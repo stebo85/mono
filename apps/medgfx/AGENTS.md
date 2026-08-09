@@ -37,7 +37,8 @@ apps/medgfx/
 ├── scripts/
 │   ├── install-quicklook.sh       build, register, prove which binary Finder uses
 │   ├── check-preview-file-kind.sh runs the routing self-check
-│   ├── check-preview-file-kind.swift
+│   ├── check-gzip-bound.sh        decompression-bound regression
+│   ├── *.swift                    the checks themselves
 │   ├── generate-about-authors.ts  generate About authors from medgfx Git history
 │   └── about-author-name-map.json override Git identities with display names
 ├── medgfxTests/                   (unused, Xcode-generated)
@@ -286,7 +287,7 @@ with a bounded parser; we hand the file to NiiVue inside WebKit, which decodes
 everything (`limitFrames4D` bounds retention, not decoding). A 2.65 MB 4D
 `.nii.gz` was measured driving the content process to 5.4 GiB.
 
-Verify routing without Xcode: `./scripts/check-preview-file-kind.sh` (30
+Verify routing without Xcode: `./scripts/check-preview-file-kind.sh` (26
 assertions). It lives outside `QuickLookPreview/` on purpose — that directory is
 a synchronized group, so anything inside it is compiled into the appex.
 
@@ -353,6 +354,13 @@ Known, deliberate, and not blocking. Each is a decision, not an oversight.
   `encoding: gz` data section, GIFTI `GZipBase64Binary` DataArrays, and every
   entry of a `.trx` ZIP. A bomb nested inside one of those is not bounded.
   Fixing it means bounding inside NiiVue, not here.
+- **The bound must never be waived on a PREDICTION about the browser.** An
+  attempt to skip it when a NIfTI header looked like it would be partial-loaded
+  was withdrawn: NiiVue does not partial-load from `loadVolumes` at all (the
+  worker full-decodes and `loadBridge.ts:60` drops the frame limit), and even if
+  it did, its eligibility is chosen by FILENAME while the native gate reads
+  CONTENT — so gzip content named `.nii` passed the gate and was fully inflated.
+  Native code must not mirror loader policy; the component that decodes owns it.
 - **A name-based gate must never sit in front of a content-based defence.**
   `GzipPeek` used to run only when the *filename* ended in `.gz`/`.mgz`, while
   every decoder downstream switches on the `1f 8b` magic bytes. `cp bomb.gz
@@ -404,6 +412,7 @@ bun apps/medgfx/scripts/generate-about-authors.ts
 ./scripts/install-quicklook.sh --debug  # Debug build, which has the trace log
 ./scripts/install-quicklook.sh --which  # who is registered / running right now
 ./scripts/check-preview-file-kind.sh    # routing self-check, no Xcode needed
+./scripts/check-gzip-bound.sh           # decompression bound, at the real call site
 
 # Xcode — from apps/medgfx/. The signing overrides are required: this machine
 # has no Mac Development certificate, and the app's entitlements otherwise

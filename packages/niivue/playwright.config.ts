@@ -20,7 +20,15 @@ export default defineConfig({
     trace: 'on-first-retry',
     // Headless Chromium renders WebGL2 through SwiftShader; recent Chrome gates
     // that software path behind this flag.
-    launchOptions: { args: ['--enable-unsafe-swiftshader'] },
+    launchOptions: {
+      args: ['--enable-unsafe-swiftshader'],
+      // Opt-in escape hatch for a machine that has a headless shell but not
+      // Playwright's exact pinned revision (a 92 MB download). Unset in CI, so
+      // the pinned browser is still what gates a PR.
+      ...(process.env.PLAYWRIGHT_CHROMIUM_PATH
+        ? { executablePath: process.env.PLAYWRIGHT_CHROMIUM_PATH }
+        : {}),
+    },
   },
   projects: [{ name: 'chromium', use: { ...devices['Desktop Chrome'] } }],
   webServer: {

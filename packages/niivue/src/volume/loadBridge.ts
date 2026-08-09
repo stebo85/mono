@@ -57,7 +57,11 @@ export async function loadVolumePrepared(
       )
     }
   }
-  const { hdr, img } = await loadVolume(url, pairedImgData)
+  // Pass the limit: `loadVolume`'s third parameter defaults to Infinity, and
+  // its partial fast path is gated on `Number.isFinite(limitFrames4D)`. Omitting
+  // it here meant the bounded 4D loader could never engage on this path, so a
+  // 4D request decoded every frame and `nii2volume` merely discarded them.
+  const { hdr, img } = await loadVolume(url, pairedImgData, limitFrames4D)
   return nii2volume(hdr, img, name ?? NVLoader.getName(url), limitFrames4D)
 }
 

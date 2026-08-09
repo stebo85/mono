@@ -370,7 +370,11 @@ class PreviewViewController: NSViewController, QLPreviewingController, WKScriptM
     ///     gzip bomb and the content process. A 2.65 MB `.nii.gz` was measured
     ///     at 5.4 GiB resident. It stops the moment the limit is passed, so the
     ///     cost is the limit, not the expansion.
-    private static func budgetFailure(fileSize: Int?, url: URL) -> PreviewFailure? {
+    /// Internal, not private, so `scripts/check-gzip-bound.sh` can call the REAL
+    /// decision. The previous check compiled only `GzipPeek` and therefore could
+    /// not see a gate reintroduced at this call site — which is exactly the
+    /// regression it claimed to guard.
+    static func budgetFailure(fileSize: Int?, url: URL) -> PreviewFailure? {
         guard let fileSize else { return .unreadable }
         if fileSize > maxFileBytes { return .resourceLimit }
         // Unconditional, and that is load-bearing. This used to be gated on

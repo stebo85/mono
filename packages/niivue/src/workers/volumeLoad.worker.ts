@@ -33,6 +33,13 @@ interface LoadRequest {
 
 self.onmessage = async (e: MessageEvent<LoadRequest>) => {
   const { _wbId: id, url, urlImageData, limitFrames4D, name } = e.data
+  let wire: unknown
+  let transfer: Transferable[] = []
+  // Only the LOAD is tagged. A structured-clone failure from `post` below is a
+  // worker-infrastructure failure -- it is the very thing the main-thread
+  // fallback exists for (see e2e/volume-load-worker.spec.ts) -- so tagging it
+  // `VolumeLoadError` would remove that safety net for the one case it was
+  // written to catch.
   try {
     // Delegate to `loadVolume` rather than repeating fetch + reader lookup.
     // The hand-rolled copy that used to live here skipped `loadVolume`'s bounded
@@ -44,21 +51,27 @@ self.onmessage = async (e: MessageEvent<LoadRequest>) => {
       url,
       urlImageData ?? null,
       limitFrames4D ?? Infinity,
+      fileName,
     )
     const volume = nii2volume(hdr, img, fileName, limitFrames4D ?? Infinity)
-    const transfer: Transferable[] = []
     if (volume.img && 'buffer' in volume.img) {
-      transfer.push(volume.img.buffer as ArrayBuffer)
+      transfer = [volume.img.buffer as ArrayBuffer]
     }
     // `volume.hdr` is a NIFTI1/NIFTI2 instance whose methods are own properties,
     // which structured clone rejects. Post a data-only snapshot; loadBridge
     // rebuilds a real instance from it.
-    const wire = { ...volume, hdr: hdrToTransferable(volume.hdr) }
-    post({ _wbId: id, volume: wire }, transfer)
+    wire = { ...volume, hdr: hdrToTransferable(volume.hdr) }
   } catch (err) {
+    // The worker itself is fine; the input is not. Tagging it stops the bridge
+    // from repeating the same fetch + inflate + parse on the UI thread for a
+    // file that will fail the same way.
     post({
       _wbId: id,
       _wbError: err instanceof Error ? err.message : String(err),
+      _wbErrorName: 'VolumeLoadError',
     })
+    return
   }
+  // Untagged: a failure here is transport, not payload, so the bridge may retry.
+  post({ _wbId: id, volume: wire }, transfer)
 }

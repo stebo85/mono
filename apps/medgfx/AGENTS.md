@@ -282,10 +282,16 @@ the two shipping macOS Quick Look extensions for these formats:
   dead config in both, invisible only because they claim generic gzip too.
 
 Content is still read for one thing: `GzipPeek.inflatedSize` bounds how far a
-compressed payload may expand. MIQ can skip this because it renders natively
-with a bounded parser; we hand the file to NiiVue inside WebKit, which decodes
-everything (`limitFrames4D` bounds retention, not decoding). A 2.65 MB 4D
-`.nii.gz` was measured driving the content process to 5.4 GiB.
+compressed payload may expand, unconditionally.
+
+`limitFrames4D` now bounds *decoding* (it bounded only retention until the
+loader fix), so a 4D preview inflates one frame rather than the series — a
+105-frame DWI went from 601 MB peak RSS to 55 MB. The native bound is still
+required, and the reasons matter because a stale note here once licensed an
+attempt to skip it: the partial reader is NIfTI-only, it returns nil on any
+miss and the caller then full-loads unbounded, and NiiVue selects it by
+FILENAME — so gzip content under an unrecognised name is inflated whole
+whatever the bytes say.
 
 Verify routing without Xcode: `./scripts/check-preview-file-kind.sh` (26
 assertions). It lives outside `QuickLookPreview/` on purpose — that directory is

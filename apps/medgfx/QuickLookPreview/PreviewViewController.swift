@@ -246,15 +246,22 @@ class PreviewViewController: NSViewController, QLPreviewingController, WKScriptM
 
     func preparePreviewOfFile(at url: URL, completionHandler handler: @escaping (Error?) -> Void) {
         startedAt = Date()
-        // Quick Look is not documented to load the view before preparing, and
-        // every path below touches the web view. Forcing it here turns a
-        // hypothetical ordering change from a nil-unwrap crash into a no-op.
-        // Decline BEFORE anything else — before the web view exists, before the
-        // security scope, before the background hop. We claim every gzip on the
-        // machine, so a folder of `.tar.gz` arrowed through in Finder would
-        // otherwise pay for a `WKWebView` and a scheme handler per file. This
-        // guard used to sit below `loadViewIfNeeded()`, which quietly made the
-        // "declining costs one string comparison" claim false.
+        // FIRST, unconditionally: Quick Look reuses one controller for a whole
+        // folder, so every entry to this method must retire the previous
+        // request — its completion, document token, security scope, navigation
+        // and timers. This used to sit below the decline guard, so arrowing
+        // from a volume onto a `.tar.gz` returned early and left the previous
+        // preview's file scoped and its route live until something else
+        // happened to tear it down.
+        //
+        // Safe before `loadViewIfNeeded()`: `teardown` reaches the web view and
+        // scheme handler only through optional chaining, so a controller whose
+        // view has never loaded is a no-op rather than a nil-unwrap.
+        teardown(reason: .cancelled)
+
+        // Decline before building anything. We claim every gzip on the machine,
+        // so a folder of `.tar.gz` arrowed through in Finder would otherwise pay
+        // for a `WKWebView` and a scheme handler per file.
         guard let kind = PreviewFileKind(url: url) else {
             log.notice("declining foreign archive")
             handler(NSError(domain: Self.errorDomain, code: 1, userInfo: [
@@ -268,10 +275,6 @@ class PreviewViewController: NSViewController, QLPreviewingController, WKScriptM
         // Quick Look is not documented to load the view before preparing, and
         // every path below touches the web view.
         loadViewIfNeeded()
-        // Quick Look may hand a second file to the same controller. Release the
-        // first one's file, token and timers before anything of the second's is
-        // registered.
-        teardown(reason: .cancelled)
         completion = handler
         let current = generation
 

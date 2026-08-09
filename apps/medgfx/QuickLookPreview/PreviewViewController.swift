@@ -382,6 +382,45 @@ class PreviewViewController: NSViewController, QLPreviewingController, WKScriptM
         // anyway. The attacker picks the name, so the name cannot select the
         // defence. `inflatedSize` already returns false for non-gzip input, so
         // the cost for an ordinary uncompressed file is one 64 KiB read.
+        //
+        // FIRST, though, ask the header. A NIfTI header states the decoded size
+        // exactly and sits at byte 0, so a ~1 ms bounded inflate can answer what
+        // the streaming bound spends hundreds of milliseconds measuring — and it
+        // answers a better question, because for a 4D series the preview never
+        // materialises the whole payload.
+        if let header = VolumeHeader.read(atFileURL: url) {
+            if header.partialLoadEligible {
+                // NiiVue's partial loader streams `vox_offset + one frame` and
+                // cancels, so the rest of the series is never inflated. Budget
+                // what is actually allocated. Measured: a 594 MB 4D volume
+                // renders in 10 MB of JS heap; budgeting the payload refused it.
+                //
+                // COUPLED, not independent — the same caveat as the first-member
+                // rule in `GzipPeek`. This is only safe while NiiVue's
+                // `loadPartialNifti1` preconditions hold, which is why
+                // `VolumeHeader.parse` accepts exactly the headers that loader
+                // accepts (little-endian NIfTI-1, single-file, non-RGB-vector,
+                // more than one frame). Widen one without the other and a large
+                // 4D file is fully inflated with no bound. The partial loader
+                // also needs `DecompressionStream`, guaranteed on our
+                // deployment target; on an older WebKit it would fall back to a
+                // full load that this budget does not cover.
+                if header.firstFrameBytes > maxDecodedBytes {
+                    log.error("one frame exceeds the decoded budget")
+                    return .resourceLimit
+                }
+                return nil
+            }
+            // Full load: everything the header describes gets inflated. Refuse
+            // early when the header alone is already over budget — no point
+            // streaming a payload we know we will reject.
+            if header.allFramesBytes > maxDecodedBytes {
+                log.error("header claims \(header.allFramesBytes / (1024 * 1024)) MB decoded")
+                return .resourceLimit
+            }
+            // Header says it fits, but a header can lie about what follows it,
+            // so fall through to the payload bound below.
+        }
         if GzipPeek.inflatedSize(ofFileAt: url, exceeds: maxDecodedBytes) {
             log.error("gzip payload exceeds the decoded budget")
             return .resourceLimit

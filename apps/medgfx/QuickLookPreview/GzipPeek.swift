@@ -62,6 +62,35 @@ enum GzipPeek {
         return data.distance(from: data.startIndex, to: index)
     }
 
+
+    /// Inflate (or read) a bounded prefix from the start of `url`.
+    ///
+    /// Gzip is forward-only, but a NIfTI header lives at byte 0, so no random
+    /// access is needed — the first block of the stream is all it takes.
+    /// Returns raw bytes when the file is not gzip.
+    static func prefix(ofFileAt url: URL, bytes wanted: Int) -> Data? {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
+        defer { try? handle.close() }
+        guard let head = try? handle.read(upToCount: compressedBudget), !head.isEmpty else { return nil }
+        guard let offset = deflateOffset(in: head), offset < head.count else {
+            // Not gzip: the bytes are already the header.
+            return head.prefix(wanted)
+        }
+        let deflate = head[head.index(head.startIndex, offsetBy: offset)...]
+        var out = Data(count: wanted)
+        let produced: Int = out.withUnsafeMutableBytes { dst -> Int in
+            guard let dstBase = dst.bindMemory(to: UInt8.self).baseAddress else { return 0 }
+            return deflate.withUnsafeBytes { src -> Int in
+                guard let srcBase = src.bindMemory(to: UInt8.self).baseAddress else { return 0 }
+                // A short result is success: the prefix legitimately ends
+                // mid-stream because we asked for a bounded number of bytes.
+                return compression_decode_buffer(dstBase, wanted, srcBase, deflate.count, nil, COMPRESSION_ZLIB)
+            }
+        }
+        guard produced > 0 else { return nil }
+        return out.prefix(produced)
+    }
+
     /// True when the gzip member at `url` inflates to more than `limit` bytes.
     ///
     /// The whole memory policy for compressed input, now that routing is by

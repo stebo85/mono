@@ -37,7 +37,9 @@ apps/medgfx/
 ├── scripts/
 │   ├── install-quicklook.sh       build, register, prove which binary Finder uses
 │   ├── check-preview-file-kind.sh runs the routing self-check
-│   ├── check-preview-file-kind.swift
+│   ├── check-header-budget.sh     header-first budget checks
+│   ├── check-gzip-bound.sh        gzip-bomb regression
+│   ├── *.swift                    the checks themselves
 │   ├── generate-about-authors.ts  generate About authors from medgfx Git history
 │   └── about-author-name-map.json override Git identities with display names
 ├── medgfxTests/                   (unused, Xcode-generated)
@@ -347,6 +349,24 @@ Known, deliberate, and not blocking. Each is a decision, not an oversight.
   the tree. The original iOS plan is explicit that the host should own this
   transport and that Quick Look should reuse it; in medgfx that is inverted. Do
   it when a volume is measurably slow.
+- **The budget asks the header first, and budgets what is MATERIALISED.** A
+  NIfTI header states the decoded size exactly and sits at byte 0, so a bounded
+  ~1 ms inflate answers what the streaming bound spends hundreds of ms
+  measuring. More importantly it measures the right thing: for a 4D series the
+  preview asks for one frame, and NiiVue's partial loader streams
+  `vox_offset + one frame` and cancels. Measured: a 594 MB 4D volume renders in
+  10 MB of JS heap, and a real 156 MB DWI series went from 710 ms to 0 ms.
+  Budgeting the payload had been refusing files the page handles trivially.
+
+  **This is coupled to NiiVue, not independent of it** — the same class as the
+  first-member rule above. `VolumeHeader.parse` accepts exactly the headers
+  `loadPartialNifti1` accepts: little-endian NIfTI-1, single-file (`n+1`),
+  non-RGB-vector, more than one frame. Widen one without the other and a large
+  4D file is fully inflated with no bound. 3D volumes, NIfTI-2, byte-swapped
+  headers and every non-NIfTI format still go through the streaming bound,
+  because those really are inflated whole. `scripts/check-header-budget.sh`
+  pins both halves — a 4D file over the cap must be accepted, a 3D one refused.
+
 - **The inflate bound covers the OUTER gzip member only.** It is called
   unconditionally on content (never gated on the filename — that was a real
   hole, see below), but NiiVue inflates in places this cannot see: NRRD's
@@ -369,8 +389,8 @@ Known, deliberate, and not blocking. Each is a decision, not an oversight.
   NiiVue also allocates `Float32Array(nVox3D*3)` + `Uint8Array(nVox3D*4)`, so
   for uint8 data the content-process peak is roughly **17x** what the gate
   counts. Conservative in the right direction; a real number needs a device
-  measurement. Consequence: an oversize legitimate 4D series is refused outright
-  rather than shown at frame zero.
+  measurement. (4D series are no longer the casualty of this — see the
+  header-first budget below.)
 - **Preview teardown does not release the NiiVue instance or the `WKWebView`.**
   The WebGL context, decoded volume and 3D textures live until the controller
   deallocates. Bounded by preview lifetime. `webView.load(about:blank)` is not

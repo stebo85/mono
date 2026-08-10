@@ -254,6 +254,38 @@ export {
   omeTiffChannelFile,
   omeTiffVolumesFrom,
 } from './volume/omeTiffLoader'
+// OME-Zarr (OME-NGFF) multiscale microscopy stores
+export {
+  type OmeZarrAxis,
+  type OmeZarrAxisIndices,
+  type OmeZarrChannel,
+  type OmeZarrDataset,
+  type OmeZarrInfo,
+  type OmeZarrSpatialOrder,
+  type OmeZarrWindow,
+  omeZarrAxisIndices,
+  omeZarrResolveAxes,
+  omeZarrSpatialOrder,
+  omeZarrSpatialScaleUm,
+  parseOmeroColor,
+  parseOmeZarrAttrs,
+} from './volume/omeZarr'
+export {
+  defaultOmeZarrLevel,
+  fetchOmeZarr,
+  loadOmeZarrVolumes,
+  OME_ZARR_LEVEL_BUDGET_BYTES,
+  type OmeZarrLevel,
+  type OmeZarrLoadOptions,
+  type OmeZarrSource,
+  omeZarrBlockToDisplay,
+  omeZarrChannelColormap,
+  omeZarrChannelCount,
+  omeZarrChannelFile,
+  omeZarrChannelName,
+  omeZarrVolumesFrom,
+  openOmeZarr,
+} from './volume/omeZarrLoader'
 export {
   createStreamingNVImage,
   type StreamingVolumeSpec,

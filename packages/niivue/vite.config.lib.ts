@@ -97,7 +97,7 @@ export default defineConfig({
       formats: ['es'],
     },
     rollupOptions: {
-      external: ['cbor-x', 'gl-matrix', 'nifti-reader-js'],
+      external: ['cbor-x', 'gl-matrix', 'nifti-reader-js', 'zarrita'],
     },
   },
 })

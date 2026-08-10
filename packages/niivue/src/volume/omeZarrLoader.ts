@@ -48,6 +48,18 @@ const ZARR_TO_NIFTI: Record<string, number> = {
   float64: NiiDataType.DT_FLOAT64,
 }
 
+/**
+ * The NIfTI datatype code for a zarr dtype, throwing on the ones NIfTI has no
+ * lossless home for (int64, bool, strings).
+ */
+export function omeZarrNiftiDatatype(dtype: string): number {
+  const code = ZARR_TO_NIFTI[dtype]
+  if (code === undefined) {
+    throw new Error(`OME-Zarr: dtype '${dtype}' is not supported`)
+  }
+  return code
+}
+
 const BYTES_PER_ELEMENT: Record<string, number> = {
   uint8: 1,
   int8: 1,
@@ -71,6 +83,12 @@ export const OME_ZARR_LEVEL_BUDGET_BYTES = 256 * 2 ** 20
 export interface OmeZarrLevel {
   /** Store-relative path of the level's array. */
   path: string
+  /**
+   * Index into the multiscale's `datasets` list (0 = finest). Differs from
+   * the level's position in {@link OmeZarrSource.levels} when only a subset
+   * was opened (see {@link OpenOmeZarrOptions.levels}).
+   */
+  datasetIndex: number
   /** The array's full shape in declared axis order. */
   shape: number[]
   /** Normalized zarr dtype (`uint16`, `float32`, ...). */
@@ -130,6 +148,53 @@ function displayDims(
   ]
 }
 
+/** Options for {@link openOmeZarr} / {@link fetchOmeZarr}. */
+export interface OpenOmeZarrOptions {
+  /**
+   * Dataset indices (into the multiscale's `datasets` list) to open, finest
+   * first. Defaults to every dataset. Use with a store that mirrors only some
+   * levels, or to skip levels a consumer will never read.
+   */
+  levels?: number[]
+  /**
+   * Skip a requested level whose array is missing from the store (a partial
+   * mirror) instead of throwing. At least one level must open.
+   */
+  ignoreMissingLevels?: boolean
+}
+
+/**
+ * Open the store root once, learning the Zarr format version so every level
+ * array can be opened version-pinned. The version-agnostic `zarr.open` probes
+ * v3 then v2 PER NODE, which costs a 404 per level on every v2 store.
+ */
+async function openStoreRoot(store: zarr.Readable): Promise<{
+  group: zarr.Group<zarr.Readable>
+  openArray: (path: string) => Promise<zarr.Array<zarr.DataType, zarr.Readable>>
+}> {
+  const root = zarr.root(store)
+  let node: zarr.Group<zarr.Readable> | zarr.Array<zarr.DataType, zarr.Readable>
+  let version: 2 | 3 = 3
+  try {
+    node = await zarr.open.v3(root)
+  } catch (err) {
+    if (!zarr.isZarritaError(err, 'NotFoundError')) {
+      throw err
+    }
+    node = await zarr.open.v2(root)
+    version = 2
+  }
+  if (node.kind !== 'group') {
+    throw new Error('OME-Zarr: the store root is a Zarr array, not a group')
+  }
+  const group = node
+  const openArray = (path: string) =>
+    version === 3
+      ? zarr.open.v3(group.resolve(path), { kind: 'array' })
+      : zarr.open.v2(group.resolve(path), { kind: 'array' })
+  return { group, openArray }
+}
+
 /**
  * Open an already-constructed store (any zarrita `Readable`, e.g. a `Map` in
  * tests) and describe its pyramid. Split out from {@link fetchOmeZarr} so
@@ -137,50 +202,84 @@ function displayDims(
  */
 export async function openOmeZarr(
   store: zarr.Readable,
+  options: OpenOmeZarrOptions = {},
 ): Promise<OmeZarrSource> {
-  const group = await zarr.open(zarr.root(store))
-  if (group.kind !== 'group') {
-    throw new Error('OME-Zarr: the store root is a Zarr array, not a group')
-  }
+  const { group, openArray } = await openStoreRoot(store)
   const info = parseOmeZarrAttrs(group.attrs)
-  const arrays = await Promise.all(
-    info.datasets.map((dataset) =>
-      zarr.open(group.resolve(dataset.path), { kind: 'array' }),
-    ),
-  )
 
-  const axes = omeZarrResolveAxes(info, arrays[0].shape.length)
+  const wanted = options.levels ?? info.datasets.map((_dataset, index) => index)
+  for (const datasetIndex of wanted) {
+    if (
+      !Number.isInteger(datasetIndex) ||
+      datasetIndex < 0 ||
+      datasetIndex >= info.datasets.length
+    ) {
+      throw new Error(
+        `OME-Zarr: level ${datasetIndex} is out of range ` +
+          `(the multiscale lists ${info.datasets.length} datasets)`,
+      )
+    }
+  }
+  const opened = (
+    await Promise.all(
+      [...wanted]
+        .sort((a, b) => a - b)
+        .map(async (datasetIndex) => {
+          try {
+            return {
+              datasetIndex,
+              array: await openArray(info.datasets[datasetIndex].path),
+            }
+          } catch (err) {
+            if (
+              options.ignoreMissingLevels &&
+              zarr.isZarritaError(err, 'NotFoundError')
+            ) {
+              return null
+            }
+            throw err
+          }
+        }),
+    )
+  ).filter((entry) => entry !== null)
+  if (opened.length === 0) {
+    throw new Error('OME-Zarr: none of the requested levels are present')
+  }
+
+  const axes = omeZarrResolveAxes(info, opened[0].array.shape.length)
   const indices = omeZarrAxisIndices(axes)
   const order = omeZarrSpatialOrder(axes, indices.spatial)
 
-  const levels: OmeZarrLevel[] = arrays.map((array, index) => {
+  const levels: OmeZarrLevel[] = opened.map(({ array, datasetIndex }) => {
     if (array.shape.length !== axes.length) {
       throw new Error(
-        `OME-Zarr: level ${index} has ${array.shape.length} dimensions, ` +
-          `expected ${axes.length}`,
+        `OME-Zarr: level ${datasetIndex} has ${array.shape.length} ` +
+          `dimensions, expected ${axes.length}`,
       )
     }
     const dims = displayDims(array.shape, indices.spatial, order)
     return {
-      path: info.datasets[index].path,
+      path: info.datasets[datasetIndex].path,
+      datasetIndex,
       shape: array.shape,
       dtype: array.dtype,
       dims,
-      spacingUm: omeZarrSpatialScaleUm(info.datasets[index], axes),
+      spacingUm: omeZarrSpatialScaleUm(info.datasets[datasetIndex], axes),
       channelBytes:
         dims[0] * dims[1] * dims[2] * (BYTES_PER_ELEMENT[array.dtype] ?? 0),
     }
   })
 
+  const finest = opened[0].array
   return {
     info,
     levels,
-    arrays,
+    arrays: opened.map((entry) => entry.array),
     axes,
     indices,
     order,
-    channelCount: indices.channel < 0 ? 1 : arrays[0].shape[indices.channel],
-    timepointCount: indices.time < 0 ? 1 : arrays[0].shape[indices.time],
+    channelCount: indices.channel < 0 ? 1 : finest.shape[indices.channel],
+    timepointCount: indices.time < 0 ? 1 : finest.shape[indices.time],
   }
 }
 
@@ -193,12 +292,12 @@ export async function openOmeZarr(
  */
 export async function fetchOmeZarr(
   url: string,
-  options: Pick<OmeZarrLoadOptions, 'fetchImpl'> = {},
+  options: OpenOmeZarrOptions & Pick<OmeZarrLoadOptions, 'fetchImpl'> = {},
 ): Promise<OmeZarrSource> {
   const store = options.fetchImpl
     ? new zarr.FetchStore(url, { fetch: options.fetchImpl })
     : new zarr.FetchStore(url)
-  return openOmeZarr(store)
+  return openOmeZarr(store, options)
 }
 
 /** The number of channels the store's channel axis carries (1 when absent). */
@@ -346,11 +445,7 @@ export async function omeZarrVolumesFrom(
       `OME-Zarr: level ${level} is out of range (store has ${source.levels.length})`,
     )
   }
-  const dtype = source.levels[level].dtype
-  const datatypeCode = ZARR_TO_NIFTI[dtype]
-  if (datatypeCode === undefined) {
-    throw new Error(`OME-Zarr: dtype '${dtype}' is not supported`)
-  }
+  const datatypeCode = omeZarrNiftiDatatype(source.levels[level].dtype)
 
   const timepoint = options.timepoint ?? 0
   if (

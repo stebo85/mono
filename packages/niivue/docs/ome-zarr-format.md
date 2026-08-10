@@ -7,18 +7,44 @@ the format the Allen Institute's IMSC viewer, IDR, and the Human Organ Atlas
 publish, and the fourth microscopy container this package reads (after the
 Allen JSON+PNG atlas, plain TIFF stacks and OME-TIFF).
 
-Two modules, in layers:
+Three modules, in layers:
 
 | Module | Responsibility |
 | --- | --- |
 | `volume/omeZarr.ts` | The metadata. Parses a group's attributes into axes, pyramid datasets and omero channels, and answers the axis questions (which dimension is channel? which spatial axis is display x?). Pure JSON in, no network, Bun-testable. |
-| `volume/omeZarrLoader.ts` | The pixels. Opens a store with zarrita, picks a pyramid level, pins time and channel, and assembles each requested channel into a NIfTI `File` for `loadVolumes`. |
+| `volume/omeZarrLoader.ts` | The pixels, whole levels at a time. Opens a store with zarrita, picks a pyramid level, pins time and channel, and assembles each requested channel into a NIfTI `File` for `loadVolumes`. |
+| `volume/omeZarrChunkedSource.ts` | The pixels, brick by brick. Adapts an opened pyramid to the core `ChunkedVolumeSource` seam for `nv.loadChunkedVolume`, which streams multi-LOD bricks of stores far too large to load whole. |
 
 Unlike TIFF, the container itself is NOT hand-parsed: chunk layout, codecs
 (blosc, gzip, zstd) and both Zarr format versions come from `zarrita`, a
-dependency shared with the streaming demos. This loader is the whole-volume,
-per-channel path; chunk-at-a-time streaming of very large stores is the
-`ChunkedVolumeSource` machinery's job (see `NVChunkedVolume.ts`).
+runtime dependency.
+
+## Streaming very large stores
+
+`fetchOmeZarrChunkedSource(url, { channel })` (or `omeZarrChunkedSource` over
+an already-opened source) yields a `ChunkedVolumeSource`: finest-first levels
+in display terms, plus a `fetchChunk` that reads one brick's voxel region from
+one level, clamped to the level's extent and zero-padded past it. The core
+`NVChunkedVolume` owns plan-building, per-level dispatch, concurrency, retry,
+dedup and GPU residency. Bricks honour the declared axis order the same way
+the whole-level loader does (an `x y z` store is transposed per brick), and
+the time/channel axes are pinned per source, so multi-channel stores stream
+one chosen channel rather than silently dropping the rest.
+
+The convenience fetch wraps the store in `zarr.withByteCaching` with a
+`ByteLruCache` (default 256 MiB): raw store responses are reused across the
+plan rebuilds that crosshair moves trigger, and a 404'd chunk is remembered as
+a zero-byte CONFIRMED ABSENCE: zarr's missing-chunk-means-fill-value
+convention makes sparse stores lean on 404s hard, and a store is immutable for
+the life of a load, so each absence needs discovering exactly once.
+
+`openOmeZarr`/`fetchOmeZarr` accept `levels` (open a subset of the pyramid,
+e.g. a partial local mirror) and `ignoreMissingLevels` (skip a listed level
+whose array is absent); each opened level keeps its `datasetIndex` so labels
+and telemetry match the store's own numbering. The store root is opened once
+to learn the Zarr format version, and every level array is opened
+version-pinned; the version-agnostic probe would cost a 404 per level on
+every v2 store.
 
 ## What is supported
 

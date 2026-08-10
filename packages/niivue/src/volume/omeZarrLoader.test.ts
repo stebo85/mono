@@ -180,6 +180,45 @@ describe('openOmeZarr', () => {
   })
 })
 
+describe('openOmeZarr level selection', () => {
+  test('opens only the requested dataset indices, keeping their labels', async () => {
+    const source = await openOmeZarr(makeTczyxStore(), { levels: [1] })
+    expect(source.levels).toHaveLength(1)
+    expect(source.levels[0].datasetIndex).toBe(1)
+    expect(source.levels[0].dims).toEqual([2, 2, 1])
+    expect(() => source.levels[0]).not.toThrow()
+    await expect(
+      openOmeZarr(makeTczyxStore(), { levels: [7] }),
+    ).rejects.toThrow('level 7 is out of range')
+  })
+
+  test('a missing level throws unless ignoreMissingLevels is set', async () => {
+    const store = makeTczyxStore()
+    store.delete('/1/.zarray')
+    await expect(openOmeZarr(store)).rejects.toThrow()
+    const source = await openOmeZarr(store, { ignoreMissingLevels: true })
+    expect(source.levels.map((l) => l.datasetIndex)).toEqual([0])
+    store.delete('/0/.zarray')
+    await expect(
+      openOmeZarr(store, { ignoreMissingLevels: true }),
+    ).rejects.toThrow('none of the requested levels are present')
+  })
+
+  test('a v2 store is opened version-pinned, with no v3 probes per level', async () => {
+    const backing = makeTczyxStore()
+    const reads: string[] = []
+    const counting = {
+      get(key: `/${string}`): Uint8Array | undefined {
+        reads.push(key)
+        return backing.get(key)
+      },
+    }
+    await openOmeZarr(counting)
+    // The root pays one v3 probe; the level arrays must not.
+    expect(reads.filter((k) => k.endsWith('zarr.json'))).toEqual(['/zarr.json'])
+  })
+})
+
 describe('omeZarrVolumesFrom', () => {
   test('loads every channel with its label, colormap and window', async () => {
     const source = await openOmeZarr(makeTczyxStore())

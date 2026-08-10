@@ -270,6 +270,16 @@ export {
   parseOmeroColor,
   parseOmeZarrAttrs,
 } from './volume/omeZarr'
+// OME-Zarr chunk-streaming adapter for nv.loadChunkedVolume
+export {
+  ByteLruCache,
+  type FetchOmeZarrChunkedSourceOptions,
+  fetchOmeZarrChunkedSource,
+  OME_ZARR_CHUNK_CACHE_BYTES,
+  type OmeZarrChunkedSource,
+  type OmeZarrChunkedSourceOptions,
+  omeZarrChunkedSource,
+} from './volume/omeZarrChunkedSource'
 export {
   defaultOmeZarrLevel,
   fetchOmeZarr,
@@ -278,11 +288,13 @@ export {
   type OmeZarrLevel,
   type OmeZarrLoadOptions,
   type OmeZarrSource,
+  type OpenOmeZarrOptions,
   omeZarrBlockToDisplay,
   omeZarrChannelColormap,
   omeZarrChannelCount,
   omeZarrChannelFile,
   omeZarrChannelName,
+  omeZarrNiftiDatatype,
   omeZarrVolumesFrom,
   openOmeZarr,
 } from './volume/omeZarrLoader'

@@ -3098,7 +3098,14 @@ export default class NiiVue extends EventTarget {
       // NVImage so we can feed it back here. `_urlImageData` is undefined for the
       // common self-contained-NII case, in which case `loadVolume`'s second arg
       // (null) just stays at its default.
-      const nii = await NVVolume.loadVolume(src, vol._urlImageData ?? null)
+      // `name` forwarded: a filename-sensitive reader (MGH label inference,
+      // VMR .v16/.vmr) must take the same branch on reload as on first load.
+      const nii = await NVVolume.loadVolume(
+        src,
+        vol._urlImageData ?? null,
+        Infinity,
+        vol.name,
+      )
       // Reconstruct through nii2volume so datatype/intent conversions (e.g.
       // DT_FLOAT64 -> DT_FLOAT32) are REAPPLIED. The re-fetched bytes are raw, so
       // coercing them through the already-converted `vol.hdr` would corrupt a

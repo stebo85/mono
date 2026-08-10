@@ -6,12 +6,23 @@
 //  identifies formats — it answers one question: does this gzip member inflate
 //  to more than we are willing to hand WebKit?
 //
-//  That question still has to be asked. MIQ and NIfTIViewQL route by name and
-//  stop there, but both render natively with their own bounded parsers. This
-//  extension hands the file to NiiVue inside WebKit, which decodes the whole
-//  buffer — `limitFrames4D` bounds retention, not decoding. A measured case
-//  from the source repo: a 2.65 MB 4D `.nii.gz` drove the content process to
-//  5.4 GiB while the metadata strip read "1 of 2600".
+//  That question still has to be asked, though the reason has changed.
+//
+//  `limitFrames4D` NOW bounds decoding: both NiiVue load paths reach the
+//  partial reader, so a 4D preview inflates `vox_offset + one frame` rather
+//  than the series. (It did not before — a 2.65 MB 4D `.nii.gz` drove the
+//  content process to 5.4 GiB while the strip read "1 of 2600".)
+//
+//  This bound stays UNCONDITIONAL anyway, and the reasons are worth stating
+//  because a stale note here is what licensed an earlier attempt to skip it:
+//    - the partial reader covers NIfTI only. `.mgz`, `.nrrd.gz`, `.gii.gz` and
+//      every mesh format are still inflated whole.
+//    - it returns nil on ANY miss — malformed header, byte-swapped, a blanket
+//      catch — and the caller then full-loads, unbounded.
+//    - NiiVue picks it by FILENAME, so gzip content under a name it does not
+//      recognise is full-loaded regardless of what the bytes say.
+//    - defence in depth: this is a security boundary for every gzip on the
+//      machine, and it must not depend on a prediction about the browser.
 //
 //  Deliberately NOT ported: `VolumeSniff` (NIfTI header parsing). Its `isNIfTI`
 //  did routing, now done by name, and its `decodedSize` is redundant for

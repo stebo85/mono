@@ -1,3 +1,29 @@
+## 1.0.0-rc.12 (2026-08-10)
+
+### Features
+
+- **medgfx:** redesign display inspector ([97d0d69](https://github.com/niivue/mono/commit/97d0d69))
+- **medgfx:** add native image file loading ([4b2665c](https://github.com/niivue/mono/commit/4b2665c))
+- **medgfx:** add macOS Quick Look preview extension ([734ff8d](https://github.com/niivue/mono/commit/734ff8d))
+
+### Fixes
+
+- **niivue:** forward the frame limit, the reader name, and loader errors ([f65908f](https://github.com/niivue/mono/commit/f65908f))
+- **niivue:** make limitFrames4D bound decoding, not just retention ([d2d3ded](https://github.com/niivue/mono/commit/d2d3ded))
+- **niivue:** publish ctrl.view only after init() resolves ([#61](https://github.com/niivue/mono/issues/61))
+- **niivue:** preserve computed window for linked NVD volumes ([d5b0ae3](https://github.com/niivue/mono/commit/d5b0ae3))
+- preserve typed MGH voxel interpretation ([3b30eba](https://github.com/niivue/mono/commit/3b30eba))
+- **niivue:** emit precise keyboard camera changes ([a75f783](https://github.com/niivue/mono/commit/a75f783))
+
+### Thank You
+
+- Claude Opus 5
+- Claude Opus 5 (1M context)
+- Korbinian Eckstein @korbinian90
+- neurolabusc
+- Paul Wighton
+- Taylor Hanayik @hanayik
+
 ## 1.0.0-rc.11 (2026-07-29)
 
 ### Features

@@ -12,8 +12,12 @@
 
 import * as zarr from 'zarrita'
 import NiiVue, {
+  ByteLruCache,
   chunkVolumeGrid,
   createStreamingNVImage,
+  omeZarrChunkedSource,
+  openOmeZarr,
+  parseOmeZarrAttrs,
   SLICE_TYPE,
 } from '../src/index.ts'
 
@@ -275,10 +279,10 @@ const OMEZARR_UPSTREAM_BASE =
 // OME-Zarr ships in two on-disk shapes and this demo reads both. 0.5 is zarr
 // v3: one `zarr.json` per group and per array, chunk keys under `c/`. 0.4 is
 // zarr v2: group metadata split across `.zgroup` + `.zattrs`, array metadata in
-// `.zarray`, chunk keys as bare indices. zarrita decodes either (it registers
-// the v2 `blosc` codec lazily, so a blosc/zstd 0.4 store needs no extra
-// dependency), which confines the version-specific code to metadata discovery
-// here plus which `zarr.open.v*` loadOmezarrSource calls.
+// `.zarray`, chunk keys as bare indices. The library's openOmeZarr detects the
+// version and opens every level pinned to it; the version-specific code left
+// HERE is only the base-probing (which metadata object to HEAD-check per
+// level).
 const ZARR_V2 = 2
 const ZARR_V3 = 3
 
@@ -286,26 +290,25 @@ function arrayMetadataPath(zarrVersion) {
   return zarrVersion === ZARR_V2 ? '.zarray' : 'zarr.json'
 }
 
-// Read a store root: its zarr version and its first multiscale. v3 is tried
-// first (every Open SciVis store is v3), so a v2 store pays one extra 404 on
-// the root object and nothing after that.
+// Read a store root: its zarr version and its parsed OME metadata (the library
+// parser handles both attribute layouts). v3 is tried first (every Open SciVis
+// store is v3), so a v2 store pays one extra 404 on the root object and
+// nothing after that.
 async function fetchStoreRoot(storeUrl) {
   try {
     const meta = await fetchJson(`${storeUrl}/zarr.json`)
-    const multiscale = multiscalesFromRoot(meta, ZARR_V3)[0]
-    if (multiscale) return { zarrVersion: ZARR_V3, multiscale }
+    return {
+      zarrVersion: ZARR_V3,
+      info: parseOmeZarrAttrs(meta.attributes ?? meta),
+    }
   } catch {
     // Not a v3 store, or no store here at all; let the v2 read decide which.
   }
   const attrs = await fetchJson(`${storeUrl}/.zattrs`)
-  const multiscale = multiscalesFromRoot(attrs, ZARR_V2)[0]
-  if (!multiscale) {
-    throw new Error(`${storeUrl} has no OME-Zarr multiscales`)
-  }
-  return { zarrVersion: ZARR_V2, multiscale }
+  return { zarrVersion: ZARR_V2, info: parseOmeZarrAttrs(attrs) }
 }
 
-// Resolved `{ url, levels, zarrVersion, multiscale }` per store id. The level
+// Resolved `{ url, levels, zarrVersion, info }` per store id. The level
 // control and the open path must agree on which base won, and the probe should
 // run once per store.
 const resolvedStores = new Map()
@@ -319,10 +322,10 @@ const resolvedStores = new Map()
 // metadata is a few hundred bytes and the browser caches it for the open that
 // follows, so the extra body costs nothing.
 async function probeStoreBase(storeDef, storeUrl) {
-  const { zarrVersion, multiscale } = await fetchStoreRoot(storeUrl)
+  const { zarrVersion, info } = await fetchStoreRoot(storeUrl)
   const levels = []
   for (const candidate of storeDef.levels) {
-    const ds = multiscale?.datasets?.[candidate]
+    const ds = info.datasets[candidate]
     if (!ds) continue
     try {
       const res = await fetch(
@@ -333,7 +336,7 @@ async function probeStoreBase(storeDef, storeUrl) {
       // Unreachable level (offline, blocked); the remaining ones may still be.
     }
   }
-  return { zarrVersion, multiscale, levels }
+  return { zarrVersion, info, levels }
 }
 
 // Pick the base offering the FINEST detail, not merely the first that answers.
@@ -360,7 +363,7 @@ async function resolveStore(storeDef) {
     url: candidates[candidates.length - 1],
     levels: [],
     zarrVersion: ZARR_V3,
-    multiscale: null,
+    info: null,
   }
   for (const url of candidates) {
     let probe = null
@@ -379,51 +382,25 @@ const MANIFEST_URL = demoAssetUrl('range-poc/synthetic-volume.json')
 
 // --- byte cache for zarrita -------------------------------------------------
 
-class ByteLruCache {
+// The library ByteLruCache (byte-bounded LRU over raw store responses, absences
+// remembered as zero-byte entries) with the demo's serial-gated HUD counters
+// layered on top.
+class TrackedByteCache extends ByteLruCache {
   constructor(maxBytes, serial) {
-    this.maxBytes = maxBytes
-    this.entries = new Map()
-    this.totalBytes = 0
+    super(maxBytes)
     // Source serial this cache belongs to; its stats writes no-op once superseded.
     this.serial = serial
   }
 
   has(key) {
-    const hit = this.entries.has(key)
+    const hit = super.has(key)
     if (hit && isLiveSerial(this.serial)) stats.cacheHits++
     return hit
   }
 
-  get(key) {
-    const entry = this.entries.get(key)
-    if (!entry) return undefined
-    this.entries.delete(key)
-    this.entries.set(key, entry)
-    return entry.value
-  }
-
   set(key, value) {
-    const existing = this.entries.get(key)
-    if (existing) {
-      this.totalBytes -= existing.bytes
-      this.entries.delete(key)
-    }
-    const bytes = value?.byteLength ?? 0
-    this.entries.set(key, { value, bytes })
-    this.totalBytes += bytes
-    this.evict()
+    super.set(key, value)
     if (isLiveSerial(this.serial)) stats.cacheBytes = this.totalBytes
-  }
-
-  evict() {
-    while (this.totalBytes > this.maxBytes && this.entries.size > 1) {
-      const firstKey = this.entries.keys().next().value
-      if (typeof firstKey !== 'string') return
-      const first = this.entries.get(firstKey)
-      if (!first) return
-      this.entries.delete(firstKey)
-      this.totalBytes -= first.bytes
-    }
   }
 }
 
@@ -802,36 +779,16 @@ function shortZarrPath(pathname) {
   return pathname.split('/').filter(Boolean).slice(-5).join('/')
 }
 
-// v3 nests group attributes under `attributes` (0.5 wraps them again in `ome`);
-// a v2 `.zattrs` IS the attribute object, so `multiscales` sits at its top level.
-function multiscalesFromRoot(meta, zarrVersion) {
-  if (zarrVersion === ZARR_V2) return meta.multiscales ?? []
-  return meta.attributes?.ome?.multiscales ?? meta.attributes?.multiscales ?? []
-}
-
-// The demo maps the array's FASTEST axis to display x and its slowest to display
-// z, and permutes the pyramid's scale the same way, so the voxel grid and its
-// spacing always agree. That is the literal axis order for the Open SciVis
-// stores, whose `axes` are the usual [z, y, x]. The Human Organ Atlas declares
-// [x, y, z] instead, so its heart is presented rotated: display x runs along the
-// anatomical long axis. Geometry, spacing and streaming are all unaffected --
-// honouring the declared order would mean transposing every decoded brick, which
-// is real per-chunk work for a demo with no radiological orientation to keep.
-function scaleFromDataset(dataset) {
-  const scale = dataset.coordinateTransformations?.find(
-    (transform) => transform.type === 'scale',
-  )?.scale
-  if (!scale || scale.length < 3) return [1, 1, 1]
-  const spatial = scale.slice(-3)
-  return [spatial[2], spatial[1], spatial[0]]
-}
-
-function trailingSpatial(nums, label) {
-  if (nums.length < 3) {
-    throw new Error(`${label} has ${nums.length} dimension(s), expected 3D`)
-  }
-  const spatial = nums.slice(-3)
-  return [spatial[0], spatial[1], spatial[2]]
+// The finest level's native zarr chunk shape in display order, for the HUD's
+// grid readout. The library exposes level dims/spacing in display order but
+// the raw array's chunk list stays in declared axis order; map it the same way
+// the library maps dims (spatial axes by position, absent z = 1).
+function displayChunkShape(zsrc) {
+  const chunks = zsrc.arrays[0].chunks
+  const { indices, order } = zsrc
+  const at = (position) =>
+    position < 0 ? 1 : chunks[indices.spatial[position]]
+  return [at(order.x), at(order.y), at(order.z)]
 }
 
 function assertSupportedDtype(dtype) {
@@ -863,53 +820,10 @@ async function loadSyntheticSource() {
 }
 
 async function loadOmezarrSource(storeDef, serial) {
-  // resolveStore already read the root to probe levels, so its version and
-  // multiscale come back with the winning base -- no second metadata fetch.
-  const {
-    url: storeUrl,
-    zarrVersion,
-    multiscale,
-  } = await resolveStore(storeDef)
-
-  const baseStore = new zarr.FetchStore(storeUrl, {
-    fetch: createTrackedZarrFetch(serial),
-  })
-  const store = zarr.withByteCaching(baseStore, {
-    cache: new ByteLruCache(ZARR_BYTE_CACHE_BYTES, serial),
-  })
-
-  // Open a single pyramid level at the version the root advertised. Opening
-  // version-agnostically would probe both and 404 noisily on every level of a
-  // static store. Returns null if the level isn't present on disk.
-  const openLevel = async (candidate) => {
-    const ds = multiscale?.datasets?.[candidate]
-    if (!ds) return null
-    try {
-      const location = zarr.root(store).resolve(`/${ds.path}`)
-      const arr = await (zarrVersion === ZARR_V2
-        ? zarr.open.v2(location, { kind: 'array' })
-        : zarr.open.v3(location, { kind: 'array' }))
-      const [sz, sy, sx] = trailingSpatial(arr.shape, 'shape')
-      return {
-        level: candidate,
-        dataset: ds,
-        array: arr,
-        shape: [sx, sy, sz],
-        spacing: scaleFromDataset(ds),
-      }
-    } catch {
-      return null // level not present on disk
-    }
-  }
-
-  // Open EVERY present level (the octree fetches each brick from its own level).
-  // `opened` is sorted finest-first so opened[0] is the common reference grid.
-  const opened = []
-  for (const candidate of [...storeDef.levels].sort((a, b) => a - b)) {
-    const lvl = await openLevel(candidate)
-    if (lvl) opened.push(lvl)
-  }
-  if (opened.length === 0) {
+  // resolveStore already probed which configured levels resolve at the winning
+  // base, so the open below touches only present arrays.
+  const { url: storeUrl, levels: presentLevels } = await resolveStore(storeDef)
+  if (presentLevels.length === 0) {
     // A `base` store is never mirrored locally, so pointing at fetch-omezarr.ts
     // would be a dead end -- it is upstream or offline.
     throw new Error(
@@ -919,15 +833,33 @@ async function loadOmezarrSource(storeDef, serial) {
           : `Did you run scripts/fetch-omezarr.ts --name=${els.source.value}?`),
     )
   }
-  opened.sort((a, b) => a.level - b.level) // finest-first
-  // Primary geometry = the finest present level (the common grid).
-  const primary = opened[0]
-  const { level, dataset, array, shape, spacing } = primary
 
-  const dtype = assertSupportedDtype(array.dtype)
+  const baseStore = new zarr.FetchStore(storeUrl, {
+    fetch: createTrackedZarrFetch(serial),
+  })
+  const store = zarr.withByteCaching(baseStore, {
+    cache: new TrackedByteCache(ZARR_BYTE_CACHE_BYTES, serial),
+  })
+
+  // Open every present level through the library: version-pinned opens, axis
+  // classification, display-order dims and spacing. ignoreMissingLevels guards
+  // the race where a probed level vanishes between probe and open.
+  const zsrc = await openOmeZarr(store, {
+    levels: [...presentLevels].sort((a, b) => a - b),
+    ignoreMissingLevels: true,
+  })
+  // The library ChunkedVolumeSource over the pyramid. Bricks arrive in display
+  // space -- an `x y z` store (the HOA heart) is transposed per brick, so it
+  // now presents the same way as a `z y x` store -- with channel/timepoint
+  // pinned to the first.
+  const chunkSource = omeZarrChunkedSource(zsrc)
+
+  // Primary geometry = the finest present level (the common grid).
+  const finest = zsrc.levels[0]
+  const dtype = assertSupportedDtype(finest.dtype)
   const dtypeInfo = niftiDatatype(dtype)
-  const [chunkZ, chunkY, chunkX] = trailingSpatial(array.chunks, 'chunks')
-  const chunkShape = [chunkX, chunkY, chunkZ]
+  const shape = finest.dims
+  const chunkShape = displayChunkShape(zsrc)
   const chunkGrid = [
     Math.ceil(shape[0] / chunkShape[0]),
     Math.ceil(shape[1] / chunkShape[1]),
@@ -939,7 +871,7 @@ async function loadOmezarrSource(storeDef, serial) {
     id: `${storeDef.id}:multilod`,
     name: `${storeDef.name} multi-LOD`,
     shape,
-    spacing,
+    spacing: finest.spacingUm,
     dtype,
     datatypeCode: dtypeInfo.code,
     numBitsPerVoxel: dtypeInfo.bits,
@@ -947,19 +879,15 @@ async function loadOmezarrSource(storeDef, serial) {
     chunkGrid,
     chunkShape,
     chunkCount: chunkGrid[0] * chunkGrid[1] * chunkGrid[2],
-    sourceUrl: `${storeDef.id}/${dataset.path}`,
+    sourceUrl: `${storeDef.id}/${finest.path}`,
     transportLabel: 'OME-Zarr multi-LOD octree',
-    array,
-    // All present levels, finest-first: {level, array, shape, spacing, dataset}.
-    // The multi-LOD chunk source dispatches each brick to levels[sourceLevel].
-    levels: opened,
-    level,
-    levelPath: dataset.path,
-    // Kept so a coarse whole-volume "floor" can be built from the coarsest
-    // present level (see buildCoarseFloorVolume): the 3D render shows that
-    // coarse detail in regions whose fine chunks have not streamed in yet.
-    store,
-    multiscale,
+    // All present levels, finest-first, as the library described them
+    // ({datasetIndex, dims, spacingUm, path, ...}). The chunkSource dispatches
+    // each brick to its own level; the coarse floor reads the last entry.
+    levels: zsrc.levels,
+    chunkSource,
+    level: finest.datasetIndex,
+    levelPath: finest.path,
     storeDef,
   }
 }
@@ -979,17 +907,24 @@ async function buildCoarseFloorVolume(source) {
   // level that was never downloaded, whose open throws, gets swallowed here, and
   // silently leaves the far-field blank even though a coarser PRESENT level
   // exists. levels[last].level is the largest (coarsest) present index.
-  const coarse = source.levels[source.levels.length - 1]
-  if (!coarse || coarse.level <= source.level) return null // no coarser present level
+  const coarseIndex = source.levels.length - 1
+  const coarse = source.levels[coarseIndex]
+  if (!coarse || coarse.datasetIndex <= source.level) return null // no coarser present level
   try {
-    const view = await zarr.get(coarse.array, null) // whole (small) coarse level
-    const img = bytesFromZarrView(view)
+    // Whole (small) coarse level through the library source, so the floor gets
+    // the same display-space layout (and axis-order transpose) as the bricks.
+    const img = await source.chunkSource.fetchChunk({
+      levelIndex: coarseIndex,
+      texOrigin: [0, 0, 0],
+      texDims: coarse.dims,
+      bytesPerVoxel: source.numBitsPerVoxel / 8,
+    })
     const win = parseWindow(source.defaultWindow)
     const floor = createStreamingNVImage({
       id: `${source.id}:floor`,
       url: `client-chunk://${source.id}/floor`,
-      shape: coarse.shape,
-      spacing: coarse.spacing,
+      shape: coarse.dims,
+      spacing: coarse.spacingUm,
       datatypeCode: source.datatypeCode,
       calMin: win.min,
       calMax: win.max,
@@ -1017,21 +952,17 @@ async function loadActiveSource() {
   return source
 }
 
-// A ChunkedVolumeSource adapter over an opened OME-Zarr pyramid. Exposes the
-// finest-first levels and reads a voxel region of one level with zarrita; the
-// core `nv.loadChunkedVolume` owns plan-building, per-level dispatch,
-// concurrency, retry, dedup, and residency. This adapter only fetches bytes
-// (plus demo telemetry so the HUD counts requested/completed/decoded).
+// The library's OME-Zarr ChunkedVolumeSource (source.chunkSource) wrapped with
+// demo telemetry, so the HUD counts requested/completed/decoded. The core
+// `nv.loadChunkedVolume` owns plan-building, per-level dispatch, concurrency,
+// retry, dedup, and residency; the library source owns the zarr read.
 function createZarrChunkedSource(source) {
+  const base = source.chunkSource
   return {
-    datatypeCode: source.datatypeCode,
-    levels: source.levels.map((l) => ({
-      level: l.level,
-      shape: l.shape,
-      spacing: l.spacing,
-    })),
-    async fetchChunk({ levelIndex, texOrigin, texDims, bytesPerVoxel }) {
-      const key = `${levelIndex}|${texOrigin.join(',')}|${texDims.join(',')}`
+    datatypeCode: base.datatypeCode,
+    levels: base.levels,
+    async fetchChunk(req) {
+      const key = `${req.levelIndex}|${req.texOrigin.join(',')}|${req.texDims.join(',')}`
       // Record every live-serial fetch. The strip keys cells by brickKey and lights a
       // cell when its brick is in `completed`; the set is NOT pruned on a plan swap, so
       // a brick the core keeps resident across a crosshair refocus (reused without a
@@ -1040,12 +971,7 @@ function createZarrChunkedSource(source) {
       // out-of-plan key here can never inflate a displayed count.
       if (isLiveSerial(source.serial)) stats.requested.add(key)
       try {
-        const bytes = await readOmezarrRegion(
-          source.levels[levelIndex],
-          texOrigin,
-          texDims,
-          bytesPerVoxel,
-        )
+        const bytes = await base.fetchChunk(req)
         if (isLiveSerial(source.serial)) {
           stats.decodedBytes += bytes.byteLength
           stats.completed.add(key)
@@ -1074,7 +1000,7 @@ function createZarrChunkedSource(source) {
 // used as the multi-LOD max-detail cap (minLevel). 0 = finest allowed.
 function selectedLevelIndex(source) {
   const picked = selectedLevel()
-  const idx = source.levels.findIndex((l) => l.level === picked)
+  const idx = source.levels.findIndex((l) => l.datasetIndex === picked)
   return idx < 0 ? 0 : idx
 }
 
@@ -1143,76 +1069,6 @@ function createRangeChunkSource(source) {
     // per request/settle would re-introduce the per-fetch DOM reflow jank.
     return next
   }
-}
-
-// Read one region of one pyramid level with zarrita, clamped + zero-padded to
-// exactly texDims (the ChunkedVolumeSource.fetchChunk contract). texOrigin/
-// texDims are in that level's own voxel grid. The core NVChunkedVolume wraps
-// this with concurrency/retry/dedup, so this is a plain read.
-async function readOmezarrRegion(level, texOrigin, texDims, bpv) {
-  const [x0, y0, z0] = texOrigin
-  const [sx, sy, sz] = texDims
-  const array = level.array
-  const [shapeX, shapeY, shapeZ] = level.shape
-  // A streaming tile near a volume edge can extend past the array bounds; clamp
-  // the read to the real extent, then zero-pad back up to the requested texDims
-  // so the texture upload still gets a full [sx,sy,sz] brick (out-of-bounds =
-  // fill value 0). zarr.slice past the end would otherwise return a short region
-  // that mismatches the expected byte count.
-  const ez = Math.min(z0 + sz, shapeZ)
-  const ey = Math.min(y0 + sy, shapeY)
-  const ex = Math.min(x0 + sx, shapeX)
-  const rz = ez - z0
-  const ry = ey - y0
-  const rx = ex - x0
-
-  const selection = []
-  for (let i = 0; i < array.shape.length - 3; i++) selection.push(0)
-  selection.push(zarr.slice(z0, ez))
-  selection.push(zarr.slice(y0, ey))
-  selection.push(zarr.slice(x0, ex))
-
-  const view = await zarr.get(array, selection)
-  const region = bytesFromZarrView(view)
-  const expectedBytes = sx * sy * sz * bpv
-
-  // Fast path: the read already covers the full requested brick.
-  if (rz === sz && ry === sy && rx === sx) {
-    if (region.byteLength !== expectedBytes) {
-      throw new Error(
-        `OME-Zarr region ${texOrigin.join(',')} returned ${region.byteLength}B, expected ${expectedBytes}B`,
-      )
-    }
-    return region
-  }
-
-  // Edge tile: copy the clamped [rz,ry,rx] region into a zero-filled [sz,sy,sx]
-  // brick. Layout is z-major then y then x (row of rx*bpv bytes per y line).
-  const out = new Uint8Array(expectedBytes)
-  const rowBytes = rx * bpv
-  const dstRowStride = sx * bpv
-  const dstPlaneStride = sy * dstRowStride
-  let src = 0
-  for (let zz = 0; zz < rz; zz++) {
-    const dstPlane = zz * dstPlaneStride
-    for (let yy = 0; yy < ry; yy++) {
-      const dst = dstPlane + yy * dstRowStride
-      out.set(region.subarray(src, src + rowBytes), dst)
-      src += rowBytes
-    }
-  }
-  return out
-}
-
-function bytesFromZarrView(view) {
-  if (typeof view !== 'object' || view === null || !('data' in view)) {
-    throw new Error('OME-Zarr selection returned a scalar instead of a chunk')
-  }
-  const data = view.data
-  if (!ArrayBuffer.isView(data)) {
-    throw new Error('OME-Zarr chunk data is not buffer-backed')
-  }
-  return new Uint8Array(data.buffer, data.byteOffset, data.byteLength)
 }
 
 // Current uniform explode scale from the slider (1 = no gap between bricks).

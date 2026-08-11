@@ -23,7 +23,9 @@ import * as zarr from 'zarrita'
 import { NiiDataType } from '@/NVConstants'
 import type { ImageFromUrlOptions, TypedVoxelArray } from '@/NVTypes'
 import { channelColormapFor } from './channelColormaps'
+import { channelVolumeFile } from './channelVolumeFile'
 import {
+  allocTypedArrayLike,
   type OmeZarrAxis,
   type OmeZarrAxisIndices,
   type OmeZarrInfo,
@@ -34,7 +36,6 @@ import {
   omeZarrSpatialScaleUm,
   parseOmeZarrAttrs,
 } from './omeZarr'
-import { createNiftiArray } from './utils'
 
 /** Zarr dtypes this loader can hand to the NIfTI assembler. */
 const ZARR_TO_NIFTI: Record<string, number> = {
@@ -342,11 +343,9 @@ export function defaultOmeZarrLevel(
 }
 
 /**
- * Wrap an assembled channel as a NIfTI `File` ready for `loadVolumes`.
- *
- * The volume is centred on the origin so every channel and every pyramid
- * level of a dataset shares one world position regardless of which subset
- * was loaded.
+ * Wrap an assembled channel as a NIfTI `File` ready for `loadVolumes`,
+ * origin-centred like every microscopy channel loader (see
+ * `channelVolumeFile.ts`).
  */
 export function omeZarrChannelFile(
   dims: readonly [number, number, number],
@@ -355,39 +354,7 @@ export function omeZarrChannelFile(
   img: TypedVoxelArray,
   name: string,
 ): File {
-  const [nx, ny, nz] = dims
-  const [sx, sy, sz] = spacingUm
-  const affine = [
-    sx,
-    0,
-    0,
-    -(nx - 1) * 0.5 * sx,
-    0,
-    sy,
-    0,
-    -(ny - 1) * 0.5 * sy,
-    0,
-    0,
-    sz,
-    -(nz - 1) * 0.5 * sz,
-    0,
-    0,
-    0,
-    1,
-  ]
-  const bytes = createNiftiArray(
-    [nx, ny, nz],
-    [sx, sy, sz],
-    affine,
-    datatypeCode,
-    img,
-  )
-  return new File([bytes], `${name}.nii`, { type: 'application/octet-stream' })
-}
-
-function allocLike<T extends TypedVoxelArray>(source: T, length: number): T {
-  const ctor = source.constructor as new (length: number) => T
-  return new ctor(length)
+  return channelVolumeFile(dims, spacingUm, datatypeCode, img, name)
 }
 
 /**
@@ -413,7 +380,7 @@ export function omeZarrBlockToDisplay(
   if (strideX === 1 && strideY === nx && (nz === 1 || strideZ === nx * ny)) {
     return { img: data, dims: [nx, ny, nz] }
   }
-  const img = allocLike(data, nx * ny * nz)
+  const img = allocTypedArrayLike(data, nx * ny * nz)
   let out = 0
   for (let z = 0; z < nz; z++) {
     for (let y = 0; y < ny; y++) {

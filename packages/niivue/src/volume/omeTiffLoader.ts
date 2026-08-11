@@ -18,6 +18,7 @@
 import { maybeDecompress } from '@/codecs/NVGz'
 import type { ImageFromUrlOptions } from '@/NVTypes'
 import { channelColormapFor } from './channelColormaps'
+import { channelVolumeFile } from './channelVolumeFile'
 import type { OmeTiffInfo } from './omeTiff'
 import { parseTiff } from './tiff'
 import {
@@ -27,9 +28,7 @@ import {
   type TiffVolume,
   tiffChannelCount,
   tiffChannelName,
-  tiffVolumeAffine,
 } from './tiffVolume'
-import { createNiftiArray } from './utils'
 
 /** Options for {@link loadOmeTiffVolumes}. */
 export interface OmeTiffLoadOptions {
@@ -56,16 +55,19 @@ export function omeTiffChannelColormap(
   return channelColormapFor(info?.channels[channel]?.color, order)
 }
 
-/** Wrap an assembled channel as a NIfTI `File` ready for `loadVolumes`. */
+/**
+ * Wrap an assembled channel as a NIfTI `File` ready for `loadVolumes`,
+ * origin-centred like every microscopy channel loader (`tiffVolumeAffine` is
+ * the same centred affine `channelVolumeFile` builds).
+ */
 export function omeTiffChannelFile(volume: TiffVolume, name: string): File {
-  const bytes = createNiftiArray(
+  return channelVolumeFile(
     volume.dims,
     volume.spacingUm,
-    tiffVolumeAffine(volume).flat(),
     volume.datatypeCode,
     volume.img,
+    name,
   )
-  return new File([bytes], `${name}.nii`, { type: 'application/octet-stream' })
 }
 
 /**

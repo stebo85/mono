@@ -12,7 +12,21 @@
  * See `docs/ome-zarr-format.md`.
  */
 
+import type { TypedVoxelArray } from '@/NVTypes'
 import { omeLengthToMicrons } from './omeTiff'
+
+/**
+ * A zero-filled typed array of `source`'s concrete type. Shared by the
+ * whole-level loader's block transpose and the chunk source's brick repack,
+ * which both rebuild a read block without knowing its dtype statically.
+ */
+export function allocTypedArrayLike<T extends TypedVoxelArray>(
+  source: T,
+  length: number,
+): T {
+  const ctor = source.constructor as new (length: number) => T
+  return new ctor(length)
+}
 
 /** One entry of a multiscale's `axes` list. */
 export interface OmeZarrAxis {

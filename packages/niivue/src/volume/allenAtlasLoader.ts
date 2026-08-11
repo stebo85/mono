@@ -25,8 +25,8 @@ import {
   parseAllenAtlasInfo,
 } from './allenAtlas'
 import { channelColormapFor } from './channelColormaps'
+import { channelVolumeFile } from './channelVolumeFile'
 import { type DecodedImage, decodeImageRGBA } from './imageDecode'
-import { createNiftiArray } from './utils'
 
 /**
  * Colormap for one channel: the closest hue to the sidecar's `channel_colors`
@@ -42,44 +42,21 @@ export function allenAtlasChannelColormap(
 }
 
 /**
- * Assemble one deinterleaved channel into a NIfTI `File`.
- *
- * The volume is centred on the origin so every channel of a dataset shares one
- * world position regardless of which subset was loaded.
+ * Assemble one deinterleaved channel into a NIfTI `File`, origin-centred like
+ * every microscopy channel loader (see `channelVolumeFile.ts`).
  */
 export function allenAtlasChannelFile(
   info: AllenAtlasInfo,
   img: Uint8Array,
   name: string,
 ): File {
-  const dims = allenAtlasVolumeDims(info)
-  const spacing = allenAtlasSpacing(info)
-  const affine = [
-    spacing[0],
-    0,
-    0,
-    -(dims[0] - 1) * 0.5 * spacing[0],
-    0,
-    spacing[1],
-    0,
-    -(dims[1] - 1) * 0.5 * spacing[1],
-    0,
-    0,
-    spacing[2],
-    -(dims[2] - 1) * 0.5 * spacing[2],
-    0,
-    0,
-    0,
-    1,
-  ]
-  const bytes = createNiftiArray(
-    dims,
-    spacing,
-    affine,
+  return channelVolumeFile(
+    allenAtlasVolumeDims(info),
+    allenAtlasSpacing(info),
     NiiDataType.DT_UINT8,
     img,
+    name,
   )
-  return new File([bytes], `${name}.nii`, { type: 'application/octet-stream' })
 }
 
 /** Options for {@link loadAllenAtlasVolumes}. */

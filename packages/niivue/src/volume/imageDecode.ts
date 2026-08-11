@@ -12,43 +12,83 @@ export interface DecodedImage {
   data: Uint8ClampedArray
 }
 
-export async function decodeImageRGBA(
-  buffer: ArrayBuffer,
-): Promise<DecodedImage> {
-  const blob = new Blob([buffer])
-  if (typeof createImageBitmap === 'function') {
-    const bitmap = await createImageBitmap(blob)
+/**
+ * The bitmap path needs BOTH capabilities: `createImageBitmap` decodes and
+ * `OffscreenCanvas` rasterizes. They ship independently (a worker may have
+ * one without the other), so each is detected on its own and anything less
+ * falls through to the `document` path.
+ */
+function hasBitmapPath(): boolean {
+  return (
+    typeof createImageBitmap === 'function' &&
+    typeof OffscreenCanvas === 'function'
+  )
+}
+
+async function decodeViaBitmap(blob: Blob): Promise<DecodedImage> {
+  const bitmap = await createImageBitmap(blob)
+  // finally: the bitmap holds decoder-owned memory and must be closed on
+  // every path out of here, including a throwing drawImage/getImageData.
+  try {
     const canvas = new OffscreenCanvas(bitmap.width, bitmap.height)
     const ctx = canvas.getContext('2d')
     if (!ctx) {
-      bitmap.close()
       throw new Error('Unable to create 2D context for image decode')
     }
     ctx.drawImage(bitmap, 0, 0)
-    const imageData = ctx.getImageData(0, 0, bitmap.width, bitmap.height)
+    return ctx.getImageData(0, 0, bitmap.width, bitmap.height)
+  } finally {
     bitmap.close()
-    return imageData
   }
-  if (typeof document !== 'undefined') {
-    return new Promise((resolve, reject) => {
-      const img = new Image()
-      img.onload = () => {
+}
+
+function decodeViaImageElement(blob: Blob): Promise<DecodedImage> {
+  return new Promise((resolve, reject) => {
+    const img = new Image()
+    const url = URL.createObjectURL(blob)
+    // Every terminal path runs through settle exactly once, so the object URL
+    // is revoked on success, on decode failure, and on a throwing canvas op.
+    let settled = false
+    const settle = (action: () => void): void => {
+      if (settled) {
+        return
+      }
+      settled = true
+      URL.revokeObjectURL(url)
+      action()
+    }
+    img.onload = () => {
+      try {
         const canvas = document.createElement('canvas')
         canvas.width = img.width
         canvas.height = img.height
         const ctx = canvas.getContext('2d')
         if (!ctx) {
-          reject(new Error('Unable to create 2D context for image decode'))
-          return
+          throw new Error('Unable to create 2D context for image decode')
         }
         ctx.drawImage(img, 0, 0)
         const imageData = ctx.getImageData(0, 0, img.width, img.height)
-        URL.revokeObjectURL(img.src)
-        resolve(imageData)
+        settle(() => resolve(imageData))
+      } catch (err) {
+        settle(() => reject(err))
       }
-      img.onerror = () => reject(new Error('Failed to decode image'))
-      img.src = URL.createObjectURL(blob)
-    })
+    }
+    img.onerror = () => {
+      settle(() => reject(new Error('Failed to decode image')))
+    }
+    img.src = url
+  })
+}
+
+export async function decodeImageRGBA(
+  buffer: ArrayBuffer,
+): Promise<DecodedImage> {
+  const blob = new Blob([buffer])
+  if (hasBitmapPath()) {
+    return decodeViaBitmap(blob)
+  }
+  if (typeof document !== 'undefined') {
+    return decodeViaImageElement(blob)
   }
   throw new Error('No image decoding path available')
 }

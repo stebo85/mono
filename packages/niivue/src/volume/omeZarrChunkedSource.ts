@@ -26,6 +26,7 @@ import type {
   ChunkedVolumeFetch,
   ChunkedVolumeSource,
 } from './ChunkedVolumeSource'
+import { allocTypedArrayLike } from './omeZarr'
 import {
   type OmeZarrLoadOptions,
   type OmeZarrSource,
@@ -44,6 +45,11 @@ import { getBitsPerVoxel } from './utils'
  * a store is immutable for the life of a load, so an absence is permanent.
  * Absences cost 0 bytes and are evicted like any other entry.
  *
+ * `totalBytes <= maxBytes` holds after every operation: a value larger than
+ * the whole budget is never admitted (its key is simply left uncached, and no
+ * resident entries are evicted for it). A budget of 0 therefore caches only
+ * zero-byte absence entries; `Infinity` never evicts.
+ *
  * ```ts
  * const store = zarr.withByteCaching(new zarr.FetchStore(url), {
  *   cache: new ByteLruCache(256 * 2 ** 20),
@@ -57,7 +63,14 @@ export class ByteLruCache {
   >()
   private total = 0
 
-  constructor(readonly maxBytes: number) {}
+  constructor(readonly maxBytes: number) {
+    // Rejects NaN and negatives in one comparison; 0 and Infinity are valid.
+    if (!(maxBytes >= 0)) {
+      throw new Error(
+        `ByteLruCache: maxBytes must be a non-negative number, got ${maxBytes}`,
+      )
+    }
+  }
 
   /** Bytes currently held (absence entries count 0). */
   get totalBytes(): number {
@@ -86,8 +99,17 @@ export class ByteLruCache {
       this.entries.delete(key)
     }
     const bytes = value?.byteLength ?? 0
+    // A value larger than the whole budget can never be held within it. Do
+    // not admit it, and do not evict resident entries to make room that will
+    // not suffice. (The stale same-key entry was already dropped above.)
+    if (bytes > this.maxBytes) {
+      return
+    }
     this.entries.set(key, { value, bytes })
     this.total += bytes
+    // Every admitted entry fits the budget on its own, so evicting oldest
+    // first always reaches totalBytes <= maxBytes by the time one entry is
+    // left.
     while (this.total > this.maxBytes && this.entries.size > 1) {
       const oldest = this.entries.entries().next().value
       if (!oldest) {
@@ -111,11 +133,6 @@ export interface OmeZarrChunkedSourceOptions {
 export interface OmeZarrChunkedSource extends ChunkedVolumeSource {
   /** The opened store behind the adapter (levels, omero channels, axes). */
   readonly zarr: OmeZarrSource
-}
-
-function allocLike<T extends TypedVoxelArray>(source: T, length: number): T {
-  const ctor = source.constructor as new (length: number) => T
-  return new ctor(length)
 }
 
 /**
@@ -206,7 +223,7 @@ async function readLevelRegion(
     return bytes
   }
 
-  const out = allocLike(data, sx * sy * sz)
+  const out = allocTypedArrayLike(data, sx * sy * sz)
   for (let z = 0; z < rz; z++) {
     for (let y = 0; y < ry; y++) {
       const src = z * strideZ + y * strideY

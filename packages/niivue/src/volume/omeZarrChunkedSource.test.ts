@@ -304,6 +304,70 @@ describe('ByteLruCache', () => {
     expect(cache.totalBytes).toBe(0)
   })
 
+  test('never admits a value larger than the budget', () => {
+    const cache = new ByteLruCache(10)
+    cache.set('big', new Uint8Array(11))
+    expect(cache.has('big')).toBe(false)
+    expect(cache.totalBytes).toBe(0)
+
+    // Resident entries are not evicted to make room that will not suffice.
+    cache.set('a', new Uint8Array(4))
+    cache.set('b', new Uint8Array(4))
+    cache.set('huge', new Uint8Array(100))
+    expect(cache.has('a')).toBe(true)
+    expect(cache.has('b')).toBe(true)
+    expect(cache.has('huge')).toBe(false)
+    expect(cache.totalBytes).toBe(8)
+  })
+
+  test('replacing an entry with an oversized value drops the stale entry', () => {
+    const cache = new ByteLruCache(10)
+    cache.set('k', new Uint8Array(4))
+    cache.set('k', new Uint8Array(64))
+    // The old value must not survive as stale bytes, and the new one cannot
+    // be held, so the key ends up uncached.
+    expect(cache.has('k')).toBe(false)
+    expect(cache.get('k')).toBeUndefined()
+    expect(cache.totalBytes).toBe(0)
+  })
+
+  test('a value exactly equal to the budget is admitted', () => {
+    const cache = new ByteLruCache(10)
+    cache.set('exact', new Uint8Array(10))
+    expect(cache.has('exact')).toBe(true)
+    expect(cache.totalBytes).toBe(10)
+    // A second entry evicts the first rather than exceeding the bound.
+    cache.set('next', new Uint8Array(10))
+    expect(cache.has('exact')).toBe(false)
+    expect(cache.has('next')).toBe(true)
+    expect(cache.totalBytes).toBe(10)
+  })
+
+  test('a zero budget caches only zero-byte absences', () => {
+    const cache = new ByteLruCache(0)
+    cache.set('data', new Uint8Array(1))
+    expect(cache.has('data')).toBe(false)
+    cache.set('absent', undefined)
+    expect(cache.has('absent')).toBe(true)
+    expect(cache.totalBytes).toBe(0)
+  })
+
+  test('rejects negative and NaN budgets at construction', () => {
+    expect(() => new ByteLruCache(-1)).toThrow('non-negative')
+    expect(() => new ByteLruCache(Number.NaN)).toThrow('non-negative')
+    expect(() => new ByteLruCache(Number.POSITIVE_INFINITY)).not.toThrow()
+  })
+
+  test('totalBytes never exceeds maxBytes across mixed workloads', () => {
+    for (const budget of [1, 7, 10, 64, 1000]) {
+      const cache = new ByteLruCache(budget)
+      for (let i = 0; i < 50; i++) {
+        cache.set(`k${i % 13}`, i % 5 === 0 ? undefined : new Uint8Array(i))
+        expect(cache.totalBytes).toBeLessThanOrEqual(budget)
+      }
+    }
+  })
+
   test('with zarrita byte caching, an absent chunk is fetched once', async () => {
     const backing = makeChunkedZyxStore()
     backing.delete('/0/1.1.1') // the chunk holding the far corner

@@ -2,6 +2,7 @@ import NiiVue, {
   allenAtlasSpacing,
   fetchAllenAtlasInfo,
   loadAllenAtlasVolumes,
+  SHOW_RENDER,
   SLICE_TYPE,
 } from '../src/index.ts'
 
@@ -23,6 +24,9 @@ const describeButton = document.getElementById('describe')
 const loadButton = document.getElementById('load')
 const channelsBox = document.getElementById('channels')
 const opacityInput = document.getElementById('opacity')
+const clipCheck = document.getElementById('clipCheck')
+const clipOverlaysCheck = document.getElementById('clipOverlaysCheck')
+const zoomInput = document.getElementById('zoom')
 const statusLine = document.getElementById('status')
 // id="location" shadows window.location, so this one element is looked up.
 const footer = document.getElementById('location')
@@ -36,6 +40,9 @@ const nv1 = new NiiVue({
   backend,
   backgroundColor: [0, 0, 0, 1],
   sliceType: SLICE_TYPE.MULTIPLANAR,
+  // The clip and zoom controls act on the 3D render, so keep its tile in the
+  // multiplanar layout instead of the slices-only AUTO default.
+  showRender: SHOW_RENDER.ALWAYS,
   isColorbarVisible: false,
 })
 window.nv1 = nv1
@@ -128,6 +135,34 @@ opacityInput.oninput = () => {
     applyDisplay()
   }
 }
+
+// --- 3D clip plane + zoom (same controls as the OME-TIFF demo) --------------
+//
+// Every channel of a stack is an overlay, so without clipPlaneOverlay the
+// clip plane appears to do nothing here: overlays show through a clipped
+// base. Clip-overlays cuts a cross-section through the whole stack instead.
+clipCheck.onchange = () => {
+  nv1.setClipPlane(clipCheck.checked ? [0.1, 270, 0] : [2, 0, 0])
+}
+
+clipOverlaysCheck.onchange = () => {
+  nv1.clipPlaneOverlay = clipOverlaysCheck.checked
+}
+
+// While a clip plane is active the wheel adjusts the plane's depth, not the
+// camera, so the slider is the way to zoom a clipped render. Two-way: wheel
+// zoom (no clip active) emits 'change', which keeps the slider in step.
+zoomInput.oninput = () => {
+  nv1.scaleMultiplier = Number(zoomInput.value)
+}
+nv1.addEventListener('change', (e) => {
+  if (e.detail?.property !== 'scaleMultiplier') return
+  const value = Number(e.detail.value)
+  if (Number.isFinite(value) && Number(zoomInput.value) !== value) {
+    // Assigning .value fires no 'input', so this cannot loop.
+    zoomInput.value = String(value)
+  }
+})
 
 function selectedChannels() {
   return [...channelsBox.querySelectorAll('input:checked')].map((b) =>

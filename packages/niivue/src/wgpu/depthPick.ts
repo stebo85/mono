@@ -118,15 +118,27 @@ fn fragment_main(in: VertexOutput) -> FragmentOutput {
       }
     }
   }
-  // --- Overlay depth pick (no clip plane) ---
+  // --- Overlay depth pick. Overlays ignore the clip plane by default, but
+  // when clipPlaneOverlay is set the RENDER clips them with the base (solid
+  // keeps [sampleRange.x, sampleRange.y], cutaway skips it; see render.wgsl
+  // clipPassSkip). The pick must march the same clipped ray, or a
+  // double-click lands on invisible cut-away voxels in front of the plane.
+  // Gate on hasClip, matching the render. ---
   var overDepth = 1.0;
   var overHit = false;
+  let clipOverlay = (params.clipPlaneOverlay > 0.5) && hasClip;
   if (params.numVolumes > 1.0) {
     var overSamplePos = vec4f(origStart + dir * (stepSize * origRan), stepSize * origRan);
     let overSamplePosStart = overSamplePos;
     // Overlay fast pass
     for (var oj: i32 = 0; oj < 1024; oj++) {
       if (overSamplePos.a > origLen) { break; }
+      if (clipOverlay && !cutaway && overSamplePos.a > sampleRange.y) { break; }
+      let ovInRangeFast = overSamplePos.a >= sampleRange.x && overSamplePos.a <= sampleRange.y;
+      if (clipOverlay && select(!ovInRangeFast, ovInRangeFast, cutaway)) {
+        overSamplePos += deltaDirFast;
+        continue;
+      }
       let alpha = textureSampleLevel(overlay, tex_sampler, overSamplePos.xyz, 0.0).a;
       if (alpha >= 0.01) { break; }
       overSamplePos += deltaDirFast;
@@ -137,6 +149,12 @@ fn fragment_main(in: VertexOutput) -> FragmentOutput {
       // Overlay fine pass
       for (var oi: i32 = 0; oi < 2048; oi++) {
         if (overSamplePos.a > origLen) { break; }
+        if (clipOverlay && !cutaway && overSamplePos.a > sampleRange.y) { break; }
+        let ovInRange = overSamplePos.a >= sampleRange.x && overSamplePos.a <= sampleRange.y;
+        if (clipOverlay && select(!ovInRange, ovInRange, cutaway)) {
+          overSamplePos += deltaDir;
+          continue;
+        }
         let alpha = textureSampleLevel(overlay, tex_sampler, overSamplePos.xyz, 0.0).a;
         if (alpha >= 0.01) {
           overDepth = frac2ndc(overSamplePos.xyz);

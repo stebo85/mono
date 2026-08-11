@@ -12,7 +12,10 @@ import NiiVue, {
 // The default URL is the live Integrated Mitotic Stem Cell dataset. That host
 // sends no Access-Control-Allow-Origin header, so a browser will refuse the
 // fetch from this page — download the sidecar and its PNGs and use the file
-// picker instead, or point the URL at a CORS-enabled copy.
+// picker instead, or point the URL at a CORS-enabled copy. The volumetric
+// server is exactly such a copy: when it is running (bunx nx dev
+// iiif-volumetric-server, after fetch-allen) this page starts on its /allen
+// mirror automatically.
 
 const urlInput = document.getElementById('url')
 const filesInput = document.getElementById('files')
@@ -190,3 +193,28 @@ loadButton.onclick = async () => {
     loadButton.disabled = false
   }
 }
+
+// Start on the volumetric server's /allen fixture mirror when one is running:
+// the only host a browser can actually fetch this format from (see the header
+// comment). Probe quietly and briefly — on the public demo site there is no
+// localhost server and the page just keeps the live-URL default + file picker.
+const LOCAL_MIRROR =
+  'http://localhost:8080/allen/COMP_crop_Interphase_atlas.json'
+async function startOnLocalMirror() {
+  try {
+    const probe = new AbortController()
+    const timer = setTimeout(() => probe.abort(), 1500)
+    const res = await fetch(LOCAL_MIRROR, {
+      method: 'HEAD',
+      signal: probe.signal,
+    })
+    clearTimeout(timer)
+    if (!res.ok) return
+  } catch {
+    return
+  }
+  urlInput.value = LOCAL_MIRROR
+  await describe(urlSource(LOCAL_MIRROR))
+  if (source) await loadButton.onclick()
+}
+await startOnLocalMirror()

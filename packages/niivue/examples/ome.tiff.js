@@ -2,6 +2,7 @@ import NiiVue, {
   describeTiff,
   omeTiffVolumesFrom,
   parseTiff,
+  SHOW_RENDER,
   SLICE_TYPE,
   tiffChannelCount,
   tiffChannelName,
@@ -35,6 +36,9 @@ const fileInput = document.getElementById('file')
 const loadButton = document.getElementById('load')
 const channelsBox = document.getElementById('channels')
 const opacityInput = document.getElementById('opacity')
+const clipCheck = document.getElementById('clipCheck')
+const clipOverlaysCheck = document.getElementById('clipOverlaysCheck')
+const zoomInput = document.getElementById('zoom')
 const statusLine = document.getElementById('status')
 // id="location" shadows window.location, so this one element is looked up.
 const footer = document.getElementById('location')
@@ -100,6 +104,9 @@ const nv1 = new NiiVue({
   backend,
   backgroundColor: [0, 0, 0, 1],
   sliceType: SLICE_TYPE.MULTIPLANAR,
+  // The clip and zoom controls act on the 3D render, so keep its tile in the
+  // multiplanar layout instead of the slices-only AUTO default.
+  showRender: SHOW_RENDER.ALWAYS,
   isColorbarVisible: false,
 })
 window.nv1 = nv1
@@ -336,6 +343,37 @@ opacityInput.oninput = () => {
     applyDisplay()
   }
 }
+
+// --- 3D clip plane + zoom ---------------------------------------------------
+//
+// Right-dragging the render tile also positions a clip plane, but this
+// checkbox is the discoverable way in: on drops a plane through the stack at
+// a fixed angle, off retracts it (depth 2 is the "no clip" sentinel).
+clipCheck.onchange = () => {
+  nv1.setClipPlane(clipCheck.checked ? [0.1, 270, 0] : [2, 0, 0])
+}
+
+// Overlays normally show through a clipped base (each channel of a stack is
+// an overlay, so the clip appears to do nothing on a multi-channel load).
+// This is the core clipPlaneOverlay flag: cut every channel with the plane.
+clipOverlaysCheck.onchange = () => {
+  nv1.clipPlaneOverlay = clipOverlaysCheck.checked
+}
+
+// While a clip plane is active the wheel adjusts the plane's depth, not the
+// camera, so the slider is the way to zoom a clipped render. Two-way: wheel
+// zoom (no clip active) emits 'change', which keeps the slider in step.
+zoomInput.oninput = () => {
+  nv1.scaleMultiplier = Number(zoomInput.value)
+}
+nv1.addEventListener('change', (e) => {
+  if (e.detail?.property !== 'scaleMultiplier') return
+  const value = Number(e.detail.value)
+  if (Number.isFinite(value) && Number(zoomInput.value) !== value) {
+    // Assigning .value fires no 'input', so this cannot loop.
+    zoomInput.value = String(value)
+  }
+})
 
 loadButton.onclick = async () => {
   if (!source) {

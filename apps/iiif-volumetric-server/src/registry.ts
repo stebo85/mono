@@ -177,6 +177,13 @@ export class Registry {
     return this.entries.get(id)
   }
 
+  /** The first `${id}_${n}` not yet registered, counting up from 2. */
+  private claimFreeId(id: string): string {
+    let n = 2
+    while (this.entries.has(`${id}_${n}`)) n++
+    return `${id}_${n}`
+  }
+
   async load(id: string): Promise<RegistryEntry> {
     const entry = this.entries.get(id)
     if (!entry) throw new HttpError(404, `Unknown volume id: ${id}`)
@@ -244,6 +251,18 @@ export class Registry {
           )
         }
         for (const entry of entries) {
+          // Two SOURCES can sanitize to colliding ids too (`a b.nii` and
+          // `a_b.nii`). Overwriting would silently drop the earlier source's
+          // entry, so rename the later arrival instead and say so.
+          if (this.entries.has(entry.id)) {
+            const renamed = this.claimFreeId(entry.id)
+            console.warn(
+              `Registry id ${entry.id} (from ${entry.source}) is already ` +
+                `taken by ${this.entries.get(entry.id)?.source}; ` +
+                `registering as ${renamed}`,
+            )
+            entry.id = renamed
+          }
           this.entries.set(entry.id, entry)
           await this.refreshLevels(entry)
           void this.generatePyramidBackground(entry.id)
@@ -774,11 +793,31 @@ function stripVolumeExtensions(name: string): string {
   )
 }
 
+// A registry id for one channel, guaranteed unique within `used`. Preference
+// order: the sanitized channel name; then the channel index (two names that
+// sanitize identically); then a numeric suffix (a channel literally NAMED like
+// the index fallback, e.g. `c1`, can collide with it). The loop always
+// terminates because the suffix counts up through untaken ids.
+export function uniqueChannelId(
+  baseId: string,
+  channelName: string,
+  channelIndex: number,
+  used: ReadonlySet<string>,
+): string {
+  const named = `${baseId}_${sanitizeId(channelName)}`
+  if (!used.has(named)) return named
+  const indexed = `${baseId}_c${channelIndex}`
+  if (!used.has(indexed)) return indexed
+  let n = 2
+  while (used.has(`${indexed}_${n}`)) n++
+  return `${indexed}_${n}`
+}
+
 // One source becomes one entry, or one entry PER CHANNEL when the adapter
 // reports a channel axis. Splitting here rather than inside the routes is
 // what keeps channels invisible to the rest of the server: every entry is
 // an ordinary single-channel volume with its own id, levels and cache.
-async function buildEntries(
+export async function buildEntries(
   adapter: VolumeAdapter,
   source: string,
   baseId: string,
@@ -823,9 +862,8 @@ async function buildEntries(
   for (const ch of channels) {
     // A sanitized channel name can collide (two channels differing only by
     // punctuation), and a duplicate id would silently drop a channel from
-    // the registry, so fall back to the index.
-    let id = `${baseId}_${sanitizeId(ch.name)}`
-    if (used.has(id)) id = `${baseId}_c${ch.index}`
+    // the registry, so ids are generated until one is provably unique.
+    const id = uniqueChannelId(baseId, ch.name, ch.index, used)
     used.add(id)
     entries.push(make(id, probe, ch.index, ch.name))
   }

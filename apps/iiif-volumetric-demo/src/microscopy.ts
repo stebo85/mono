@@ -11,11 +11,22 @@
 // listed with a link to the page that streams them, so this page is still the
 // index of the microscopy demos rather than a subset of them.
 
-import NiiVue, {
-  type TypedVoxelArray,
-  VOLUME_RENDER_MODE,
-} from '@niivue/niivue'
+import NiiVue, { VOLUME_RENDER_MODE } from '@niivue/niivue'
 import { getBackendFromUrl } from './backend'
+import {
+  type ApiVolume,
+  type Dataset,
+  type Family,
+  groupDatasets,
+  hollowMask,
+  isLoadableHere,
+  isSegChannel,
+  opacityFor,
+  percentileWindow,
+  SerialLoadQueue,
+  suggestedOpacity,
+  visibleChannels,
+} from './microscopy-core'
 import { installNav } from './nav'
 
 installNav()
@@ -48,15 +59,6 @@ const DEFAULT_CHANNELS = 2
  */
 const RAW_SIGNAL_FRACTION = 0.015
 const RAW_SATURATION_FRACTION = 0.001
-
-// A segmentation mask is a filled solid where a fluorescence channel is sparse,
-// so the same overlay opacity that reads well for `_raw` buries everything
-// under `_seg`. Fade masks further than raw channels.
-const SEG_OPACITY_SCALE = 0.5
-
-// Whole-volume load budget. Bigger sources belong on the streaming pages, which
-// fetch a level/region at a time instead of the entire array.
-const MAX_WHOLE_VOLUME_VOXELS = 64_000_000
 
 // Distinct hues so stacked channels stay separable, one per channel of a full
 // 16-structure Allen dataset before the list repeats. Ordered so the common
@@ -129,46 +131,6 @@ const SPACING_UNIT: Record<string, string> = {
 const STREAMING_PAGES: Record<string, { href: string; label: string }> = {
   'ome-zarr': { href: '/omezarr.html', label: 'omezarr' },
   'dicom-wsi': { href: '/wsi.html', label: 'wsi' },
-}
-
-type Shape3 = [number, number, number]
-
-interface ApiVolume {
-  id: string
-  format: string
-  shape: Shape3
-  dtype: string
-  spacing: Shape3
-  channel: number | null
-  channelName: string | null
-  dataset: string
-  levels?: unknown[]
-}
-
-interface Dataset {
-  key: string
-  format: string
-  shape: Shape3
-  spacing: Shape3
-  channels: ApiVolume[]
-}
-
-// Which family of channels the sidebar lists.
-type Family = 'all' | 'raw' | 'seg'
-
-// Allen ships each tagged structure twice: the raw fluorescence image and the
-// segmentation derived from it, distinguished only by a `_raw` / `_seg` suffix
-// on the channel name. Nothing in the volume metadata separates them (both are
-// uint8 at the same shape), so the suffix is the only signal available — and
-// the two need opposite display treatment, since a mask has no internal
-// texture to window against.
-function isSegChannel(entry: ApiVolume): boolean {
-  return /_seg$/i.test(entry.channelName ?? '')
-}
-
-function matchesFamily(entry: ApiVolume, family: Family): boolean {
-  if (family === 'all') return true
-  return isSegChannel(entry) === (family === 'seg')
 }
 
 // `TUBA1B_71126_raw` -> `TUBA1B`. The middle token is the cell line and varies
@@ -245,9 +207,11 @@ const els = {
 let nv: NiiVue | null = null
 let datasets: Dataset[] = []
 let current: Dataset | null = null
-// Bumped per load so a superseded load (rapid dataset switching) drops its
-// result instead of windowing the volumes of the newer one.
-let loadToken = 0
+// Loads run strictly one at a time through this queue, latest-wins: an older
+// load can never finish AFTER a newer one and leave nv.volumes showing a
+// superseded selection (see SerialLoadQueue). A load superseded while queued
+// is skipped; one superseded while running skips its bookkeeping.
+const loadQueue = new SerialLoadQueue()
 let loaded: ApiVolume[] = []
 // Per-channel display window, keyed by registry id. See computeWindows().
 const windows = new Map<string, { calMin: number; calMax: number }>()
@@ -263,48 +227,12 @@ function showFallback(msg: string): void {
   els.fallback.style.display = 'flex'
 }
 
-function voxels(shape: Shape3): number {
-  return shape[0] * shape[1] * shape[2]
-}
-
 function unitFor(format: string): string {
   return SPACING_UNIT[format] ?? 'units'
 }
 
 function formatSpacing(d: Dataset): string {
   return `${d.spacing.map((s) => s.toPrecision(3)).join(' x ')} ${unitFor(d.format)}/voxel`
-}
-
-// One dataset per `dataset` key, channels in channel order.
-function groupDatasets(volumes: ApiVolume[]): Dataset[] {
-  const byKey = new Map<string, ApiVolume[]>()
-  for (const v of volumes) {
-    const list = byKey.get(v.dataset)
-    if (list) list.push(v)
-    else byKey.set(v.dataset, [v])
-  }
-  const out: Dataset[] = []
-  for (const [key, entries] of byKey) {
-    entries.sort((a, b) => (a.channel ?? 0) - (b.channel ?? 0))
-    const first = entries[0]
-    out.push({
-      key,
-      format: first.format,
-      shape: first.shape,
-      spacing: first.spacing,
-      channels: entries,
-    })
-  }
-  out.sort((a, b) => a.key.localeCompare(b.key))
-  return out
-}
-
-// A multi-channel source is microscopy by construction here; a single-channel
-// one qualifies only if it is small enough to fetch whole.
-function isLoadableHere(d: Dataset): boolean {
-  if (d.format === 'nifti') return false
-  if (d.channels.length > 1) return true
-  return voxels(d.shape) <= MAX_WHOLE_VOLUME_VOXELS
 }
 
 function channelBoxes(): HTMLInputElement[] {
@@ -337,10 +265,6 @@ function setAllChannels(checked: boolean): void {
     box.checked = checked && index < MAX_CHANNELS
   })
   refreshChannelLimit()
-}
-
-function visibleChannels(d: Dataset, family: Family): ApiVolume[] {
-  return d.channels.filter((entry) => matchesFamily(entry, family))
 }
 
 function buildChannelList(
@@ -430,66 +354,6 @@ function applyColormap(id: string, colormap: string): void {
   renderHud()
 }
 
-/**
- * Replace a label mask with its surface shell, in place.
- *
- * A mask is a filled solid, and a filled solid is opaque along any ray that
- * crosses it — so in the 3D render the largest structure (the nucleus of
- * `DNA_seg`) hides everything inside it no matter how far its alpha is turned
- * down. Alpha only controls how fast a ray saturates, not whether it does.
- *
- * Keeping only the labelled voxels that touch an unlabelled 6-neighbour turns
- * each mask into an outline in the 2D slices and a hollow shell in the 3D
- * render, which is what makes a whole segmentation stack legible at once.
- *
- * `floor` is the background level (`globalMin`), which the interior is reset to
- * rather than to zero: the display windows above the floor, so the emptied
- * interior has to land on it to read as background. `globalMin` / `globalMax`
- * are unchanged by this, since the shell keeps both extremes.
- *
- * Returns a NEW array rather than editing in place. Both backends cache the
- * uploaded source texture against `img.buffer` identity
- * (`prepareOrientTextureCache`), so an in-place edit is invisible to the GPU —
- * the cache reuses the texture it already has and nothing on screen changes.
- */
-function hollowMask(
-  img: TypedVoxelArray,
-  dims: [number, number, number],
-  floor: number,
-): TypedVoxelArray {
-  const [nx, ny, nz] = dims
-  const rowStride = nx
-  const sliceStride = nx * ny
-  const src = img
-  const out = img.slice()
-  for (let z = 0; z < nz; z++) {
-    for (let y = 0; y < ny; y++) {
-      for (let x = 0; x < nx; x++) {
-        const i = x + y * rowStride + z * sliceStride
-        if (src[i] <= floor) continue
-        // A voxel on a volume face has no neighbour beyond it. Treat the
-        // outside as unlabelled so a structure clipped by the field of view
-        // still closes instead of opening into a hole.
-        const interior =
-          x > 0 &&
-          x < nx - 1 &&
-          y > 0 &&
-          y < ny - 1 &&
-          z > 0 &&
-          z < nz - 1 &&
-          src[i - 1] > floor &&
-          src[i + 1] > floor &&
-          src[i - rowStride] > floor &&
-          src[i + rowStride] > floor &&
-          src[i - sliceStride] > floor &&
-          src[i + sliceStride] > floor
-        if (interior) out[i] = floor
-      }
-    }
-  }
-  return out
-}
-
 // Swap every loaded segmentation for its shell, then re-upload. Destructive to
 // the loaded copy, so the toggle re-runs the load (served from the HTTP cache)
 // rather than trying to undo it.
@@ -508,80 +372,6 @@ async function hollowLoadedMasks(): Promise<void> {
     changed = true
   })
   if (changed) await nv.updateGLVolume()
-}
-
-/**
- * Opacity for a loaded channel at its stack position.
- *
- * Volume 0 is niivue's base layer and is normally drawn opaque, which is right
- * for a raw fluorescence channel. It is wrong for a mask: a segmentation is a
- * filled solid, so an opaque one hides every channel stacked on it — that is
- * what made a seg-only selection render as a single flat blob, with the whole
- * nucleus of `DNA_seg` swallowing the structures inside it. When the base layer
- * is a mask, fade it like the rest.
- *
- * A hollowed mask is the opposite case and takes the plain overlay opacity: a
- * one-voxel shell occludes almost nothing and barely overlaps its neighbours,
- * so it does not need the extra fade a filled one does — and at the fade a
- * filled stack wants, a shell is too thin to see at all.
- */
-function opacityFor(
-  entry: ApiVolume | undefined,
-  index: number,
-  overlayOpacity: number,
-  hollow: boolean,
-): number {
-  const seg = entry ? isSegChannel(entry) : false
-  if (!seg) return index === 0 ? 1 : overlayOpacity
-  return hollow ? overlayOpacity : overlayOpacity * SEG_OPACITY_SCALE
-}
-
-/**
- * Intensities bracketing the top `lowFrac` / `highFrac` of a channel's voxels.
- *
- * A 256-bin histogram over the channel's own range, walked from the bright end.
- * Bin resolution is plenty here: the source is uint8, so the bins land on the
- * actual sample values rather than approximating them.
- *
- * Both fractions are of the whole volume, not of the above-floor voxels, which
- * is what makes one constant work across channels: a sparse structure and a
- * dense one differ mostly in how many voxels sit above the floor, and taking a
- * fixed share of the total lets the sparse one keep proportionally more of its
- * own signal.
- */
-function percentileWindow(
-  img: TypedVoxelArray,
-  min: number,
-  max: number,
-  lowFrac: number,
-  highFrac: number,
-): { calMin: number; calMax: number } {
-  const range = max - min
-  if (!(range > 0)) return { calMin: min, calMax: max }
-  const bins = new Uint32Array(256)
-  const scale = 255 / range
-  for (let i = 0; i < img.length; i++) {
-    const b = Math.round((img[i] - min) * scale)
-    bins[b < 0 ? 0 : b > 255 ? 255 : b]++
-  }
-  const lowTarget = img.length * lowFrac
-  const highTarget = img.length * highFrac
-  const value = (bin: number): number => min + (bin * range) / 255
-  let seen = 0
-  let calMax = max
-  let calMin = min
-  for (let b = 255; b >= 0; b--) {
-    seen += bins[b]
-    if (seen >= highTarget && calMax === max) calMax = value(b)
-    if (seen >= lowTarget) {
-      calMin = value(b)
-      break
-    }
-  }
-  // A channel flat enough that one bin crosses both targets would collapse to a
-  // zero-width window, which paints every voxel at the top of the colormap.
-  if (calMax <= calMin) calMax = max
-  return { calMin, calMax }
 }
 
 /**
@@ -677,30 +467,20 @@ function renderHud(): void {
   els.hud.textContent = lines.join('\n')
 }
 
-// Overlay opacity is a per-channel gain in an additive blend, so N channels at
-// a fixed opacity sum toward white: at the 0.6 that suits a two-channel view, a
-// full 16-channel stack blows out its dense core. Scale the default with the
-// count (verified: 16 raw Allen channels are legible near 0.12, unreadable at
-// 0.6). Anchored so the common 2-channel case still lands on 0.6. Once the user
-// moves the slider it is theirs, and this stops overriding it.
-//
-// Hollowed masks are exempt: shells cover a small fraction of the voxels and
-// hardly overlap, so the sum stays far from saturation however many are
-// stacked, and scaling them down just makes them invisible.
-function suggestedOpacity(entries: ApiVolume[], hollow: boolean): number {
-  if (entries.length < 2) return 0.6
-  if (hollow && entries.every(isSegChannel)) return 0.6
-  return Math.min(0.6, Math.max(0.12, 1.2 / entries.length))
+function loadSelected(): Promise<void> {
+  return loadQueue.schedule((isCurrent) => runLoad(isCurrent))
 }
 
-async function loadSelected(): Promise<void> {
+// The body of one load, run exclusively by the queue. Selection and controls
+// are read at RUN time, so a queued load acts on the UI as it stands when its
+// turn comes rather than as it stood when it was scheduled.
+async function runLoad(isCurrent: () => boolean): Promise<void> {
   if (!nv || !current) return
   const ids = selectedBoxes().map((b) => b.value)
   const entries = current.channels.filter((e) => ids.includes(e.id))
   if (!opacityTouched) {
     els.opacity.value = String(suggestedOpacity(entries, els.hollow.checked))
   }
-  const myToken = ++loadToken
   els.load.disabled = true
   els.status.textContent = entries.length
     ? `loading ${entries.length} channel(s)…`
@@ -725,19 +505,20 @@ async function loadSelected(): Promise<void> {
       })),
     )
   } catch (err) {
-    if (myToken !== loadToken) return
+    if (!isCurrent()) return
     els.status.textContent = `load failed: ${err instanceof Error ? err.message : err}`
     return
   } finally {
-    if (myToken === loadToken) els.load.disabled = false
+    if (isCurrent()) els.load.disabled = false
   }
-  // A newer load superseded this one while these channels streamed.
-  if (myToken !== loadToken) return
+  // A newer load was scheduled while these channels streamed; it runs next in
+  // the queue and will overwrite the scene, so skip the bookkeeping here.
+  if (!isCurrent()) return
   loaded = entries
   computeWindows()
   applyDisplay()
   if (els.hollow.checked) await hollowLoadedMasks()
-  if (myToken !== loadToken) return
+  if (!isCurrent()) return
   nv.sliceType = Number(els.layout.value)
   nv.drawScene()
   els.status.textContent = ''

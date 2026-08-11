@@ -36,6 +36,7 @@ const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || `http://${HOST}:${PORT}`
 const FIXTURES_DIR =
   process.env.FIXTURES_DIR || path.resolve(__dirname, '..', 'fixtures')
 const OMEZARR_FIXTURES_DIR = path.join(FIXTURES_DIR, 'omezarr')
+const ALLEN_FIXTURES_DIR = path.join(FIXTURES_DIR, 'allen')
 
 interface NiivuePackage {
   name: string
@@ -142,6 +143,15 @@ async function main(): Promise<void> {
         },
       }),
     )
+  }
+
+  // Raw Allen JSON+PNG atlas files (fetch-allen output). The live Allen host
+  // sends no CORS headers, so browser demos of the library's atlas loader
+  // (e.g. niivue's allen.atlas.html) can only fetch the format from this
+  // local mirror; the global cors() above is what makes that possible.
+  if (fs.existsSync(ALLEN_FIXTURES_DIR)) {
+    console.log(`Mounting Allen atlas fixtures from ${ALLEN_FIXTURES_DIR}`)
+    app.use('/allen', express.static(ALLEN_FIXTURES_DIR))
   }
 
   if (NIIVUE_DIST) {

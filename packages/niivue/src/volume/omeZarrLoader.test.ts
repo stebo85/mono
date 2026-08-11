@@ -299,6 +299,59 @@ describe('omeZarrVolumesFrom', () => {
     }
   })
 
+  test('a sparse store reads absent chunks as the fill value', async () => {
+    const store = new Map<string, Uint8Array>()
+    store.set('/.zgroup', jsonBytes({ zarr_format: 2 }))
+    store.set(
+      '/.zattrs',
+      jsonBytes({
+        multiscales: [
+          {
+            version: '0.4',
+            axes: [
+              { name: 'z', type: 'space' },
+              { name: 'y', type: 'space' },
+              { name: 'x', type: 'space' },
+            ],
+            datasets: [
+              {
+                path: '0',
+                coordinateTransformations: [
+                  { type: 'scale', scale: [1, 1, 1] },
+                ],
+              },
+            ],
+          },
+        ],
+      }),
+    )
+    // 4x2x2 in 2x2x2 chunks: two chunks along z, only the first stored.
+    // Sparse stores lean on zarr's absent-chunk-means-fill-value convention
+    // (the stag beetle's finest level omits 121 of 256 chunks), and the fill
+    // value is deliberately nonzero so a zero-filled default cannot pass.
+    store.set(
+      '/0/.zarray',
+      jsonBytes({
+        zarr_format: 2,
+        shape: [4, 2, 2],
+        chunks: [2, 2, 2],
+        dtype: '<u2',
+        compressor: null,
+        fill_value: 7,
+        order: 'C',
+        filters: null,
+      }),
+    )
+    store.set(
+      '/0/0.0.0',
+      new Uint8Array(new Uint16Array([1, 2, 3, 4, 5, 6, 7, 8]).buffer),
+    )
+    const volumes = await omeZarrVolumesFrom(await openOmeZarr(store))
+    const voxels = await fileVoxels(volumes[0].url as File)
+    expect([...voxels.slice(0, 8)]).toEqual([1, 2, 3, 4, 5, 6, 7, 8])
+    expect([...voxels.slice(8)]).toEqual([7, 7, 7, 7, 7, 7, 7, 7])
+  })
+
   test('rejects an unsupported dtype', async () => {
     const store = makeXyzStore()
     store.set('/0/.zarray', zarray([2, 3, 4], '<i8'))

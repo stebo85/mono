@@ -187,6 +187,8 @@ const els = {
   hollow: el<HTMLInputElement>('hollow'),
   shading: el<HTMLInputElement>('shading'),
   maxProject: el<HTMLInputElement>('maxproject'),
+  clip: el<HTMLInputElement>('clip'),
+  clipOverlays: el<HTMLInputElement>('clipoverlays'),
   alpha2d: el<HTMLInputElement>('alpha2d'),
   load: el<HTMLButtonElement>('load'),
   clear: el<HTMLButtonElement>('clear'),
@@ -683,6 +685,18 @@ async function main(): Promise<void> {
     nv.volumeRenderMode = els.maxProject.checked
       ? VOLUME_RENDER_MODE.MAXIMUM
       : VOLUME_RENDER_MODE.COMPOSITE
+  })
+  // Clip plane through the stack; depth 2 is niivue's "no clip" sentinel.
+  // Right-dragging the 3D view repositions the plane once one is active.
+  els.clip.addEventListener('change', () => {
+    if (!nv) return
+    nv.setClipPlane(els.clip.checked ? [0.1, 270, 0] : [2, 0, 0])
+  })
+  // Every channel here is an overlay, so without this the plane only cuts
+  // the base layer and appears to do nothing to the stack.
+  els.clipOverlays.addEventListener('change', () => {
+    if (!nv) return
+    nv.clipPlaneOverlay = els.clipOverlays.checked
   })
   els.alpha2d.addEventListener('change', () => {
     if (!nv) return

@@ -2659,7 +2659,20 @@ export default class NVView {
           volumeTexture.depthOrArrayLayers,
         ]
         const zeroPaqdUniforms = [0, 0, 0, 0]
-        const renderParamPadding = [0, 0, 0, 0, 0, 0, 0]
+        // The 7 floats after earlyTermination: clipPlaneOverlay, fadeAlpha,
+        // renderMode, then _pad0 + implicit struct padding. clipPlaneOverlay
+        // must carry the LIVE flag — the pick shader clips its overlay pass
+        // with it, and a zero here made picks land on cut-away overlay voxels
+        // (WebGL2 sets the same uniform by name in drawDepthPick).
+        const renderParamPadding = [
+          md.scene.clipPlaneOverlay ? 1.0 : 0.0,
+          1.0, // fadeAlpha: no cross-fade in a pick draw
+          0,
+          0,
+          0,
+          0,
+          0,
+        ]
         const identityChunkUniforms = [
           ...volumeTexDimsFull,
           1,

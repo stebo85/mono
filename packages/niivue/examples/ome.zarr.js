@@ -20,6 +20,7 @@ const sampleSelect = document.getElementById('sample')
 const urlInput = document.getElementById('url')
 const fetchButton = document.getElementById('fetchUrl')
 const levelSelect = document.getElementById('level')
+const viewSelect = document.getElementById('view')
 const timepointPair = document.getElementById('timepointPair')
 const timepointInput = document.getElementById('timepoint')
 const creditLine = document.getElementById('credit')
@@ -237,6 +238,10 @@ opacityInput.oninput = () => {
   }
 }
 
+viewSelect.onchange = () => {
+  nv1.sliceType = Number(viewSelect.value)
+}
+
 /** The load options of the volumes on screen, for re-applying opacity. */
 let lastLoaded = null
 
@@ -265,8 +270,12 @@ loadButton.onclick = async () => {
     const vol = nv1.volumes[0]
     const voxels = vol.dimsRAS.slice(1, 4)
     // A single-slice image (a 2D store) has nothing to show in the other two
-    // planes, so give the whole canvas to the axial.
-    nv1.sliceType = voxels[2] > 1 ? SLICE_TYPE.MULTIPLANAR : SLICE_TYPE.AXIAL
+    // planes, so give the whole canvas to the axial; a 3D store follows the
+    // View selector (the selector reflects the override so it never lies).
+    const view =
+      voxels[2] > 1 ? Number(viewSelect.value) : SLICE_TYPE.AXIAL
+    nv1.sliceType = view
+    viewSelect.value = String(view)
     say(
       `Showing ${volumes.map((v) => v.name).join(', ')} - ` +
         `${voxels.join(' x ')} voxels, ` +

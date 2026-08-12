@@ -193,9 +193,9 @@ async function main() {
   const updateHud = () => {
     const label = backend === 'webgpu' ? 'WebGPU' : 'WebGL2'
     const s = slide.stats
-    const lod =
+    const lodLabel =
       lodSel.value === 'auto' ? 'LOD auto' : `LOD pinned L${lodSel.value}`
-    hud.textContent = `${slide.manifest.name}\nMNI152 + slide plane · ${label} · ${lod}\ntiles ${s.completed}/${s.requested} · ${(s.wireBytes / 1024).toFixed(0)} KB\ndraw mode ${drawMode ? 'ON' : 'off'} (d toggle · u undo · c clear)`
+    hud.textContent = `${slide.manifest.name}\nMNI152 + slide plane · ${label} · ${lodLabel}\ntiles ${s.completed}/${s.requested} · ${(s.wireBytes / 1024).toFixed(0)} KB\ndraw mode ${drawMode ? 'ON' : 'off'} (d toggle · u undo · c clear)`
   }
   slide.addEventListener('change', updateHud)
   updateHud()

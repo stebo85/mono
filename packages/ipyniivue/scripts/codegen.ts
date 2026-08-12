@@ -56,6 +56,14 @@ const NON_SERIALIZABLE_METHODS = new Map<string, string>([
     'argument is not JSON-serializable (volume transform with JS function hooks)',
   ],
   [
+    'registerOverlayRenderer',
+    'argument and return value are not JSON-serializable (JS overlay renderer and disposer function)',
+  ],
+  [
+    'unregisterOverlayRenderer',
+    'argument is not JSON-serializable (JS overlay renderer)',
+  ],
+  [
     'useLoader',
     'argument is not JSON-serializable (converter must be a JS function)',
   ],

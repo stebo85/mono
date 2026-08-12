@@ -866,21 +866,6 @@ and its volumes alive."""
         """
         self.send({"cmd": "refreshSlideAnnotation", "args": []})
 
-    async def register_overlay_renderer(self, renderer: Any) -> Any:
-        """Register a privileged overlay renderer (e.g.
-
-        a
-
-        Parameters
-        ----------
-        renderer : UIKitOverlayRenderer
-
-        Returns
-        -------
-        () => void
-        """
-        return await self._request("registerOverlayRenderer", _make_args(renderer))
-
     async def reinitialize_view(self, options: Any = _UNSET) -> Any:
         return await self._request("reinitializeView", _make_args(options))
 
@@ -1443,15 +1428,6 @@ and its volumes alive."""
         plan : ChunkPlan
         """
         self.send({"cmd": "swapVolumeChunkPlan", "args": _make_args(volume_id, plan)})
-
-    def unregister_overlay_renderer(self, renderer: Any) -> None:
-        """Remove a previously registered overlay renderer.
-
-        Parameters
-        ----------
-        renderer : UIKitOverlayRenderer
-        """
-        self.send({"cmd": "unregisterOverlayRenderer", "args": _make_args(renderer)})
 
     def update_gl_volume(self) -> None:
         self.send({"cmd": "updateGLVolume", "args": []})

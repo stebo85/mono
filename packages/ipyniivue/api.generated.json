@@ -2486,23 +2486,6 @@
       "returnsDoc": null
     },
     {
-      "jsName": "registerOverlayRenderer",
-      "pyName": "register_overlay_renderer",
-      "isAsync": false,
-      "returnsValue": true,
-      "params": [
-        {
-          "name": "renderer",
-          "tsType": "UIKitOverlayRenderer",
-          "optional": false,
-          "doc": null
-        }
-      ],
-      "returns": "() => void",
-      "doc": "Register a privileged overlay renderer (e.g. a",
-      "returnsDoc": null
-    },
-    {
       "jsName": "reinitializeView",
       "pyName": "reinitialize_view",
       "isAsync": true,
@@ -3569,23 +3552,6 @@
       "returnsDoc": null
     },
     {
-      "jsName": "unregisterOverlayRenderer",
-      "pyName": "unregister_overlay_renderer",
-      "isAsync": false,
-      "returnsValue": false,
-      "params": [
-        {
-          "name": "renderer",
-          "tsType": "UIKitOverlayRenderer",
-          "optional": false,
-          "doc": null
-        }
-      ],
-      "returns": "void",
-      "doc": "Remove a previously registered overlay renderer.",
-      "returnsDoc": null
-    },
-    {
       "jsName": "updateGLVolume",
       "pyName": "update_gl_volume",
       "isAsync": true,
@@ -3912,8 +3878,16 @@
         "reason": "return value is not JSON-serializable (JS extension context handle)"
       },
       {
+        "jsName": "registerOverlayRenderer",
+        "reason": "argument and return value are not JSON-serializable (JS overlay renderer and disposer function)"
+      },
+      {
         "jsName": "registerVolumeTransform",
         "reason": "argument is not JSON-serializable (volume transform with JS function hooks)"
+      },
+      {
+        "jsName": "unregisterOverlayRenderer",
+        "reason": "argument is not JSON-serializable (JS overlay renderer)"
       },
       {
         "jsName": "useLoader",

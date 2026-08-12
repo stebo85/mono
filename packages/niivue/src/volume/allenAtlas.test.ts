@@ -70,6 +70,57 @@ describe('parseAllenAtlasInfo', () => {
     ).toThrow(/past the declared/)
   })
 
+  const badInts: Array<[string, number]> = [
+    ['fractional', 2.5],
+    ['zero', 0],
+    ['negative', -3],
+    ['NaN', Number.NaN],
+    ['infinite', Number.POSITIVE_INFINITY],
+  ]
+  for (const field of ['channels', 'tiles', 'tile_width', 'times', 'width']) {
+    for (const [label, value] of badInts) {
+      test(`rejects a ${label} '${field}'`, () => {
+        expect(() =>
+          parseAllenAtlasInfo({ ...SIDECAR, [field]: value }),
+        ).toThrow(/positive integer/)
+      })
+    }
+  }
+
+  test('keeps channel colours positional across an invalid entry', () => {
+    const info = parseAllenAtlasInfo({
+      ...SIDECAR,
+      channel_colors: [[255, 0, 0], 'nope', [0, 0, 255], [1, 2]],
+    })
+    expect(info.channelColors).toEqual([[255, 0, 0], null, [0, 0, 255], null])
+  })
+
+  test('treats malformed or out-of-range colour components as absent', () => {
+    const info = parseAllenAtlasInfo({
+      ...SIDECAR,
+      channel_colors: [
+        [255, 'x', 0],
+        [0, -1, 0],
+        [0, 256, 0],
+        [Number.NaN, 0, 0],
+        [0, Number.POSITIVE_INFINITY, 0],
+        [12, 34, 56],
+      ],
+    })
+    expect(info.channelColors).toEqual([
+      null,
+      null,
+      null,
+      null,
+      null,
+      [12, 34, 56],
+    ])
+  })
+
+  test('yields no channel colours when the sidecar omits them', () => {
+    expect(parseAllenAtlasInfo(SIDECAR).channelColors).toEqual([])
+  })
+
   test('names channels when the sidecar omits channel_names', () => {
     const { channel_names: _n, ...rest } = SIDECAR
     expect(parseAllenAtlasInfo(rest).channelNames).toEqual([

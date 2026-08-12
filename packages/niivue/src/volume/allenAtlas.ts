@@ -29,8 +29,12 @@ export interface AllenAtlasInfo {
   channels: number
   /** Per-channel label, always `channels` entries. */
   channelNames: string[]
-  /** Optional per-channel RGB triplet, 0-255. */
-  channelColors: number[][]
+  /**
+   * Per-channel RGB triplet, 0-255, indexed by channel; null where the sidecar
+   * has no valid colour for that channel (the loader falls back to the shared
+   * palette). May be shorter than `channels` when the sidecar's array is.
+   */
+  channelColors: (number[] | null)[]
   /** Tile grid of one atlas. */
   rows: number
   cols: number
@@ -70,10 +74,10 @@ interface AllenAtlasJson {
 }
 
 function positiveInt(value: unknown, field: string): number {
-  if (typeof value !== 'number' || !Number.isFinite(value) || value < 1) {
-    throw new Error(`Allen atlas: '${field}' must be a positive number`)
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < 1) {
+    throw new Error(`Allen atlas: '${field}' must be a positive integer`)
   }
-  return Math.round(value)
+  return value
 }
 
 function positiveNumber(value: unknown, fallback: number): number {
@@ -97,15 +101,23 @@ function stringArray(value: unknown, length: number): string[] {
   )
 }
 
-function colorArray(value: unknown): number[][] {
+/**
+ * Per-channel colours, kept POSITIONAL: entry i colours channel i, so a bad
+ * entry becomes null (palette fallback for that one channel) rather than being
+ * dropped, which would shift every later colour onto the wrong channel.
+ */
+function colorArray(value: unknown): (number[] | null)[] {
   if (!Array.isArray(value)) return []
-  const colors: number[][] = []
-  for (const entry of value) {
-    if (!Array.isArray(entry) || entry.length < 3) continue
-    const rgb = entry.slice(0, 3).map((c) => (typeof c === 'number' ? c : 0))
-    colors.push(rgb)
-  }
-  return colors
+  return value.map((entry) => {
+    if (!Array.isArray(entry) || entry.length < 3) return null
+    const rgb: number[] = []
+    for (const c of entry.slice(0, 3)) {
+      if (typeof c === 'number' && Number.isFinite(c) && c >= 0 && c <= 255) {
+        rgb.push(c)
+      }
+    }
+    return rgb.length === 3 ? rgb : null
+  })
 }
 
 function parseImages(value: unknown, channels: number): AllenAtlasImage[] {

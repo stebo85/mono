@@ -31,6 +31,17 @@ interface Options {
   force: boolean
 }
 
+// A non-integer here is worse than a bad default: NaN or 0 makes
+// runWithConcurrency spawn no workers, so the run "succeeds" downloading
+// nothing. Exported for tests.
+export function parseConcurrency(raw: string): number {
+  const n = Number(raw)
+  if (!Number.isInteger(n) || n < 1) {
+    throw new Error(`concurrency must be a positive integer, got '${raw}'`)
+  }
+  return n
+}
+
 function parseArgs(): Options {
   const args = new Map<string, string>()
   for (const raw of process.argv.slice(2)) {
@@ -54,9 +65,8 @@ function parseArgs(): Options {
         env.ALLEN_FIXTURES_DIR ??
         path.resolve(__dirname, '..', 'fixtures', 'allen'),
     ),
-    concurrency: Math.max(
-      1,
-      Number(args.get('concurrency') ?? env.FETCH_CONCURRENCY ?? '4'),
+    concurrency: parseConcurrency(
+      args.get('concurrency') ?? env.FETCH_CONCURRENCY ?? '4',
     ),
     force: args.get('force') === 'true',
   }
@@ -183,7 +193,9 @@ async function main(): Promise<void> {
   if (failed > 0) process.exit(1)
 }
 
-main().catch((err: unknown) => {
-  console.error(err)
-  process.exit(1)
-})
+if (import.meta.main) {
+  main().catch((err: unknown) => {
+    console.error(err)
+    process.exit(1)
+  })
+}

@@ -38,6 +38,8 @@ jobs:
           token: ${{ secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
 
       - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version-file: .bun-version
 
       - uses: actions/setup-node@v4
         with:

@@ -62,6 +62,21 @@ bunx nx reset                        # Clear Nx cache
 
 Prefer `nx affected` over `nx run-many` when working on a branch.
 
+## Repository knowledge graph
+
+Before broad source searches, use the local knowledge graph to identify the
+smallest relevant project, files, symbols, tests, and documentation:
+
+```bash
+bun run graph:build
+bun run graph:query <project-file-or-symbol> --depth=1 --max-nodes=30
+```
+
+The generated `.repo-graph/graph.json` is ignored and disposable. Rebuild it
+when project configuration, imports, exported symbols, tests, or documentation
+change. Use its output for routing, then inspect the selected source files; do
+not treat the graph as a substitute for current code. See `KNOWLEDGE_GRAPH.md`.
+
 ## Creating new code
 
 ### When to create a new lib vs. app

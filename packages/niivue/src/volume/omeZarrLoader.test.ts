@@ -270,6 +270,24 @@ describe('omeZarrVolumesFrom', () => {
     expect(voxels).toHaveLength(2 * 2)
   })
 
+  test('falls back to the coarsest level when nothing fits the budget', async () => {
+    const source = await openOmeZarr(makeTczyxStore())
+    expect(defaultOmeZarrLevel(source, 0)).toBe(1)
+  })
+
+  test('skips levels with an unknown decoded size', async () => {
+    const source = await openOmeZarr(makeTczyxStore())
+    // A level whose channelBytes could not be computed must not be chosen
+    // just because 0 fits any budget.
+    const patched = {
+      ...source,
+      levels: source.levels.map((level, i) =>
+        i === 0 ? { ...level, channelBytes: 0 } : level,
+      ),
+    }
+    expect(defaultOmeZarrLevel(patched, Number.MAX_SAFE_INTEGER)).toBe(1)
+  })
+
   test('validates channel, timepoint and level before any read', async () => {
     const source = await openOmeZarr(makeTczyxStore())
     await expect(omeZarrVolumesFrom(source, { channels: [2] })).rejects.toThrow(

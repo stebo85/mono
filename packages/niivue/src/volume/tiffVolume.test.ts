@@ -2,7 +2,7 @@ import { describe, expect, test } from 'bun:test'
 import { NiiDataType } from '@/NVConstants'
 import { channelColormapFor } from './channelColormaps'
 import { parseTiff, TIFF_TAG } from './tiff'
-import { buildTiff, type Entry } from './tiffBuilders'
+import { buildMultiIfd, buildTiff } from './tiffBuilders'
 import {
   describeTiff,
   readTiffVolume,
@@ -24,110 +24,9 @@ function stackTiff(
   width = 2,
   height = 1,
 ): ArrayBuffer {
-  // The test builder writes one IFD, so a multi-plane stack is emulated by
-  // giving that IFD one strip per row is not enough - instead build each plane
-  // as its own IFD via `buildMultiIfd` below.
+  // A multi-plane stack needs one IFD per plane, which the shared builder
+  // assembles by chaining single-IFD files.
   return buildMultiIfd(planes, description, width, height)
-}
-
-/**
- * Build a multi-IFD TIFF by concatenating single-IFD files and relinking them.
- *
- * The test builder in `tiff.test.ts` writes one IFD; chaining them here keeps
- * that builder simple while still exercising the reader's IFD walk.
- */
-function buildMultiIfd(
-  planes: number,
-  description: string | undefined,
-  width: number,
-  height: number,
-): ArrayBuffer {
-  const parts: Uint8Array[] = []
-  const ifdOffsets: number[] = []
-  let cursor = 8 // room for the shared header
-
-  for (let i = 0; i < planes; i++) {
-    const extra: Entry[] = []
-    if (i === 0 && description !== undefined) {
-      extra.push({
-        tag: TIFF_TAG.imageDescription,
-        type: 2,
-        values: description,
-      })
-    }
-    const single = new Uint8Array(
-      buildTiff({
-        entries: [
-          { tag: TIFF_TAG.imageWidth, type: 3, values: [width] },
-          { tag: TIFF_TAG.imageLength, type: 3, values: [height] },
-          { tag: TIFF_TAG.bitsPerSample, type: 3, values: [8] },
-          { tag: TIFF_TAG.compression, type: 3, values: [1] },
-          { tag: TIFF_TAG.samplesPerPixel, type: 3, values: [1] },
-          { tag: TIFF_TAG.rowsPerStrip, type: 3, values: [height] },
-          ...extra,
-        ],
-        blocks: [new Uint8Array(width * height).fill(i)],
-      }),
-    )
-    const view = new DataView(single.buffer)
-    const localIfd = view.getUint32(4, true)
-    // Drop the per-part header and rebase every absolute offset onto `cursor`.
-    const body = single.subarray(8)
-    const shift = cursor - 8
-    if (shift !== 0) {
-      rebaseIfd(body, localIfd - 8, shift)
-    }
-    ifdOffsets.push(localIfd + shift)
-    parts.push(body)
-    cursor += body.length
-  }
-
-  const total = new Uint8Array(cursor)
-  const view = new DataView(total.buffer)
-  view.setUint16(0, 0x4949, false)
-  view.setUint16(2, 42, true)
-  view.setUint32(4, ifdOffsets[0], true)
-  let at = 8
-  for (const part of parts) {
-    total.set(part, at)
-    at += part.length
-  }
-  // Chain the IFDs together.
-  for (let i = 0; i < ifdOffsets.length; i++) {
-    const count = view.getUint16(ifdOffsets[i], true)
-    const linkAt = ifdOffsets[i] + 2 + count * 12
-    view.setUint32(
-      linkAt,
-      i + 1 < ifdOffsets.length ? ifdOffsets[i + 1] : 0,
-      true,
-    )
-  }
-  return total.buffer
-}
-
-/** Add `shift` to every offset an IFD stores, in a header-stripped body. */
-function rebaseIfd(body: Uint8Array, ifdAt: number, shift: number): void {
-  const view = new DataView(body.buffer, body.byteOffset, body.byteLength)
-  const count = view.getUint16(ifdAt, true)
-  for (let i = 0; i < count; i++) {
-    const at = ifdAt + 2 + i * 12
-    const type = view.getUint16(at + 2, true)
-    const n = view.getUint32(at + 4, true)
-    const size = type === 3 ? 2 : type === 4 ? 4 : type === 5 ? 8 : 1
-    const bytes = n * size
-    if (bytes > 4) {
-      view.setUint32(at + 8, view.getUint32(at + 8, true) + shift, true)
-    } else if (type === 4 || type === 16) {
-      // Inline strip offsets and byte counts: only offsets need rebasing.
-      const tag = view.getUint16(at, true)
-      if (tag === TIFF_TAG.stripOffsets || tag === TIFF_TAG.tileOffsets) {
-        for (let v = 0; v < n; v++) {
-          const vat = at + 8 + v * 4
-          view.setUint32(vat, view.getUint32(vat, true) + shift, true)
-        }
-      }
-    }
-  }
 }
 
 const OME_TWO_CHANNEL = `<OME><Image Name="two channel">

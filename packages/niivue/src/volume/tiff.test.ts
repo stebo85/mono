@@ -1,10 +1,12 @@
 import { describe, expect, test } from 'bun:test'
 import {
+  applyHorizontalPredictor,
   decodeLzw,
   decodePackBits,
   parseTiff,
   readTiffImage,
   SAMPLE_FORMAT,
+  sampleArrayCtor,
   TIFF_TAG,
   tagString,
   tagValue,
@@ -366,5 +368,248 @@ describe('tiffResolutionMm', () => {
       }),
     )
     expect(tiffResolutionMm(tiff.ifds[0])).toBeUndefined()
+  })
+})
+
+/** Pack `values` as fixed-width samples, wrapping negatives per TIFF. */
+function sampleBytes(
+  values: number[],
+  bitsPerSample: number,
+  littleEndian: boolean,
+): Uint8Array {
+  const bytes = bitsPerSample >> 3
+  const out = new Uint8Array(values.length * bytes)
+  const view = new DataView(out.buffer)
+  values.forEach((value, i) => {
+    if (bytes === 1) {
+      out[i] = value & 0xff
+    } else if (bytes === 2) {
+      view.setUint16(i * 2, value & 0xffff, littleEndian)
+    } else {
+      view.setUint32(i * 4, value >>> 0, littleEndian)
+    }
+  })
+  return out
+}
+
+/** Read fixed-width unsigned samples back out of a block. */
+function readSampleValues(
+  block: Uint8Array,
+  bitsPerSample: number,
+  littleEndian: boolean,
+): number[] {
+  const bytes = bitsPerSample >> 3
+  const view = new DataView(block.buffer, block.byteOffset, block.byteLength)
+  const out: number[] = []
+  for (let at = 0; at < block.byteLength; at += bytes) {
+    if (bytes === 1) {
+      out.push(block[at])
+    } else if (bytes === 2) {
+      out.push(view.getUint16(at, littleEndian))
+    } else {
+      out.push(view.getUint32(at, littleEndian))
+    }
+  }
+  return out
+}
+
+describe('applyHorizontalPredictor', () => {
+  // Each case stores per-row first-order differences and expects the
+  // reconstructed samples; every arithmetic branch (byte, 16-bit, 32-bit)
+  // is covered in both byte orders where the width makes them differ.
+  const cases: Array<{
+    name: string
+    bits: number
+    samplesPerPixel: number
+    littleEndian: boolean
+    stored: number[][]
+    expected: number[][]
+  }> = [
+    {
+      name: '8-bit rows, wrapping at 256',
+      bits: 8,
+      samplesPerPixel: 1,
+      littleEndian: true,
+      stored: [
+        [10, 1, 2],
+        [250, 10, 3],
+      ],
+      expected: [
+        [10, 11, 13],
+        [250, 4, 7],
+      ],
+    },
+    {
+      name: '8-bit RGB adds within each channel',
+      bits: 8,
+      samplesPerPixel: 3,
+      littleEndian: true,
+      stored: [[10, 20, 30, 1, 2, 3]],
+      expected: [[10, 20, 30, 11, 22, 33]],
+    },
+    {
+      name: '16-bit little-endian rows, wrapping at 65536',
+      bits: 16,
+      samplesPerPixel: 1,
+      littleEndian: true,
+      stored: [
+        [1000, 10, 20],
+        [65530, 10, 2],
+      ],
+      expected: [
+        [1000, 1010, 1030],
+        [65530, 4, 6],
+      ],
+    },
+    {
+      name: '16-bit big-endian rows',
+      bits: 16,
+      samplesPerPixel: 1,
+      littleEndian: false,
+      stored: [
+        [1000, 10, 20],
+        [65530, 10, 2],
+      ],
+      expected: [
+        [1000, 1010, 1030],
+        [65530, 4, 6],
+      ],
+    },
+    {
+      name: '16-bit RGB adds within each channel',
+      bits: 16,
+      samplesPerPixel: 3,
+      littleEndian: true,
+      stored: [[100, 200, 300, 5, 65530, 7]],
+      expected: [[100, 200, 300, 105, 194, 307]],
+    },
+    {
+      name: '32-bit rows, wrapping at 2^32',
+      bits: 32,
+      samplesPerPixel: 1,
+      littleEndian: true,
+      stored: [[100000, 10, 4294967286]],
+      expected: [[100000, 100010, 100000]],
+    },
+  ]
+
+  for (const c of cases) {
+    test(c.name, () => {
+      const block = sampleBytes(c.stored.flat(), c.bits, c.littleEndian)
+      applyHorizontalPredictor(
+        block,
+        c.stored.length,
+        c.stored[0].length / c.samplesPerPixel,
+        c.samplesPerPixel,
+        c.bits,
+        c.littleEndian,
+      )
+      expect(readSampleValues(block, c.bits, c.littleEndian)).toEqual(
+        c.expected.flat(),
+      )
+    })
+  }
+
+  test('rejects 64-bit samples', () => {
+    expect(() =>
+      applyHorizontalPredictor(new Uint8Array(16), 1, 2, 1, 64, true),
+    ).toThrow(/64-bit/)
+  })
+
+  test('is applied to 16-bit strips by readTiffImage', async () => {
+    // The dominant fluorescence OME-TIFF shape: 16-bit samples with the
+    // predictor tag. Stored differences must come back as absolute values.
+    const stored = sampleBytes([1000, 10, 20, 2000, 65526, 65531], 16, true)
+    const entries = baseEntries(3, 2, 16, [
+      { tag: TIFF_TAG.predictor, type: 3, values: [2] },
+    ])
+    const tiff = parseTiff(buildTiff({ entries, blocks: [stored] }))
+    const image = await readTiffImage(tiff, 0)
+    expect(Array.from(image.data)).toEqual([1000, 1010, 1030, 2000, 1990, 1985])
+  })
+})
+
+describe('sampleArrayCtor', () => {
+  const cases: Array<{
+    bits: number
+    format: number
+    formatName: string
+    ctor: ReturnType<typeof sampleArrayCtor>
+    ctorName: string
+  }> = [
+    {
+      bits: 8,
+      format: SAMPLE_FORMAT.uint,
+      formatName: 'uint',
+      ctor: Uint8Array,
+      ctorName: 'Uint8Array',
+    },
+    {
+      bits: 16,
+      format: SAMPLE_FORMAT.uint,
+      formatName: 'uint',
+      ctor: Uint16Array,
+      ctorName: 'Uint16Array',
+    },
+    {
+      bits: 32,
+      format: SAMPLE_FORMAT.uint,
+      formatName: 'uint',
+      ctor: Uint32Array,
+      ctorName: 'Uint32Array',
+    },
+    {
+      bits: 8,
+      format: SAMPLE_FORMAT.int,
+      formatName: 'int',
+      ctor: Int8Array,
+      ctorName: 'Int8Array',
+    },
+    {
+      bits: 16,
+      format: SAMPLE_FORMAT.int,
+      formatName: 'int',
+      ctor: Int16Array,
+      ctorName: 'Int16Array',
+    },
+    {
+      bits: 32,
+      format: SAMPLE_FORMAT.int,
+      formatName: 'int',
+      ctor: Int32Array,
+      ctorName: 'Int32Array',
+    },
+    {
+      bits: 32,
+      format: SAMPLE_FORMAT.float,
+      formatName: 'float',
+      ctor: Float32Array,
+      ctorName: 'Float32Array',
+    },
+    {
+      bits: 64,
+      format: SAMPLE_FORMAT.float,
+      formatName: 'float',
+      ctor: Float64Array,
+      ctorName: 'Float64Array',
+    },
+  ]
+
+  for (const c of cases) {
+    test(`${c.bits}-bit ${c.formatName} maps to ${c.ctorName}`, () => {
+      expect(sampleArrayCtor(c.bits, c.format)).toBe(c.ctor)
+    })
+  }
+
+  test('rejects unsupported widths per format', () => {
+    expect(() => sampleArrayCtor(16, SAMPLE_FORMAT.float)).toThrow(
+      /16-bit float samples/,
+    )
+    expect(() => sampleArrayCtor(64, SAMPLE_FORMAT.int)).toThrow(
+      /64-bit signed samples/,
+    )
+    expect(() => sampleArrayCtor(64, SAMPLE_FORMAT.uint)).toThrow(
+      /64-bit samples/,
+    )
   })
 })

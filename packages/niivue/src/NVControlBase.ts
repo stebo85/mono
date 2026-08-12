@@ -3683,6 +3683,18 @@ export default class NiiVue extends EventTarget {
     this.drawScene()
   }
 
+  /**
+   * Pin the slide plane's pyramid level (0 = finest), or return to the
+   * camera-driven choice with undefined. Mutates the registered plane in
+   * place, so — unlike re-calling {@link setSlidePlane} — the slide drawing
+   * and vector annotations survive the change. No-op without a plane.
+   */
+  setSlidePlaneLevel(levelIndex?: number): void {
+    if (!this._slidePlane) return
+    this._slidePlane.levelIndex = levelIndex
+    this.drawScene()
+  }
+
   /** Remove a slide plane registered with {@link setSlidePlane}. */
   clearSlidePlane(): void {
     if (this._slidePlaneSlide && this._slidePlaneOnChange) {

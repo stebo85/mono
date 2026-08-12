@@ -17,6 +17,7 @@
 // canvas and exported.
 
 import { parseMultipartRelated } from './dicomWadoRs'
+import { imageTypeString } from './wsiTileSource'
 
 interface WsiThumbInstance extends Record<string, unknown> {
   imageId?: unknown
@@ -37,7 +38,8 @@ function frameCount(inst: WsiThumbInstance): number {
 // dedicated THUMBNAIL makes the best series preview; a plain side image is next;
 // a LABEL (the slide's paper label) is the least useful, so only fall back to it.
 function flavorRank(inst: WsiThumbInstance): number {
-  const it = typeof inst.ImageType === 'string' ? inst.ImageType : ''
+  // Array-tolerant: dcmjs-naturalized instances deliver ImageType as an array.
+  const it = imageTypeString(inst.ImageType) ?? ''
   if (it.includes('OVERVIEW')) return 0
   if (it.includes('THUMBNAIL')) return 1
   if (it.includes('LABEL')) return 3

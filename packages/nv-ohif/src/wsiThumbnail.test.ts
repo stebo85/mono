@@ -89,6 +89,25 @@ describe('pickThumbnailInstance', () => {
     expect(inst?.imageId).toBe(frameId('other'))
   })
 
+  it('ranks array-form ImageType (dcmjs-naturalized instances)', () => {
+    // The array form must keep the flavor preference: with the paper LABEL
+    // first, ranking every instance equal would tie-break on frame count and
+    // show the label instead of the tissue OVERVIEW in the study panel.
+    const inst = pickThumbnailInstance([
+      {
+        ImageType: ['DERIVED', 'PRIMARY', 'LABEL', 'NONE'],
+        NumberOfFrames: 1,
+        imageId: frameId('label'),
+      },
+      {
+        ImageType: ['DERIVED', 'PRIMARY', 'OVERVIEW', 'NONE'],
+        NumberOfFrames: 1,
+        imageId: frameId('overview'),
+      },
+    ])
+    expect(inst?.imageId).toBe(frameId('overview'))
+  })
+
   it('skips instances without an imageId', () => {
     const inst = pickThumbnailInstance([
       { ImageType: 'OVERVIEW', NumberOfFrames: 1 },

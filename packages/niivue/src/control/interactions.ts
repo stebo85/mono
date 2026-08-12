@@ -1,6 +1,9 @@
 import type { mat4 } from 'gl-matrix'
 import * as Annotation from '@/annotation'
-import { shouldStartFreshMultiClickContour } from '@/annotation/multiClick'
+import {
+  shouldAppendMultiClickPoint,
+  shouldStartFreshMultiClickContour,
+} from '@/annotation/multiClick'
 import {
   emitOrientationChange,
   emitPan2DChange,
@@ -1385,11 +1388,23 @@ export function initInteraction(ctrl: NiiVue): void {
             resetLivewire(ctrl)
           }
           const poly = ctrl._annotationPolyPoints as AnnotationPoint[]
+          // The second press of a double-click (which closes the contour via
+          // the dblclick handler) and a press coincident with the last placed
+          // point must not append: the duplicate point would let a single
+          // placed point + double-click pass the >= 3-point commit guard as a
+          // degenerate contour, and a normally finished spline would carry a
+          // coincident closing pair (a Catmull-Rom cusp at the close point).
+          const append = shouldAppendMultiClickPoint(
+            evt.detail,
+            poly[poly.length - 1],
+            pt2d,
+            computeTolerance(ctrl.model),
+          )
           if (isLivewireTool(tool)) {
             if (fresh || !ctrl._livewireSeed) {
               seedLivewire(ctrl, pt2d)
               poly.push(pt2d)
-            } else {
+            } else if (append) {
               // Commit the snapped path from the last seed to this click (drop
               // its first point, a duplicate of the last committed one), then
               // re-seed the live wire here.
@@ -1397,7 +1412,7 @@ export function initInteraction(ctrl: NiiVue): void {
               for (let i = 1; i < seg.length; i++) poly.push(seg[i])
               seedLivewire(ctrl, pt2d)
             }
-          } else {
+          } else if (append) {
             poly.push(pt2d)
           }
           updateMultiClickPreview(ctrl, pt2d)

@@ -140,6 +140,38 @@ describe('wsiVolumeLevels', () => {
     }
   })
 
+  it('classifies array-form ImageType (dcmjs-naturalized instances)', () => {
+    // OHIF's dcmjs-naturalized instances deliver multi-valued ImageType as a
+    // string array. The flavor gate must still apply: a LABEL side image tiled
+    // larger than one tile must NOT fall through to the matrix-vs-tile-size
+    // heuristic and corrupt the volume pyramid.
+    const ds: OhifDisplaySet = {
+      instances: [
+        {
+          ImageType: ['DERIVED', 'PRIMARY', 'VOLUME', 'NONE'],
+          TotalPixelMatrixColumns: 2000,
+          TotalPixelMatrixRows: 1000,
+          Columns: 512,
+          Rows: 512,
+          TransferSyntaxUID: JPEG,
+        },
+        {
+          // Tiled LABEL (matrix wider than one tile) -> must still be dropped.
+          ImageType: ['DERIVED', 'PRIMARY', 'LABEL', 'NONE'],
+          TotalPixelMatrixColumns: 800,
+          TotalPixelMatrixRows: 400,
+          Columns: 512,
+          Rows: 512,
+          TransferSyntaxUID: JPEG,
+        },
+      ],
+      imageIds: [frameId('fine'), frameId('label')],
+    }
+    const levels = wsiVolumeLevels(ds)
+    expect(levels).toHaveLength(1)
+    expect(levels[0]?.matrixColumns).toBe(2000)
+  })
+
   it('falls back to a tiled-matrix test when ImageType is absent', () => {
     const ds: OhifDisplaySet = {
       instances: [

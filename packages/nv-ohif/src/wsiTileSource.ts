@@ -42,6 +42,23 @@ function first(value: unknown): unknown {
 }
 
 /**
+ * A multi-valued DICOM attribute (e.g. ImageType) as a backslash-joined string.
+ * Depending on the data source the value arrives either already joined
+ * ('DERIVED\\PRIMARY\\VOLUME\\NONE') or as a string array (OHIF's
+ * dcmjs-naturalized instances deliver ['DERIVED', 'PRIMARY', 'VOLUME', 'NONE']);
+ * normalize both to the joined form so flavor matching sees every value.
+ */
+export function imageTypeString(value: unknown): string | undefined {
+  if (Array.isArray(value)) {
+    const parts = value.filter(
+      (v): v is string => typeof v === 'string' && v.length > 0,
+    )
+    return parts.length > 0 ? parts.join('\\') : undefined
+  }
+  return str(value)
+}
+
+/**
  * Physical pixel spacing in millimetres as NVSlide expects it: `[x, y]` (column,
  * then row), for the given tier's pixel matrix. Prefers the per-frame
  * PixelSpacing carried in the (Shared/Per-frame) PixelMeasuresSequence, then a
@@ -113,7 +130,7 @@ interface WsiLevel {
 // VOLUME (LABEL / OVERVIEW / THUMBNAIL are single-tile side images). When
 // ImageType is absent, fall back to "genuinely tiled" (matrix bigger than a tile).
 function isVolumeLevel(inst: Record<string, unknown>): boolean {
-  const imageType = str(inst.ImageType)
+  const imageType = imageTypeString(inst.ImageType)
   if (imageType) return imageType.includes('VOLUME')
   const matCols = num(inst.TotalPixelMatrixColumns) ?? 0
   const tileCols = num(inst.Columns) ?? 0

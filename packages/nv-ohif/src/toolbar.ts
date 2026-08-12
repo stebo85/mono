@@ -1,4 +1,3 @@
-import { DRAG_MODE } from '@niivue/niivue'
 import { baseModality, NIIVUE_COLORMAPS, NIIVUE_SLICE_TYPES } from './commands'
 import {
   getNiivueEntryForViewport,
@@ -507,9 +506,13 @@ export function getNiivueToolbarModule(): OhifToolbarModuleEntry[] {
         const nv = getNiivueForViewport(viewportId)
         if (!nv) return DISABLED
         if (volumeDisabled(viewportId)) return VOLUME_DISABLED
+        // Length is annotation-backed (toolBridge maps it to 'measureLine');
+        // nothing in this package ever sets DRAG_MODE.measurement.
         return {
           disabled: false,
-          isActive: nv.primaryDragMode === DRAG_MODE.measurement,
+          isActive:
+            nv.annotationIsEnabled === true &&
+            nv.annotationTool === 'measureLine',
         }
       },
     },

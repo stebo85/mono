@@ -1,12 +1,13 @@
 import { afterEach, describe, expect, it } from 'bun:test'
 import type NiiVue from '@niivue/niivue'
-import { DRAG_MODE, SLICE_TYPE } from '@niivue/niivue'
+import { SLICE_TYPE } from '@niivue/niivue'
 import {
   getNiivueEntryForViewport,
   registerNiivue,
   unregisterNiivue,
   updateNiivueViewport,
 } from './niivueRegistry'
+import { ohifToolToAnnotationTool } from './toolBridge'
 import {
   getNiivueToolbarModule,
   NIIVUE_CLIP_SECTION,
@@ -96,15 +97,21 @@ describe('toolbar evaluators', () => {
     ).toBe(false)
   })
 
-  it('mark the ruler active only in measurement drag mode', () => {
+  it('mark the ruler active only while the Length annotation tool is on', () => {
+    // Activate the tool the way the integration does: OHIF's 'Length' maps to
+    // the 'measureLine' annotation tool (toolBridge), not a drag mode.
     const nv = {
-      primaryDragMode: DRAG_MODE.measurement as number,
+      annotationIsEnabled: true,
+      annotationTool: ohifToolToAnnotationTool('Length'),
       volumes: [{}],
     }
     registerNiivue('vp-1', nv as unknown as NiiVue)
     const evaluate = evaluator('evaluate.niivue.measurement')
     expect(evaluate({ viewportId: 'vp-1' })?.isActive).toBe(true)
-    nv.primaryDragMode = DRAG_MODE.crosshair
+    nv.annotationTool = ohifToolToAnnotationTool('EllipticalROI')
+    expect(evaluate({ viewportId: 'vp-1' })?.isActive).toBe(false)
+    nv.annotationTool = ohifToolToAnnotationTool('Length')
+    nv.annotationIsEnabled = false
     expect(evaluate({ viewportId: 'vp-1' })?.isActive).toBe(false)
   })
 

@@ -7,6 +7,7 @@ import {
   applyOhifVisibilityToAnnotation,
   clearNiivueAnnotations,
   findOverlayCandidate,
+  flashStatus,
   getNiivueCommandsModule,
   jumpToNiivueMeasurement,
   NIIVUE_CLIP_PLANES,
@@ -1888,5 +1889,38 @@ describe('niivueToggleOverlay', () => {
     const { definitions } = getNiivueCommandsModule({ servicesManager: sm })
     await definitions.niivueToggleOverlay()
     expect(nv.added).toHaveLength(0)
+  })
+})
+
+describe('flashStatus', () => {
+  const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
+
+  function statusEntry() {
+    const writes: Array<string | null> = []
+    const entry = {
+      setStatus: (message: string | null) => writes.push(message),
+    } as unknown as Parameters<typeof flashStatus>[0]
+    return { entry, writes }
+  }
+
+  it('clears its own message after the flash duration', async () => {
+    const { entry, writes } = statusEntry()
+    flashStatus(entry, 'No other loadable series in this study.', 10)
+    expect(writes).toEqual(['No other loadable series in this study.'])
+    await sleep(30)
+    expect(writes).toEqual(['No other loadable series in this study.', null])
+  })
+
+  it('does not blank a newer status when its timer fires late', async () => {
+    const { entry, writes } = statusEntry()
+    flashStatus(entry, 'Overlay load failed: boom', 10)
+    // A retried load writes fresh progress before the failure flash expires.
+    flashStatus(entry, 'Fetching overlay: PERFUSION... 3/10', 1000)
+    await sleep(30)
+    // The stale timer must not clear the live progress readout.
+    expect(writes).toEqual([
+      'Overlay load failed: boom',
+      'Fetching overlay: PERFUSION... 3/10',
+    ])
   })
 })

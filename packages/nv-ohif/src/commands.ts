@@ -133,11 +133,31 @@ export function findOverlayCandidate(
   })
 }
 
-// Show a transient message in the viewport (no-op if the viewport did not
-// register a status sink).
-function flashStatus(entry: NiivueViewportEntry, message: string): void {
+// Every status write from this module bumps the entry's token, so a flash's
+// deferred clear can tell whether its message is still the one on screen.
+const statusTokens = new WeakMap<NiivueViewportEntry, number>()
+
+// Write a status message (or null to clear) through the viewport's sink,
+// invalidating any pending flash clear (no-op if the viewport did not register
+// a status sink).
+function writeStatus(entry: NiivueViewportEntry, message: string | null): void {
+  statusTokens.set(entry, (statusTokens.get(entry) ?? 0) + 1)
   entry.setStatus?.(message)
-  setTimeout(() => entry.setStatus?.(null), 4000)
+}
+
+// Show a transient message in the viewport. The deferred clear is dropped when
+// a newer status was written in the meantime (e.g. a retried overlay load's
+// progress readout must not be blanked by a stale failure-flash timer).
+export function flashStatus(
+  entry: NiivueViewportEntry,
+  message: string,
+  ms = 4000,
+): void {
+  writeStatus(entry, message)
+  const token = statusTokens.get(entry)
+  setTimeout(() => {
+    if (statusTokens.get(entry) === token) writeStatus(entry, null)
+  }, ms)
 }
 
 // The base series' modality (what OHIF's presets are keyed by).
@@ -1457,11 +1477,12 @@ export function getNiivueCommandsModule({
             opacity: OVERLAY_OPACITY,
           })
         } else {
-          entry.setStatus?.(`Fetching overlay: ${label}...`)
+          writeStatus(entry, `Fetching overlay: ${label}...`)
           const niftiFile = await convertDisplaySetToNifti(candidate, {
             headers: authHeaders(servicesManager),
             onProgress: (phase, loaded, total) => {
-              entry.setStatus?.(
+              writeStatus(
+                entry,
                 phase === 'fetching'
                   ? `Fetching overlay: ${label}... ${loaded}/${total}`
                   : `Converting overlay: ${label} (dcm2niix)...`,
@@ -1479,7 +1500,7 @@ export function getNiivueCommandsModule({
         }
         if (!added) return
         entry.overlayUIDs.push(uid)
-        entry.setStatus?.(null)
+        writeStatus(entry, null)
       } catch (err) {
         console.error('[nv-ohif] overlay load failed', err)
         const message = err instanceof Error ? err.message : String(err)

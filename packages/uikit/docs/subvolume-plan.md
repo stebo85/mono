@@ -65,3 +65,36 @@ core from the crosshair-centring work).
 4. Blocks for multi-LOD plans: v1 uses the plan's bricks as-is (mixed
    sizes); the "variable-sized blocks" backlog item in the iiif TODO is the
    deeper render-side follow-up.
+
+## Post-merge integration plan (PR #76 landed 2026-08-12, merge commit 28da9cfc)
+
+Taylor's six review fixes (five nv-ohif, one niivue spline fix) came in with
+the merge and touch nothing under packages/uikit. Dry-runs done 2026-08-12:
+main -> microscopy has exactly 5 mechanical conflicts; this branch onto the
+merged result has none.
+
+Run AFTER the meeting, in order:
+
+1. Stop the three demo dev servers (they serve from the tree being merged).
+2. In ~/Dev/mono on feat/multichannel-microscopy-formats:
+   `git fetch origin && git merge origin/main`
+   - 3 export-list conflicts (src/index.ts, index.webgpu.ts, index.webgl2.ts):
+     resolution is the UNION of both sides' exports; lint:fix re-sorts.
+   - 2 ipyniivue artifacts: do not hand-merge; take either side, then
+     `bunx nx codegen ipyniivue` and stage the regenerated files.
+   - `bun install` to reconcile bun.lock (not flagged, but cheap insurance).
+3. Gate: nx affected format/lint/typecheck/test/build vs origin/main,
+   check-boundaries, codespell; then the demo-smoke e2e and one click-through
+   of showcase.html with the servers restarted (the merge brings the NVSlide/
+   OHIF core changes under the microscopy demos).
+4. Push, and open the microscopy PR to main - it is unblocked now that #76
+   is in, and CI only runs on PRs.
+5. In ~/Dev/mono-uikit:
+   `git rebase feat/multichannel-microscopy-formats` (replays just the plan
+   commit; zero conflicts expected), then
+   `git push --force-with-lease`.
+   This branch then contains main + Taylor's fixes + the microscopy work
+   (including the depth-pick clip fix the widgets rely on), and widget
+   implementation starts.
+6. Optional housekeeping: delete the stale local ohif-viewer-integration and
+   feat/uikit-line-terminators branches (both fully contained in main now).

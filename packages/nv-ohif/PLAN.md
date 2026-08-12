@@ -69,6 +69,17 @@ main. Remaining prerequisites, in order:
    publishes as `1.0.0-rc.*` while npm `latest` is still the old 0.69.0 line.
    An upstream PR can only reference installable packages, so an `nx release`
    of nv-ohif + uikit (+ the niivue rc they peer on) comes first.
+   **Runbook (uikit targeted shortly after the 2026-08-12 meeting):** the
+   `release` GitHub workflow (manual dispatch, whole typescript group,
+   independent versions from conventional commits) — run once with
+   `dry_run=true` and review the version plan (uikit goes 0.0.0 -> first
+   release; the train also picks up nv-ohif and the next niivue rc, which is
+   wanted here), then re-run for real; `rc=true` publishes under the npm
+   `next` tag instead. Publishing is `publish-npm-packages.ts` in the same
+   workflow (or `publish-from-tags` re-runs it from tags). Verify with
+   `npm view @niivue/uikit version`. The `workspace:*` peer substitution is
+   the same mechanism prior nv-react/extension rc publishes used; the dry
+   run shows the resolved ranges.
 2. **Decide the PR shape.** Recommended: stay an EXTERNAL plugin, PRing
    OHIF's docs/plugin registry with the `pluginConfig.json` recipe and mode
    wiring (small, maintainable here); contributing the extension into the

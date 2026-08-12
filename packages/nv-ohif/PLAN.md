@@ -1,6 +1,10 @@
 # `@niivue/nv-ohif` — NiiVue viewport extension for OHIF
 
-Design + delivery plan. Branch: `ohif-viewer-integration`.
+Design + delivery plan. Developed on `ohif-viewer-integration`, **merged to
+main 2026-08-12 via PR #76** (merge 28da9cfc) after review by Taylor, whose
+six review fixes (toolbar/ruler state, flashStatus timer, WSI ImageType
+classification and ranking, imageIds fallback compaction, spline dblclick)
+are included.
 
 **Status: Phase 1 PROVEN — in a real OHIF app.** The extension + React-18 viewport +
 NIfTI data bridge render a volume end-to-end. Independent proofs:
@@ -53,6 +57,28 @@ hooks threw "Invalid hook call" (two React copies); (2) load must wait for
 `attachToCanvas` to resolve (a `ready` gate) or it races the GPU context; (3) default
 to the **WebGL2** backend — WebGPU threw a `createBindGroup` error under the demo's
 mount/unmount churn. All three are baked in.
+
+## Upstream OHIF/Viewers PR — status 2026-08-12
+
+The "PR into the OHIF/Viewers monorepo can follow once this is proven" from
+the Goal below is now actionable: the extension is proven, reviewed and in
+main. Remaining prerequisites, in order:
+
+1. **Publish the packages.** `@niivue/nv-ohif` is not on npm (E404), nor is
+   `@niivue/uikit` (made publishable 2026-07-28, ebc8ca0f); `@niivue/niivue`
+   publishes as `1.0.0-rc.*` while npm `latest` is still the old 0.69.0 line.
+   An upstream PR can only reference installable packages, so an `nx release`
+   of nv-ohif + uikit (+ the niivue rc they peer on) comes first.
+2. **Decide the PR shape.** Recommended: stay an EXTERNAL plugin, PRing
+   OHIF's docs/plugin registry with the `pluginConfig.json` recipe and mode
+   wiring (small, maintainable here); contributing the extension into the
+   OHIF monorepo itself is the heavyweight alternative and transfers
+   maintenance.
+3. **First-impression polish that should ride along** (from the follow-up
+   list): colormap picker and segmentation overlays; NVSlide-2D/WSI already
+   ships (JPEG TILED_FULL, others declined with a note).
+4. Re-verify the clean-consumer path (`npm pack` install into a stock OHIF
+   app) against the PUBLISHED packages rather than local tarballs.
 
 ## Goal
 
@@ -181,7 +207,17 @@ the "good experience": one load, NiiVue renders it.
 - Risk: getting the affine / axis orientation exactly right (DICOM LPS ↔ NIfTI RAS,
   row/column/slice direction cosines). Needs careful tests against known series.
 
-### DICOM shippability — BLOCKED on an unpublished dcm2niix release (2026-07-14)
+### DICOM shippability — RESOLVED (was: blocked on an unpublished dcm2niix release)
+
+**RESOLVED 2026-07-28 (commit a34799f5):** `@niivue/dcm2niix` `1.3.20260724`
+published with the Web-Worker exit fix; the `DCM2NIIX_PIN` dep was bumped to
+`^1.3.20260724`, so DICOM conversion works for npm-install consumers. The fix's
+presence in the published tarball was independently re-verified 2026-08-12
+(guarded `exitCode = mod.callMain(args)` + `err.status` recovery in both
+workers). Follow-ups: the dev-rig `file:` override in
+`~/Dev/ohif-viewers/.niivue-pkgs` and the twice-daily npm-watch routine
+(`trig_01SpgkDT1MxP8VasinX5bQdi`) are both obsolete and can be retired.
+The original finding, kept for history:
 
 `DCM2NIIX_PIN` — **DICOM does not work for `npm`-install consumers yet.** The path
 needs the dcm2niix Web-Worker exit fix (wrap `callMain` in try/catch, read

@@ -502,10 +502,14 @@ all are edge cases or pre-existing, the common paths are verified working):
   follow-up: for a *readable* large `.nii.gz` with no `limitFrames4D`, the sniff
   still fully decompresses before the volume loader streams frames — a header-only
   classification (`Blob.slice` / `decompressHeaderAsync`) would remove that.
-- **No automated test exercises the real gzip/`DecompressionStream` partial path**
-  (the Bun harness lacks `DecompressionStream`). `readFirstBytes`' pure stream logic
-  IS unit-tested; the end-to-end path is browser-verified manually against
-  `mpld_asl` (5/25) and a synthetic >2 GiB file (auto-cap 35/40).
+- ~~No automated test exercises the real gzip/`DecompressionStream` partial
+  path~~ — `e2e/partial-decode-4d.spec.ts` now does, in real Chromium. It asserts
+  on a stream TRUNCATED after frame 0 rather than on memory: a bounded read
+  succeeds where a full decode cannot, so the outcome is the measurement. (Memory
+  is the wrong instrument here — the decode runs in a Worker, whose heap
+  `performance.memory` does not report, and that is exactly how the bug below hid
+  through review.) `readFirstBytes`' pure stream logic remains unit-tested under
+  Bun, which has no `DecompressionStream`.
 - **`DecompressionStream` is feature-detected** (`HAS_DECOMPRESSION_STREAM`):
   `gunzipStream` returns null gracefully if it's missing (no `ReferenceError`), the gz
   partial path then declines, and an oversize gz load emits a specific always-visible
@@ -532,6 +536,30 @@ all are edge cases or pre-existing, the common paths are verified working):
   (streamed `readWindow`), so the remaining freeze is in the view layer's texture
   upload. A frame-by-frame / chunked upload with `await` yields between batches would
   fix it; not yet done (touches `wgpu/`/`gl/` upload paths, browser-only).
+
+**Both load paths must FORWARD the limit — this was broken.** `limitFrames4D`
+bounded retention only, not decoding, because neither caller reached the fast
+path: `workers/volumeLoad.worker.ts` reimplemented `loadVolume` (its own
+`fetchFile` + reader dispatch), and `volume/loadBridge.ts`'s main-thread fallback
+called `loadVolume(url, paired)` with no third argument, which defaults to
+`Infinity`. So every frame was fetched and inflated and then discarded by
+`nii2volume`; a 105-frame DWI peaked at 601 MB RSS to show one 1.5 MB frame. The
+worker now delegates to `loadVolume` (which also gives it the >2 GiB oversize
+recovery it lacked) and the fallback forwards the limit. If you add a third
+caller, forward it there too.
+
+**`name` is reader metadata, and both paths must forward it.** Some readers are
+filename-sensitive (MGH infers label volumes from it, VMR tells `.v16` from
+`.vmr`), so `loadVolume` takes an optional `name` that reaches `reader.read`. It
+does NOT select the format — reader dispatch and partial-loader eligibility both
+read the URL. Pinned by `e2e/reader-name-override.spec.ts`.
+
+**A bad input is not retried on the main thread.** `loadBridge` falls back to a
+main-thread load only for INFRASTRUCTURE failure (no Worker, terminated,
+transport). A healthy worker that fails on the payload tags the error
+`VolumeLoadError`, which the bridge rethrows — otherwise a malformed or missing
+file paid for its whole fetch + inflate + parse twice, the second time on the UI
+thread.
 
 **Detached-header formats:** AFNI (`.HEAD` + `.BRIK.gz`), NIfTI (`.hdr` + `.img`), NRRD (`.nhdr` + `.*`). The `urlImageData` property provides the image data URL alongside the header URL.
 

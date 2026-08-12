@@ -17,6 +17,12 @@
 const ID_KEY = '_wbId'
 /** Internal error key returned by workers on failure. */
 const ERR_KEY = '_wbError'
+/**
+ * Set by a worker that ran correctly but whose *payload* failed — a bad file, a
+ * 404, an unparsable header. Callers use it to tell "this worker is unusable"
+ * (retry elsewhere) from "this input is bad" (retrying changes nothing).
+ */
+const ERR_NAME_KEY = '_wbErrorName'
 
 interface Pending<T> {
   resolve: (value: T) => void
@@ -88,12 +94,20 @@ export class NVWorker {
   }
 
   private onMessage(e: MessageEvent): void {
-    const { [ID_KEY]: id, [ERR_KEY]: error, ...result } = e.data
+    const {
+      [ID_KEY]: id,
+      [ERR_KEY]: error,
+      [ERR_NAME_KEY]: errorName,
+      ...result
+    } = e.data
     const entry = this.pending.get(id)
     if (!entry) return
     this.pending.delete(id)
     if (error) {
-      entry.reject(new Error(error))
+      const err = new Error(error)
+      // Preserved so a caller can decide whether a retry is worth anything.
+      if (typeof errorName === 'string') err.name = errorName
+      entry.reject(err)
     } else {
       entry.resolve(result)
     }

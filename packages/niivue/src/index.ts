@@ -4,9 +4,10 @@
  * @packageDocumentation
  */
 
-// biome-ignore-all lint/performance/noBarrelFile: package entry point
+// biome-ignore-all lint/performance/noBarrelFile assist/source/organizeImports: package entry point
 // Label colormap helpers for extensions producing label/atlas volumes
 export { lookupColorMap, makeLabelLut } from './cmap/NVCmaps'
+export { slice2DToMM } from './annotation/sliceProjection'
 // Viewport controller (OpenSeadragon-style smooth pan/zoom on the shared canvas).
 // Opt-in: not in the static graph so apps that don't need the UX don't pay for it.
 // Import directly: `import { NVCanvasViewportController } from '@niivue/niivue/viewport'`
@@ -63,6 +64,9 @@ export { default, default as NiiVue } from './NVControl'
 export type { SerializeOptions } from './NVDocument'
 // Event types
 export type {
+  AnnotationAddedDetail,
+  AnnotationChangedDetail,
+  AnnotationRemovedDetail,
   AzimuthElevationChangeDetail,
   CanvasResizeDetail,
   ClipPlaneChangeDetail,
@@ -94,12 +98,18 @@ export type {
 export type {
   AffineMatrix,
   AffineTransform,
+  AnnotationConfig,
+  AnnotationPoint,
+  AnnotationScreenShape,
+  AnnotationStats,
+  AnnotationTool,
   BackendType,
   CanvasViewport,
   ColorMap,
   CustomLayoutTile,
   DragReleaseInfo,
   ImageFromUrlOptions,
+  MeasurementScreenLine,
   MeshFromUrlOptions,
   MeshLayerFromUrlOptions,
   MeshUpdate,
@@ -130,6 +140,7 @@ export type {
   SignalSpectrumMode,
   SyncOpts,
   TypedVoxelArray,
+  VectorAnnotation,
   ViewHitTest,
   VolumeChunkExplode,
   VolumeChunkSource,
@@ -205,6 +216,13 @@ export {
   fetchAllenAtlasInfo,
   loadAllenAtlasVolumes,
 } from './volume/allenAtlasLoader'
+// UIKit overlay lifecycle hook — the seam @niivue/uikit widgets draw into
+export type {
+  UIKitBackendHandle,
+  UIKitOverlayBounds,
+  UIKitOverlayFrame,
+  UIKitOverlayRenderer,
+} from './view/NVOverlayHook'
 // Crosshair-focused multi-resolution (multi-LOD) streamed volumes
 export type {
   ChunkedVolumeFetch,

@@ -39,6 +39,7 @@ export type {
   CustomLayoutTile,
   DragReleaseInfo,
   ImageFromUrlOptions,
+  MeasurementScreenLine,
   MeshFromUrlOptions,
   MeshLayerFromUrlOptions,
   MeshUpdate,
@@ -86,6 +87,12 @@ export {
   phaseCorrection,
   ppmRefForNucleus,
 } from './signal/processing'
+export type {
+  UIKitBackendHandle,
+  UIKitOverlayBounds,
+  UIKitOverlayFrame,
+  UIKitOverlayRenderer,
+} from './view/NVOverlayHook'
 // Allen "volume-viewer" JSON + PNG atlas datasets (multi-channel microscopy)
 export {
   type AllenAtlasImage,

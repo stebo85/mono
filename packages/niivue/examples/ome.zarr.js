@@ -272,8 +272,7 @@ loadButton.onclick = async () => {
     // A single-slice image (a 2D store) has nothing to show in the other two
     // planes, so give the whole canvas to the axial; a 3D store follows the
     // View selector (the selector reflects the override so it never lies).
-    const view =
-      voxels[2] > 1 ? Number(viewSelect.value) : SLICE_TYPE.AXIAL
+    const view = voxels[2] > 1 ? Number(viewSelect.value) : SLICE_TYPE.AXIAL
     nv1.sliceType = view
     viewSelect.value = String(view)
     say(

@@ -18,6 +18,7 @@
  */
 
 import { decompress } from '@/codecs/NVGz'
+import { log } from '@/logger'
 import type { TypedVoxelArray } from '@/NVTypes'
 
 /** TIFF tag numbers this reader consumes. */
@@ -44,6 +45,9 @@ export const TIFF_TAG = {
   tileByteCounts: 325,
   sampleFormat: 339,
 } as const
+
+/** Tags this reader consumes; corruption in any other tag is survivable. */
+const CONSUMED_TAGS = new Set<number>(Object.values(TIFF_TAG))
 
 /** TIFF `Compression` values this reader understands. */
 const COMPRESSION = {
@@ -192,7 +196,15 @@ function readEntry(
         ? Number(view.getBigUint64(valueFieldOffset, littleEndian))
         : view.getUint32(valueFieldOffset, littleEndian)
   if (dataOffset + totalBytes > view.byteLength) {
-    throw new Error(`TIFF: tag ${tag} points past the end of the file`)
+    if (CONSUMED_TAGS.has(tag)) {
+      throw new Error(`TIFF: tag ${tag} points past the end of the file`)
+    }
+    // A truncated private tag (maker notes, editor metadata) must not abort
+    // the parse - nothing downstream reads it.
+    log.warn(
+      `TIFF: skipping tag ${tag}, its data points past the end of the file`,
+    )
+    return { tag, value: { type, count, values: [] } }
   }
   if (type === 2) {
     // The spec says ASCII, but ImageDescription in practice carries UTF-8:

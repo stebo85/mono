@@ -65,6 +65,54 @@ describe('parseTiff', () => {
       '\0',
     )
   })
+
+  /** Point `tag`'s out-of-line data offset past the end of the file. */
+  function corruptTagOffset(buffer: ArrayBuffer, tag: number): void {
+    const view = new DataView(buffer)
+    const ifdAt = view.getUint32(4, true)
+    const count = view.getUint16(ifdAt, true)
+    for (let i = 0; i < count; i++) {
+      const at = ifdAt + 2 + i * 12
+      if (view.getUint16(at, true) === tag) {
+        view.setUint32(at + 8, 0x7fffffff, true)
+        return
+      }
+    }
+    throw new Error(`test setup: tag ${tag} was not written`)
+  }
+
+  test('skips a truncated private tag instead of aborting the parse', async () => {
+    // A MakerNote whose data lies past the end of the file, as left behind by
+    // naive TIFF truncation/editing. Nothing downstream reads it, so the file
+    // must still open.
+    const MAKER_NOTE = 37500
+    const pixels = Uint8Array.of(7, 8)
+    const buffer = buildTiff({
+      entries: baseEntries(2, 1, 8, [
+        { tag: MAKER_NOTE, type: 1, values: [1, 2, 3, 4, 5, 6, 7, 8] },
+      ]),
+      blocks: [pixels],
+    })
+    corruptTagOffset(buffer, MAKER_NOTE)
+    const tiff = parseTiff(buffer)
+    const image = await readTiffImage(tiff, 0)
+    expect(Array.from(image.data)).toEqual([7, 8])
+  })
+
+  test('still rejects a truncated tag the reader depends on', () => {
+    const buffer = buildTiff({
+      entries: baseEntries(2, 1, 8, [
+        {
+          tag: TIFF_TAG.imageDescription,
+          type: 2,
+          values: '<OME><Image/></OME>',
+        },
+      ]),
+      blocks: [Uint8Array.of(9, 9)],
+    })
+    corruptTagOffset(buffer, TIFF_TAG.imageDescription)
+    expect(() => parseTiff(buffer)).toThrow(/points past the end/)
+  })
 })
 
 describe('readTiffImage', () => {
@@ -336,6 +384,19 @@ describe('decodeLzw', () => {
       if (bit) input[i >> 3] |= 1 << (7 - (i & 7))
     })
     expect(Array.from(decodeLzw(input, 4))).toEqual([65, 65, 65, 65])
+  })
+
+  test('round-trips a literal stream long enough to widen the code three times', () => {
+    // 2000 literals grow the decoder's table past 511, 1023 and 2047, so the
+    // builder must widen its writes at the same early-change points or the
+    // stream desyncs after ~253 bytes.
+    const data = Uint8Array.from(
+      { length: 2000 },
+      (_unused, i) => (i * 7) & 0xff,
+    )
+    expect(Array.from(decodeLzw(lzwLiteralOnly(data), data.length))).toEqual(
+      Array.from(data),
+    )
   })
 })
 

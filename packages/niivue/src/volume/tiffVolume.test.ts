@@ -104,6 +104,24 @@ describe('tiffPlaneIndices', () => {
     const source = describeTiff(parseTiff(stackTiff(4, OME_TWO_CHANNEL)))
     expect(tiffPlaneIndices(source, { channel: 0 })).toEqual([0, 2])
   })
+
+  test('an interleaved-RGB OME file is a single channel, one plane per z', () => {
+    // Bio-Formats convention: SizeC=3 counts samples, but a single
+    // <Channel SamplesPerPixel="3"> packs them into ONE plane per z, so a
+    // 2-slice stack has 2 IFDs, not 6. Reading it as 3 channels used to make
+    // channel 1+ throw "no planes in this file" and fail the whole load.
+    const OME_INTERLEAVED_RGB = `<OME><Image Name="brightfield">
+      <Pixels SizeX="2" SizeY="1" SizeZ="2" SizeC="3" SizeT="1"
+        DimensionOrder="XYCZT" Type="uint8" Interleaved="true">
+        <Channel Name="brightfield" SamplesPerPixel="3"/>
+      </Pixels></Image></OME>`
+    const source = describeTiff(parseTiff(stackTiff(2, OME_INTERLEAVED_RGB)))
+    expect(tiffChannelCount(source)).toBe(1)
+    expect(tiffPlaneIndices(source, { channel: 0 })).toEqual([0, 1])
+    expect(() => tiffPlaneIndices(source, { channel: 1 })).toThrow(
+      /out of range/,
+    )
+  })
 })
 
 describe('readTiffVolume', () => {

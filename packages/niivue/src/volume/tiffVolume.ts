@@ -16,6 +16,7 @@ import {
   type ImageJStackInfo,
   type OmeTiffInfo,
   omeChannelName,
+  omeEffectiveSizeC,
   omePlaneCount,
   omePlaneIndex,
   parseImageJDescription,
@@ -73,7 +74,7 @@ export function describeTiff(tiff: TiffFile): TiffSource {
 /** Number of channels the file describes. */
 export function tiffChannelCount(source: TiffSource): number {
   if (source.ome) {
-    return source.ome.sizeC
+    return omeEffectiveSizeC(source.ome)
   }
   return source.imagej?.channels ?? 1
 }
@@ -109,9 +110,9 @@ export function tiffPlaneIndices(
   const timepoint = selection.timepoint ?? 0
   if (source.ome) {
     const info = source.ome
-    if (channel >= info.sizeC) {
+    if (channel >= omeEffectiveSizeC(info)) {
       throw new Error(
-        `OME-TIFF: channel ${channel} is out of range (file has ${info.sizeC})`,
+        `OME-TIFF: channel ${channel} is out of range (file has ${omeEffectiveSizeC(info)})`,
       )
     }
     if (timepoint >= info.sizeT) {

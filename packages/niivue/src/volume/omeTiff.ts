@@ -17,6 +17,8 @@
  * See `docs/ome-tiff-format.md`.
  */
 
+import { log } from '@/logger'
+
 /** One channel of an OME image. */
 export interface OmeChannel {
   name: string
@@ -62,25 +64,65 @@ export interface ImageJStackInfo {
  * where the renderer is well conditioned. It is also OME's own default unit,
  * so the common case is an exact passthrough.
  */
-const UNIT_UM: Record<string, number> = {
-  m: 1e6,
-  dm: 1e5,
-  cm: 1e4,
-  mm: 1e3,
-  µm: 1,
-  um: 1,
-  micron: 1,
-  microns: 1,
-  micrometer: 1,
-  micrometre: 1,
-  nm: 1e-3,
-  nanometer: 1e-3,
-  nanometre: 1e-3,
-  pm: 1e-6,
-  a: 1e-4, // angstrom
-  å: 1e-4,
-  in: 25400,
-  inch: 25400,
+const UNIT_UM: Record<string, number> = buildUnitTable()
+
+function buildUnitTable(): Record<string, number> {
+  // OME-XML writes SI symbols; OME-NGFF axes use spelled-out UDUNITS-2 names
+  // ("millimeter"), so both families and both -er/-re spellings are needed.
+  const prefixUm: Record<string, number> = {
+    '': 1e6,
+    yotta: 1e30,
+    zetta: 1e27,
+    exa: 1e24,
+    peta: 1e21,
+    tera: 1e18,
+    giga: 1e15,
+    mega: 1e12,
+    kilo: 1e9,
+    hecto: 1e8,
+    deca: 1e7,
+    deci: 1e5,
+    centi: 1e4,
+    milli: 1e3,
+    micro: 1,
+    nano: 1e-3,
+    pico: 1e-6,
+    femto: 1e-9,
+    atto: 1e-12,
+    zepto: 1e-15,
+    yocto: 1e-18,
+  }
+  const table: Record<string, number> = {
+    m: 1e6,
+    dm: 1e5,
+    cm: 1e4,
+    mm: 1e3,
+    µm: 1,
+    um: 1,
+    micron: 1,
+    microns: 1,
+    nm: 1e-3,
+    pm: 1e-6,
+    km: 1e9,
+    a: 1e-4, // angstrom
+    å: 1e-4,
+    angstrom: 1e-4,
+    in: 25400,
+    inch: 25400,
+    ft: 304800,
+    foot: 304800,
+    yd: 914400,
+    yard: 914400,
+    mi: 1.609344e9,
+    mile: 1.609344e9,
+    pc: 3.0856775814914e22,
+    parsec: 3.0856775814914e22,
+  }
+  for (const [prefix, um] of Object.entries(prefixUm)) {
+    table[`${prefix}meter`] = um
+    table[`${prefix}metre`] = um
+  }
+  return table
 }
 
 /**
@@ -95,7 +137,13 @@ export function omeLengthToMicrons(
     return 0
   }
   const scale = UNIT_UM[normalizeUnit(unit)]
-  return scale === undefined ? 0 : value * scale
+  if (scale === undefined) {
+    // Callers treat 0 as "not stated" and fall back to 1 um, so an
+    // unrecognised unit silently mis-sizes the volume unless surfaced.
+    log.warn(`OME: unrecognised length unit "${unit}"; treating as unstated`)
+    return 0
+  }
+  return value * scale
 }
 
 /**
@@ -252,6 +300,23 @@ export function parseOmeColor(
   return [(rgba >>> 24) & 0xff, (rgba >>> 16) & 0xff, (rgba >>> 8) & 0xff]
 }
 
+/**
+ * Number of separately-stored channels: the C extent of the plane grid.
+ *
+ * A channel whose `SamplesPerPixel` is greater than 1 stores its samples
+ * interleaved within ONE plane (an RGB brightfield channel is the common
+ * case), so `SizeC` counts samples while the plane grid has one slot per
+ * `<Channel>` element. Falls back to `SizeC` when the channel list does not
+ * account for it exactly.
+ */
+export function omeEffectiveSizeC(info: OmeTiffInfo): number {
+  const samples = info.channels.reduce((sum, c) => sum + c.samplesPerPixel, 0)
+  if (info.channels.length > 0 && samples === info.sizeC) {
+    return info.channels.length
+  }
+  return info.sizeC
+}
+
 /** IFD index of the (z, c, t) plane under the image's `DimensionOrder`. */
 export function omePlaneIndex(
   info: OmeTiffInfo,
@@ -261,7 +326,7 @@ export function omePlaneIndex(
 ): number {
   const sizes: Record<string, number> = {
     Z: info.sizeZ,
-    C: info.sizeC,
+    C: omeEffectiveSizeC(info),
     T: info.sizeT,
   }
   const positions: Record<string, number> = { Z: z, C: c, T: t }
@@ -276,7 +341,7 @@ export function omePlaneIndex(
 
 /** Total number of planes the OME metadata describes. */
 export function omePlaneCount(info: OmeTiffInfo): number {
-  return info.sizeZ * info.sizeC * info.sizeT
+  return info.sizeZ * omeEffectiveSizeC(info) * info.sizeT
 }
 
 /** Display name for a channel, falling back to a positional label. */

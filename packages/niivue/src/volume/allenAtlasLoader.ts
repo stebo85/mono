@@ -73,6 +73,24 @@ export interface AllenAtlasLoadOptions {
   decodeImage?: (buffer: ArrayBuffer) => Promise<DecodedImage>
 }
 
+/**
+ * Resolve an atlas image name against the sidecar URL. Pages usually pass a
+ * RELATIVE sidecar URL ("data/atlas.json"), which `new URL` rejects as a base,
+ * so resolve through the page location when there is one; failing that, swap
+ * the sidecar's final path segment for the image name.
+ */
+function resolveAtlasImageUrl(imageName: string, sidecarUrl: string): string {
+  const pageHref = typeof location === 'undefined' ? undefined : location.href
+  try {
+    return new URL(
+      imageName,
+      pageHref ? new URL(sidecarUrl, pageHref) : sidecarUrl,
+    ).href
+  } catch {
+    return sidecarUrl.replace(/[^/]*$/, imageName)
+  }
+}
+
 async function fetchBuffer(
   url: string,
   fetchImpl: typeof fetch,
@@ -144,7 +162,7 @@ export async function loadAllenAtlasVolumes(
   const volumes: ImageFromUrlOptions[] = new Array(requests.length)
   await Promise.all(
     Array.from(byImage, async ([imageName, group]) => {
-      const url = new URL(imageName, sidecarUrl).href
+      const url = resolveAtlasImageUrl(imageName, sidecarUrl)
       const decoded = await decode(await fetchBuffer(url, fetchImpl))
       if (
         decoded.width !== info.atlasWidth ||

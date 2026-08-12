@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test'
 import {
   omeChannelName,
+  omeEffectiveSizeC,
   omeLengthToMicrons,
   omePlaneCount,
   omePlaneIndex,
@@ -212,6 +213,41 @@ describe('omePlaneIndex', () => {
   })
 })
 
+describe('omeEffectiveSizeC', () => {
+  const rgbInfo = parseOmeXml(
+    omeXml(
+      '',
+      '<Channel ID="Channel:0:0" Name="brightfield" SamplesPerPixel="3"/>',
+    ),
+  )
+
+  test('one interleaved-RGB channel occupies one plane slot', () => {
+    // Bio-Formats RGB convention: SizeC counts samples (3), but a single
+    // <Channel SamplesPerPixel="3"> stores them interleaved in ONE plane.
+    const info = parseOmeXml(
+      omeXml(
+        '',
+        '<Channel ID="Channel:0:0" Name="brightfield" SamplesPerPixel="3"/>',
+      ).replace('SizeC="2"', 'SizeC="3"'),
+    )
+    expect(info && omeEffectiveSizeC(info)).toBe(1)
+    // The plane grid strides C by the EFFECTIVE count: with XYCZT and
+    // SizeZ=3 the file has 3 IFDs, one per z.
+    expect(info && omePlaneCount(info)).toBe(3)
+    expect(info && omePlaneIndex(info, 2, 0, 0)).toBe(2)
+  })
+
+  test('falls back to SizeC when the channel list does not add up', () => {
+    // SizeC=2 but a single 3-sample channel: malformed, keep SizeC.
+    expect(rgbInfo && omeEffectiveSizeC(rgbInfo)).toBe(2)
+  })
+
+  test('is SizeC for ordinary one-sample channels', () => {
+    const info = parseOmeXml(omeXml())
+    expect(info && omeEffectiveSizeC(info)).toBe(2)
+  })
+})
+
 describe('omeChannelName', () => {
   test('uses the stated name', () => {
     const info = parseOmeXml(omeXml())
@@ -249,11 +285,25 @@ describe('omeLengthToMicrons', () => {
     expect(omeLengthToMicrons(1, 'in')).toBe(25400)
   })
 
+  test('accepts the spelled-out UDUNITS names OME-NGFF axes use', () => {
+    // A zarr axis saying {"unit": "millimeter"} silently mis-sized volumes
+    // by 1000x when only the SI symbols were recognised.
+    expect(omeLengthToMicrons(0.02, 'millimeter')).toBe(20)
+    expect(omeLengthToMicrons(0.02, 'millimetre')).toBe(20)
+    expect(omeLengthToMicrons(1, 'meter')).toBe(1e6)
+    expect(omeLengthToMicrons(1, 'centimeter')).toBe(1e4)
+    expect(omeLengthToMicrons(1, 'nanometer')).toBe(1e-3)
+    expect(omeLengthToMicrons(1, 'picometer')).toBe(1e-6)
+    expect(omeLengthToMicrons(1, 'angstrom')).toBe(1e-4)
+    expect(omeLengthToMicrons(1, 'foot')).toBe(304800)
+    expect(omeLengthToMicrons(1, 'Micrometer')).toBe(1)
+  })
+
   test('reports 0 rather than guessing for an unusable value or unit', () => {
     expect(omeLengthToMicrons(Number.NaN, 'µm')).toBe(0)
     expect(omeLengthToMicrons(0, 'µm')).toBe(0)
     expect(omeLengthToMicrons(-1, 'µm')).toBe(0)
-    expect(omeLengthToMicrons(1, 'parsec')).toBe(0)
+    expect(omeLengthToMicrons(1, 'furlong')).toBe(0)
   })
 })
 

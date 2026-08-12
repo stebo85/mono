@@ -111,6 +111,18 @@ describe('loadAllenAtlasVolumes', () => {
     expect(requested).toContain('https://example.org/data/a_0.png')
   })
 
+  test('accepts a relative sidecar URL', async () => {
+    // Demo pages pass "data/atlas.json"; new URL(name, relative) alone throws.
+    const { requested, fetchImpl, decodeImage } = makeHarness()
+    const volumes = await loadAllenAtlasVolumes('data/atlas.json', {
+      channels: [0],
+      fetchImpl,
+      decodeImage,
+    })
+    expect(volumes).toHaveLength(1)
+    expect(requested[1].endsWith('data/a_0.png')).toBe(true)
+  })
+
   test('rejects a channel index no atlas carries, before downloading', async () => {
     const { requested, fetchImpl, decodeImage } = makeHarness()
     await expect(

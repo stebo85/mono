@@ -201,11 +201,26 @@ export function lzwLiteralOnly(data: Uint8Array): Uint8Array {
       bits.push((code >> i) & 1)
     }
   }
-  push(256, 9) // clear
-  for (const byte of data) {
-    push(byte, 9)
-  }
-  push(257, 9) // end of information
+  // Mirror the decoder's table growth: it adds one entry per literal after the
+  // first, and widens the code EARLY at 511/1023/2047. Writing everything at
+  // 9 bits desyncs the stream after ~253 literals.
+  let nextCode = 258
+  let codeLength = 9
+  push(256, codeLength) // clear
+  data.forEach((byte, i) => {
+    push(byte, codeLength)
+    if (i > 0 && nextCode < 4096) {
+      nextCode++
+    }
+    if (nextCode === 511) {
+      codeLength = 10
+    } else if (nextCode === 1023) {
+      codeLength = 11
+    } else if (nextCode === 2047) {
+      codeLength = 12
+    }
+  })
+  push(257, codeLength) // end of information
   while (bits.length % 8 !== 0) {
     bits.push(0)
   }

@@ -143,13 +143,24 @@ function isVolumeLevel(inst: Record<string, unknown>): boolean {
 export function wsiVolumeLevels(ds: OhifDisplaySet): WsiLevel[] {
   const instances = ds.instances ?? []
   const imageIds = ds.imageIds ?? []
+  // The display set's `imageIds` snapshot is built by FILTERING out instances
+  // without an imageId (sopClassHandler.ts), compacting the array. Positional
+  // indexing is only safe when nothing was dropped; against a compacted array
+  // it would pair this instance's pixel-matrix metadata with ANOTHER
+  // instance's frame URL and render the slide scrambled.
+  const positionalSafe = imageIds.length === instances.length
   const levels: WsiLevel[] = []
   instances.forEach((inst, i) => {
     // Prefer the per-instance imageId (populated by OHIF's data source) over the
     // display set's `imageIds` snapshot: a SOP-class handler may run before the
     // data source assigns imageIds, leaving that snapshot empty.
     const instImageId = (inst as { imageId?: unknown }).imageId
-    const imageId = typeof instImageId === 'string' ? instImageId : imageIds[i]
+    const imageId =
+      typeof instImageId === 'string'
+        ? instImageId
+        : positionalSafe
+          ? imageIds[i]
+          : undefined
     const matrixColumns = num(inst.TotalPixelMatrixColumns)
     const matrixRows = num(inst.TotalPixelMatrixRows)
     const tileColumns = num(inst.Columns)

@@ -172,6 +172,40 @@ describe('wsiVolumeLevels', () => {
     expect(levels[0]?.matrixColumns).toBe(2000)
   })
 
+  it('never pairs a level with another instance frame URL after imageIds compaction', () => {
+    // sopClassHandler builds ds.imageIds by FILTERING out id-less instances,
+    // compacting the array. With the id-less instance FIRST, a positional
+    // imageIds[i] fallback would pair its pixel-matrix metadata with the other
+    // instance's frame URL and render the slide scrambled.
+    const ds: OhifDisplaySet = {
+      instances: [
+        {
+          // No imageId (not yet assigned by the data source).
+          ImageType: 'DERIVED\\PRIMARY\\VOLUME\\NONE',
+          TotalPixelMatrixColumns: 2000,
+          TotalPixelMatrixRows: 1000,
+          Columns: 512,
+          Rows: 512,
+          TransferSyntaxUID: JPEG,
+        },
+        {
+          imageId: frameId('coarse'),
+          ImageType: 'DERIVED\\PRIMARY\\VOLUME\\NONE',
+          TotalPixelMatrixColumns: 500,
+          TotalPixelMatrixRows: 250,
+          Columns: 512,
+          Rows: 512,
+          TransferSyntaxUID: JPEG,
+        },
+      ],
+      imageIds: [frameId('coarse')], // compacted: only the second instance's id
+    }
+    const levels = wsiVolumeLevels(ds)
+    expect(levels).toHaveLength(1)
+    expect(levels[0]?.matrixColumns).toBe(500)
+    expect(levels[0]?.frameBaseUrl).toBe(`${BASE}/coarse/frames`)
+  })
+
   it('falls back to a tiled-matrix test when ImageType is absent', () => {
     const ds: OhifDisplaySet = {
       instances: [

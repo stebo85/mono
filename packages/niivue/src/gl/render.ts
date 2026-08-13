@@ -37,8 +37,8 @@ import {
 } from '@/volume/chunking'
 import { buildModulationParams } from '@/volume/modulation'
 import {
-  chunkOverlayMatrix,
   chunkedDisplayKey,
+  chunkOverlayMatrix,
   extractChunkBytes,
 } from '@/volume/orientChunked'
 import * as depthPickShader from './depthPickShader'

@@ -2,8 +2,8 @@ import { describe, expect, test } from 'bun:test'
 import type { NVImage } from '@/NVTypes'
 import type { Vec3i } from '@/volume/chunking'
 import {
-  chunkRGBA,
   chunkedDisplayKey,
+  chunkRGBA,
   extractChunkBytes,
   extractChunkBytesReoriented,
   isRGBAChunkDatatype,

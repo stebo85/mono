@@ -35,8 +35,8 @@ import {
 } from '@/volume/chunking'
 import { buildModulationParams } from '@/volume/modulation'
 import {
-  chunkOverlayMatrix,
   chunkedDisplayKey,
+  chunkOverlayMatrix,
   extractChunkBytes,
 } from '@/volume/orientChunked'
 import { MAX_TILES, UNIFORM_ALIGNMENT } from './mesh'

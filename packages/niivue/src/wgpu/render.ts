@@ -34,7 +34,11 @@ import {
   type Vec3i,
 } from '@/volume/chunking'
 import { buildModulationParams } from '@/volume/modulation'
-import { chunkOverlayMatrix, extractChunkBytes } from '@/volume/orientChunked'
+import {
+  chunkOverlayMatrix,
+  chunkedDisplayKey,
+  extractChunkBytes,
+} from '@/volume/orientChunked'
 import { MAX_TILES, UNIFORM_ALIGNMENT } from './mesh'
 import * as orient from './orient'
 import {
@@ -162,6 +166,12 @@ interface ChunkedTexEntry {
   plan: ChunkPlan
   /** Per-chunk cached bind group; null until built or after invalidation. */
   bindGroups: (GPUBindGroup | null)[]
+  /**
+   * chunkedDisplayKey at uploader creation. Resident chunk textures bake the
+   * colormap/window this key captures, so a mismatch on updateVolume forces an
+   * uploader rebuild + full re-stream (see _ensureChunkedVolumeEntry).
+   */
+  displayKey: string
 }
 
 type TexCacheEntry = SingleTexEntry | ChunkedTexEntry
@@ -803,9 +813,32 @@ export class VolumeRenderer extends NVRenderer {
       )
     }
     const cacheKey = vol.url || vol.name
+    const displayKey = chunkedDisplayKey(vol)
     const existing = cacheKey ? this._texCache.get(cacheKey) : undefined
     if (existing && existing.kind === 'chunked') {
       existing.volume = vol
+      if (existing.displayKey !== displayKey) {
+        // Colormap/window/frame changed after load. Resident chunk textures
+        // bake the old state (the uploader's LUT + orient uniforms are fixed at
+        // creation), so rebuild the uploader and re-stream: evict everything,
+        // then admit chunk 0 with the new state so the volume stays present
+        // while the working set refills — the same drop-and-refill mechanism as
+        // _refreshUnlitChunksForLighting.
+        existing.displayKey = displayKey
+        const newUploader = await createChunkUploaderGPU(
+          device,
+          vol,
+          existing.plan,
+          () => this.gradientAmount > 0,
+        )
+        existing.uploader.dispose()
+        existing.uploader = newUploader
+        existing.manager.remap(new Map(), existing.plan.chunks.length)
+        existing.bindGroups = existing.plan.chunks.map(() => null)
+        const chunk0 = await existing.uploader.uploadChunk(0)
+        if (!chunk0.hasGradient) this._uploadedUnlit = true
+        existing.manager.admit(0, chunk0)
+      }
       return existing
     }
     if (existing) this._destroyTexEntry(existing)
@@ -827,6 +860,7 @@ export class VolumeRenderer extends NVRenderer {
       uploader,
       plan,
       bindGroups: plan.chunks.map(() => null),
+      displayKey,
     }
     entry.manager = new ChunkResidencyManager<VolumeChunkGPU>(
       plan.chunks.length,
@@ -884,6 +918,7 @@ export class VolumeRenderer extends NVRenderer {
     entry.plan = newPlan
     entry.bindGroups = newPlan.chunks.map(() => null)
     entry.volume = vol
+    entry.displayKey = chunkedDisplayKey(vol)
     vol.chunkPlan = newPlan
     // Keep at least one chunk resident for the first post-swap frame; the pump
     // streams the rest from the next working set.

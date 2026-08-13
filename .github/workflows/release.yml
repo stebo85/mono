@@ -46,7 +46,7 @@ jobs:
           node-version: 24
           registry-url: "https://registry.npmjs.org"
 
-      - run: bun install
+      - run: bun install --frozen-lockfile
 
       - name: Configure git identity
         # Uses the official github-actions[bot] noreply address (user id 41898282).

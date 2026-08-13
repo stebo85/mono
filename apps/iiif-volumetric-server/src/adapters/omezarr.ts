@@ -334,6 +334,11 @@ async function resolveChannelInfo(
     (a) => a.type === 'channel' || a.name?.toLowerCase() === 'c',
   )
   if (axisIndex < 0) return null
+  // The channel axis must be a leading (non-spatial) one. NGFF puts the
+  // spatial axes last, so a `c` inside the trailing three dims (e.g. a 2D
+  // c,y,x store) is read as a spatial dim and cannot be selected per
+  // channel — reporting channels for it would mint N identical entries.
+  if (axisIndex >= axes.length - 3) return null
 
   // The axis length lives on the array, not the metadata. Use the first
   // dataset that opens — a partial fixture fetch may be missing the rest.

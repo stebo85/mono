@@ -125,6 +125,21 @@ beforeAll(async () => {
     { channels: [{ label: 'DAPI' }, { label: 'GFP' }] },
   )
 
+  // A 2D store whose `c` axis falls INSIDE the trailing three dims: the
+  // spatial mapping reads it as a spatial axis, so it must not be offered
+  // for per-channel selection.
+  await writeZarr(
+    path.join(tmpDir, 'flat.ome.zarr'),
+    [
+      { name: 'c', type: 'channel' },
+      { name: 'y', type: 'space', unit: 'micrometer' },
+      { name: 'x', type: 'space', unit: 'micrometer' },
+    ],
+    [2, Y, X],
+    new Uint8Array(2 * Y * X).fill(9),
+    { channels: [{ label: 'DAPI' }, { label: 'GFP' }] },
+  )
+
   await writeZarr(
     path.join(tmpDir, 'plain.ome.zarr'),
     [
@@ -182,6 +197,16 @@ describe('OME-Zarr channels', () => {
   test('a store with no channel axis reports no channels', async () => {
     const channels = await omezarrAdapter.probeChannels?.(
       path.join(tmpDir, 'plain.ome.zarr'),
+    )
+    expect(channels).toEqual([])
+  })
+
+  test('a channel axis inside the trailing spatial dims reports no channels', async () => {
+    // A (c, y, x) 2D store: `c` is one of the trailing three dims, so it is
+    // consumed as a spatial axis and cannot be selected per channel —
+    // reporting channels here would mint N identical volumes.
+    const channels = await omezarrAdapter.probeChannels?.(
+      path.join(tmpDir, 'flat.ome.zarr'),
     )
     expect(channels).toEqual([])
   })

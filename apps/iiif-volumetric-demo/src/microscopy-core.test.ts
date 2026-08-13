@@ -140,7 +140,7 @@ describe('dataset grouping and filtering', () => {
     expect(matchesFamily(raw, 'all')).toBe(true)
   })
 
-  test('loadability: nifti never, multi-channel always, size caps the rest', () => {
+  test('loadability: nifti never, size caps everything else', () => {
     const base: Dataset = {
       key: 'k',
       format: 'allen-atlas',
@@ -151,10 +151,18 @@ describe('dataset grouping and filtering', () => {
     expect(isLoadableHere(base)).toBe(true)
     expect(isLoadableHere({ ...base, format: 'nifti' })).toBe(false)
     expect(isLoadableHere({ ...base, shape: [1000, 1000, 1000] })).toBe(false)
+    // Channel count must not bypass the cap: the page auto-loads channels on
+    // open, so an oversize multi-channel source would fire N huge requests.
     expect(
       isLoadableHere({
         ...base,
         shape: [1000, 1000, 1000],
+        channels: [vol({ id: 'c0' }), vol({ id: 'c1' })],
+      }),
+    ).toBe(false)
+    expect(
+      isLoadableHere({
+        ...base,
         channels: [vol({ id: 'c0' }), vol({ id: 'c1' })],
       }),
     ).toBe(true)
@@ -178,6 +186,19 @@ describe('percentileWindow', () => {
     const img = new Uint8Array(64).fill(7)
     const win = percentileWindow(img, 7, 42, 0.015, 0.001)
     expect(win.calMax).toBeGreaterThan(win.calMin)
+  })
+
+  test('a top-clipped channel does not collapse to a zero-width window', () => {
+    // 1000 voxels with 30 pinned at max (clipped saturation): both the high
+    // and low crossings land in the TOP bin, so calMin reaches max and the
+    // guard must reset both ends, not just calMax.
+    const img = new Uint8Array(1000)
+    for (let i = 0; i < 970; i++) img[i] = 126 + (i % 75)
+    img.fill(255, 970)
+    const win = percentileWindow(img, 0, 255, 0.015, 0.001)
+    expect(win.calMax).toBeGreaterThan(win.calMin)
+    expect(win.calMin).toBe(0)
+    expect(win.calMax).toBe(255)
   })
 
   test('a zero range returns the range unchanged', () => {

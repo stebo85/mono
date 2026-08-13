@@ -120,11 +120,12 @@ const ALLEN_STRUCTURES: Record<
 
 // The registry reports spacing in the source's own units and does not carry a
 // unit field, so the unit is per format: the Allen sidecar is microns, NIfTI is
-// millimetres by definition, OME-Zarr axes are usually metres.
+// millimetres by definition, and the server's OME-Zarr adapter multiplies each
+// axis scale by unitToMm before it reaches /api, so those arrive as mm.
 const SPACING_UNIT: Record<string, string> = {
   'allen-atlas': 'um',
   nifti: 'mm',
-  'ome-zarr': 'm',
+  'ome-zarr': 'mm',
 }
 
 // Where a source that can't be loaded whole is actually viewable.

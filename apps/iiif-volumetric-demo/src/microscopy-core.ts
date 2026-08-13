@@ -86,11 +86,11 @@ export function groupDatasets(volumes: ApiVolume[]): Dataset[] {
   return out
 }
 
-// A multi-channel source is microscopy by construction here; a single-channel
-// one qualifies only if it is small enough to fetch whole.
+// A microscopy source qualifies only when one channel is small enough to fetch
+// whole - the page auto-loads channels on open, so an uncapped multi-channel
+// source would fire huge whole-volume requests unprompted.
 export function isLoadableHere(d: Dataset): boolean {
   if (d.format === 'nifti') return false
-  if (d.channels.length > 1) return true
   return voxels(d.shape) <= MAX_WHOLE_VOLUME_VOXELS
 }
 
@@ -231,7 +231,12 @@ export function percentileWindow(
   }
   // A channel flat enough that one bin crosses both targets would collapse to a
   // zero-width window, which paints every voxel at the top of the colormap.
-  if (calMax <= calMin) calMax = max
+  // Reset BOTH ends: when the crossing lands in the top bin (clipped
+  // saturation), calMin is already max, so widening calMax alone cannot help.
+  if (calMax <= calMin) {
+    calMin = min
+    calMax = max
+  }
   return { calMin, calMax }
 }
 

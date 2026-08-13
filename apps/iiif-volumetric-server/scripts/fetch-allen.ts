@@ -88,7 +88,21 @@ async function download(src: string, dest: string): Promise<number> {
   }
   const bytes = new Uint8Array(await res.arrayBuffer())
   await fs.mkdir(path.dirname(dest), { recursive: true })
-  await fs.writeFile(dest, bytes)
+  // Write via temp + rename (as the registry's pyramid cache does): the skip
+  // check above only tests existence, so a partial file left by an interrupted
+  // run would otherwise be treated as complete forever after.
+  const tmpPath = `${dest}.${process.pid}.${Date.now()}.tmp`
+  try {
+    await fs.writeFile(tmpPath, bytes)
+    await fs.rename(tmpPath, dest)
+  } catch (err) {
+    try {
+      await fs.unlink(tmpPath)
+    } catch (_) {
+      /* ignore */
+    }
+    throw err
+  }
   return bytes.byteLength
 }
 

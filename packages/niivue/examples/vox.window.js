@@ -57,7 +57,7 @@ clipDarkCheck.onchange = function () {
 }
 
 // Otsu threshold for the floor, 99.5th percentile for the ceiling
-autoBtn.onclick = function () {
+autoBtn.onclick = () => {
   if (nv1.volumes.length < 1) return
   const v = nv1.volumes[0]
   const img = v.img
@@ -109,7 +109,7 @@ autoBtn.onclick = function () {
   nv1.updateGLVolume()
 }
 
-resetBtn.onclick = function () {
+resetBtn.onclick = () => {
   if (nv1.volumes.length < 1) return
   nv1.volumes[0].calMin = gMin
   nv1.volumes[0].calMax = gMax

@@ -49,7 +49,7 @@
     "deploy": "bun run codegen:assets && bun run gen-fixtures && bunx --bun vite build --config vite.config.examples.ts --mode production",
     "demo": "bun run build:examples && bunx http-server dist/ --cors -o",
     "preview": "vite preview",
-    "e2e:serve": "bun run codegen:assets && bunx --bun vite --port 5273 --strictPort",
+    "e2e:serve": "bun run codegen:assets && bun run gen-fixtures && bunx --bun vite --port 5273 --strictPort",
     "test:e2e": "playwright test",
     "convert:legacy": "bun run scripts/convert-legacy-nvd.ts",
     "lint": "bunx biome check src",

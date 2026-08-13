@@ -275,6 +275,14 @@ export function parseTiff(buffer: ArrayBuffer): TiffFile {
       : view.getUint16(nextIfd, littleEndian)
     const entrySize = isBigTiff ? 20 : 12
     const headerSize = isBigTiff ? 8 : 2
+    // The +4/+8 covers the next-IFD link after the entries.
+    const ifdEnd =
+      nextIfd + headerSize + entryCount * entrySize + (isBigTiff ? 8 : 4)
+    if (ifdEnd > buffer.byteLength) {
+      throw new Error(
+        `TIFF: IFD at offset ${nextIfd} claims ${entryCount} entries but runs past the end of the file`,
+      )
+    }
     const tags = new Map<number, TiffTagValue>()
     for (let i = 0; i < entryCount; i++) {
       const { tag, value } = readEntry(
@@ -711,9 +719,9 @@ export async function readTiffImage(
   for (let plane = 0; plane < planeCount; plane++) {
     for (let block = 0; block < blocksPerPlane; block++) {
       const flat = plane * blocksPerPlane + block
-      if (flat >= offsets.length) {
+      if (flat >= offsets.length || flat >= byteCounts.length) {
         throw new Error(
-          `TIFF: IFD ${index} lists ${offsets.length} blocks, expected ${planeCount * blocksPerPlane}`,
+          `TIFF: IFD ${index} lists ${Math.min(offsets.length, byteCounts.length)} blocks, expected ${planeCount * blocksPerPlane}`,
         )
       }
       const x0 = (block % across) * blockWidth

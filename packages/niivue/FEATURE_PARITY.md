@@ -35,7 +35,7 @@ Tracking which features from the old `niivue` package exist in the new rewrite.
 | DICOM loading | ✅ | Provided by `@niivue/nv-ext-dcm2niix` extension (browser-side dcm2niix/WASM conversion) |
 | `loadDeferred4DVolumes()` | ✅ | |
 | Partial 4D load (`limitFrames4D` option) | ✅ | Reads only header + first N frames: a gzip NIfTI-1 via `DecompressionStream` (no fflate), or an uncompressed `.nii` `File` via `Blob.slice`; the only way to open a 4D volume larger than V8's ~2 GiB `ArrayBuffer` cap. Auto-caps to as-many-frames-as-fit on `RangeError`/`NotReadableError` even without the option |
-| `getZarrVolume()` / Zarr format | ❌ | No Zarr reader |
+| `getZarrVolume()` / Zarr format | ✅ | OME-Zarr multiscale stores via `loadOmeZarrVolumes` / `fetchOmeZarr` (whole level) and `omeZarrChunkedSource` (streamed chunks); see `docs/ome-zarr-format.md` |
 | `NVImage` static loaders (`loadFromUrl/File/Base64`) | ❌ | NVImage is a type, not a class with static methods |
 
 ## 3. Mesh Loading
@@ -366,7 +366,7 @@ Tracking which features from the old `niivue` package exist in the new rewrite.
 | `calMinMax()` / `calculateRAS()` | ✅ | Internal utilities in `volume/utils.ts` |
 | `intensityRaw2Scaled()` / `intensityScaled2Raw()` | ❌ | |
 | `clone()` / `zeroImage()` | ❌ | |
-| Format readers | ✅ | All major formats except Zarr |
+| Format readers | ✅ | All major formats, including OME-Zarr |
 
 ## 30. NVMesh Public API
 
@@ -399,7 +399,7 @@ Tracking which features from the old `niivue` package exist in the new rewrite.
 | VMR | ✅ |
 | NPY/NPZ | ✅ |
 | Allen JSON+PNG atlas | ✅ |
-| Zarr | ❌ |
+| Zarr (OME-Zarr) | ✅ |
 | DICOM (extension) | ✅ |
 | MINC (plugin) | ❌ |
 | TIFF / OME-TIFF / ImageJ stack | ✅ |
@@ -546,15 +546,13 @@ per-backend. Design: `docs/tiled-volumes.md`. Demo: `apps/iiif-volumetric-demo`
 
 ### High Priority (Core Functionality)
 1. **Mesh overlay formats**: GIfTI, CIfTI-2, MZ3, FreeSurfer ANNOT layer readers
-2. **Statistical threshold modes**: old `colormapType` threshold behavior is not clearly exposed, despite negative colormaps/thresholds being present
 
 ### Medium Priority
-3. **3D rendering**: `setGradientOpacity`, custom gradient textures (MIP is now covered by `volumeRenderMode`)
-4. **Volume/mesh lookup by ID/URL**: `getVolumeIndexByID`, `getMeshIndexByID`, `removeVolumeByUrl`, `removeMeshByUrl`
-5. **`saveScene()`**: HTML export is covered by `@niivue/nv-ext-save-html`, but old scene export remains missing
-6. **Zarr volume format**
-7. **FreeSurfer connectome** loader
-8. **NVImage class methods**: coordinate conversion, getValue, clone, etc. (architectural difference — NVImage is a type not a class)
+2. **3D rendering**: `setGradientOpacity`, custom gradient textures (MIP is now covered by `volumeRenderMode`)
+3. **Volume/mesh lookup by ID/URL**: `getVolumeIndexByID`, `getMeshIndexByID`, `removeVolumeByUrl`, `removeMeshByUrl`
+4. **`saveScene()`**: HTML export is covered by `@niivue/nv-ext-save-html`, but old scene export remains missing
+5. **FreeSurfer connectome** loader
+6. **NVImage class methods**: coordinate conversion, getValue, clone, etc. (architectural difference — NVImage is a type not a class)
 
 ### Lower Priority
 9. **Mouse/touch event config**: `setMouseEventConfig`, `setTouchEventConfig`

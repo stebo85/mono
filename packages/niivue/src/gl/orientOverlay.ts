@@ -1747,7 +1747,11 @@ export function orientChunkToTexture(
   if (uniforms.isLabel) gl.uniform1i(uniforms.isLabel, u.isLabel)
   if (uniforms.labelMin) gl.uniform1f(uniforms.labelMin, u.labelMin)
   if (uniforms.labelWidth) gl.uniform1f(uniforms.labelWidth, u.labelWidth)
-  if (uniforms.atlasOutline) gl.uniform1f(uniforms.atlasOutline, u.atlasOutline)
+  // atlasOutline probes neighbours in the SOURCE texture; a chunk's texture is
+  // a tile of the volume, so probes at a chunk seam would read the neighbouring
+  // chunk's edge and draw a spurious border. Outlining is therefore off for the
+  // chunked path (matching wgpu/orientChunked.ts).
+  if (uniforms.atlasOutline) gl.uniform1f(uniforms.atlasOutline, 0)
   // Modulation is disabled for chunks, but the shader's modVol sampler must
   // still point at a valid texture unit (else it collides with the intensity
   // sampler at unit 0 -> "two textures of different types use the same sampler

@@ -113,6 +113,16 @@ describe('parseTiff', () => {
     corruptTagOffset(buffer, TIFF_TAG.imageDescription)
     expect(() => parseTiff(buffer)).toThrow(/points past the end/)
   })
+
+  test('rejects a corrupt IFD entry count as a TIFF error, not a RangeError', () => {
+    const bytes = new Uint8Array(16)
+    const view = new DataView(bytes.buffer)
+    view.setUint16(0, 0x4949, false)
+    view.setUint16(2, 42, true)
+    view.setUint32(4, 8, true)
+    view.setUint16(8, 5000, true)
+    expect(() => parseTiff(bytes.buffer)).toThrow(/claims 5000 entries/)
+  })
 })
 
 describe('readTiffImage', () => {
@@ -144,6 +154,30 @@ describe('readTiffImage', () => {
     )
     const image = await readTiffImage(tiff, 0)
     expect(Array.from(image.data)).toEqual([1, 2, 3, 4, 5, 6])
+  })
+
+  test('rejects a StripByteCounts list shorter than StripOffsets', async () => {
+    // Divert the builder's automatic byte-count entry to an unused private tag
+    // so the real StripByteCounts can carry fewer entries than StripOffsets.
+    // Decoding must throw, not silently leave the second row blank.
+    const tiff = parseTiff(
+      buildTiff({
+        entries: [
+          { tag: TIFF_TAG.imageWidth, type: 3, values: [4] },
+          { tag: TIFF_TAG.imageLength, type: 3, values: [2] },
+          { tag: TIFF_TAG.bitsPerSample, type: 3, values: [8] },
+          { tag: TIFF_TAG.compression, type: 3, values: [1] },
+          { tag: TIFF_TAG.samplesPerPixel, type: 3, values: [1] },
+          { tag: TIFF_TAG.rowsPerStrip, type: 3, values: [1] },
+          { tag: TIFF_TAG.stripByteCounts, type: 4, values: [4] },
+        ],
+        blocks: [Uint8Array.of(10, 11, 12, 13), Uint8Array.of(14, 15, 16, 17)],
+        countTag: 0xfffe,
+      }),
+    )
+    await expect(readTiffImage(tiff, 0)).rejects.toThrow(
+      /lists 1 blocks, expected 2/,
+    )
   })
 
   test('decodes 16-bit samples in both byte orders identically', async () => {

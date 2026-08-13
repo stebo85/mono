@@ -28,7 +28,14 @@ export {
   PROTON_PEAK_ANNOTATIONS,
   paddedPpmRange,
 } from './mrs/MrsScene'
-export { DRAG_MODE } from './NVConstants'
+export {
+  DRAG_MODE,
+  MULTIPLANAR_TYPE,
+  NiiDataType,
+  SHOW_RENDER,
+  SLICE_TYPE,
+  VOLUME_RENDER_MODE,
+} from './NVConstants'
 export { default, default as NiiVue } from './NVControlWebGL2'
 export type {
   AffineMatrix,

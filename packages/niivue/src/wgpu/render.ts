@@ -275,6 +275,18 @@ export class VolumeRenderer extends NVRenderer {
    * depth-test against each other. Safe because meshes draw after the volume.
    */
   pipelineChunked: GPURenderPipeline | null
+  /**
+   * MIP variant of `pipelineChunked` — identical except the framebuffer blend
+   * is a component-wise `max`. Each chunked MIP cube draw emits its ray
+   * segment's premultiplied maximum (the shader's per-layer MIP rule is also
+   * `max`, see depthAwareMix), so maxing across the chunk draws reconstructs
+   * the full-ray MIP regardless of chunk order — OVER blending would let a
+   * high-alpha near chunk occlude a brighter voxel in a farther chunk.
+   * Limitation: the max also applies against the pre-existing framebuffer, so
+   * a chunked MIP assumes the tile behind the cube is black (the classic
+   * MAX-blend MIP convention); non-chunked MIP still composites OVER.
+   */
+  pipelineChunkedMip: GPURenderPipeline | null
   bindLayout: GPUBindGroupLayout | null
   bindGroup: GPUBindGroup | null
   matcapTexture: GPUTexture | null
@@ -395,6 +407,7 @@ export class VolumeRenderer extends NVRenderer {
     super()
     this.pipeline = null
     this.pipelineChunked = null
+    this.pipelineChunkedMip = null
     this.bindLayout = null
     this.bindGroup = null
     this.matcapTexture = null
@@ -602,48 +615,54 @@ export class VolumeRenderer extends NVRenderer {
       },
     })
 
-    this.pipelineChunked = device.createRenderPipeline({
-      layout: device.createPipelineLayout({
-        bindGroupLayouts: [this.bindLayout],
-      }),
-      multisample: { count: msaaCount },
-      vertex: {
-        module: shaderModule,
-        entryPoint: 'vertex_main',
-        buffers: [
-          {
-            arrayStride: 12,
-            attributes: [{ format: 'float32x3', offset: 0, shaderLocation: 0 }],
-          },
-        ],
-      },
-      fragment: {
-        module: shaderModule,
-        entryPoint: 'fragment_main',
-        targets: [
-          {
-            format: format,
-            blend: {
-              color: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha' },
-              alpha: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha' },
+    const chunkedBindLayout = this.bindLayout
+    const chunkedPipeline = (blend: GPUBlendState): GPURenderPipeline =>
+      device.createRenderPipeline({
+        layout: device.createPipelineLayout({
+          bindGroupLayouts: [chunkedBindLayout],
+        }),
+        multisample: { count: msaaCount },
+        vertex: {
+          module: shaderModule,
+          entryPoint: 'vertex_main',
+          buffers: [
+            {
+              arrayStride: 12,
+              attributes: [
+                { format: 'float32x3', offset: 0, shaderLocation: 0 },
+              ],
             },
-          },
-        ],
-      },
-      // depthCompare 'always' (vs 'less' above): the per-chunk cube draws
-      // composite back-to-front with OVER blending and must not depth-test
-      // against each other, or a chunk behind an already-drawn chunk is
-      // rejected and its contribution is lost.
-      depthStencil: {
-        depthWriteEnabled: true,
-        depthCompare: 'always',
-        format: this.depthFormat,
-      },
-      primitive: {
-        topology: 'triangle-strip',
-        stripIndexFormat: 'uint16',
-        cullMode: 'back',
-      },
+          ],
+        },
+        fragment: {
+          module: shaderModule,
+          entryPoint: 'fragment_main',
+          targets: [{ format: format, blend }],
+        },
+        // depthCompare 'always' (vs 'less' above): the per-chunk cube draws
+        // composite back-to-front with OVER blending and must not depth-test
+        // against each other, or a chunk behind an already-drawn chunk is
+        // rejected and its contribution is lost.
+        depthStencil: {
+          depthWriteEnabled: true,
+          depthCompare: 'always',
+          format: this.depthFormat,
+        },
+        primitive: {
+          topology: 'triangle-strip',
+          stripIndexFormat: 'uint16',
+          cullMode: 'back',
+        },
+      })
+    this.pipelineChunked = chunkedPipeline({
+      color: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha' },
+      alpha: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha' },
+    })
+    // MIP chunk draws merge by component-wise max (see the pipelineChunkedMip
+    // field doc). WebGPU requires 'one' blend factors with the max operation.
+    this.pipelineChunkedMip = chunkedPipeline({
+      color: { operation: 'max', srcFactor: 'one', dstFactor: 'one' },
+      alpha: { operation: 'max', srcFactor: 'one', dstFactor: 'one' },
     })
 
     this.isReady = true
@@ -2410,6 +2429,7 @@ export class VolumeRenderer extends NVRenderer {
     if (
       !entry ||
       !this.pipelineChunked ||
+      !this.pipelineChunkedMip ||
       !this.paramsBuffer ||
       !this.vertexBuffer ||
       !this.indexBuffer ||
@@ -2478,7 +2498,13 @@ export class VolumeRenderer extends NVRenderer {
       volScale,
     )
 
-    pass.setPipeline(this.pipelineChunked)
+    // MIP: merge chunk draws (and the overlay entry's draws over the base) by
+    // component-wise max instead of OVER — matching the shader's own per-layer
+    // MIP rule (depthAwareMix), so the result is the true full-ray maximum
+    // independent of chunk draw order.
+    pass.setPipeline(
+      this.renderMode > 0.5 ? this.pipelineChunkedMip : this.pipelineChunked,
+    )
     pass.setVertexBuffer(0, this.vertexBuffer)
     pass.setIndexBuffer(this.indexBuffer, 'uint16')
 
@@ -2888,6 +2914,7 @@ export class VolumeRenderer extends NVRenderer {
     this.samplerNearest = null
     this.pipeline = null
     this.pipelineChunked = null
+    this.pipelineChunkedMip = null
     this.bindLayout = null
     this._bindTexVol = null
     this._bindTexGrad = null

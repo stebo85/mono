@@ -2104,6 +2104,16 @@ export class VolumeRenderer extends NVRenderer {
     // against each other, or a chunk behind an already-drawn chunk is
     // rejected and its contribution is lost. Restored to LESS after the loop.
     gl.depthFunc(gl.ALWAYS)
+    // MIP: merge chunk draws (and the overlay entry's draws over the base) by
+    // component-wise max instead of OVER — each cube emits its ray segment's
+    // premultiplied maximum and the shader's own per-layer MIP rule is also
+    // max, so MAX blending reconstructs the true full-ray maximum independent
+    // of chunk draw order (OVER would let a high-alpha near chunk occlude a
+    // brighter voxel in a farther chunk). Assumes a black tile behind the cube
+    // (the classic MAX-blend MIP convention); non-chunked MIP composites OVER.
+    // GL_MAX ignores the blend factors. Restored to FUNC_ADD after the loop.
+    const mip = this.renderMode > 0.5
+    if (mip) gl.blendEquation(gl.MAX)
     const explode = entry.volume.chunkExplode
     const order = chunksBackToFront(
       entry.plan,
@@ -2261,6 +2271,7 @@ export class VolumeRenderer extends NVRenderer {
       }
       gl.drawElements(gl.TRIANGLE_STRIP, indexCount, gl.UNSIGNED_SHORT, 0)
     }
+    if (mip) gl.blendEquation(gl.FUNC_ADD)
     gl.depthFunc(gl.LESS)
   }
 

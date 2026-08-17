@@ -880,6 +880,14 @@ export type NiiVueOptions = {
    * memory.
    */
   maxChunkResidencyBytes?: number
+  /**
+   * Duration, in milliseconds, of the cross-fade a freshly-streamed chunk of a
+   * chunked (tiled) volume dissolves in over its coarse floor, so a level-of-
+   * detail change softens rather than cuts. 0 disables the fade (chunks pop in
+   * at full strength). Only applies where a coarse floor is present; unset
+   * leaves the renderer default.
+   */
+  chunkFadeMs?: number
 
   // Scene
   azimuth?: number

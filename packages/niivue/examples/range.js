@@ -892,54 +892,6 @@ async function loadOmezarrSource(storeDef, serial) {
   }
 }
 
-// Build a small in-memory whole-volume from the coarsest present pyramid level
-// of an OME-Zarr source, to use as niivue's base "coarse floor". The 3D render
-// draws this behind any not-yet-resident fine chunk, so a huge level (whose
-// full chunk set can't fit the residency budget) still shows the whole volume
-// immediately instead of rendering blank. Returns null if no coarser level than
-// the active one is available, or on any error (the floor is best-effort).
-async function buildCoarseFloorVolume(source) {
-  // Reuse the coarsest PRESENT level already opened by loadOmezarrSource
-  // (source.levels is finest-first, each carrying a resolved array + spacing),
-  // rather than re-opening from storeDef.levels. That both drops a redundant
-  // metadata fetch per reload AND avoids naming a configured-but-absent level (a
-  // partial fetch-omezarr.ts run): Math.max(...storeDef.levels) could point at a
-  // level that was never downloaded, whose open throws, gets swallowed here, and
-  // silently leaves the far-field blank even though a coarser PRESENT level
-  // exists. levels[last].level is the largest (coarsest) present index.
-  const coarseIndex = source.levels.length - 1
-  const coarse = source.levels[coarseIndex]
-  if (!coarse || coarse.datasetIndex <= source.level) return null // no coarser present level
-  try {
-    // Whole (small) coarse level through the library source, so the floor gets
-    // the same display-space layout (and axis-order transpose) as the bricks.
-    const img = await source.chunkSource.fetchChunk({
-      levelIndex: coarseIndex,
-      texOrigin: [0, 0, 0],
-      texDims: coarse.dims,
-      bytesPerVoxel: source.numBitsPerVoxel / 8,
-    })
-    const win = parseWindow(source.defaultWindow)
-    const floor = createStreamingNVImage({
-      id: `${source.id}:floor`,
-      url: `client-chunk://${source.id}/floor`,
-      shape: coarse.dims,
-      spacing: coarse.spacingUm,
-      datatypeCode: source.datatypeCode,
-      calMin: win.min,
-      calMax: win.max,
-      colormap: els.colormap.value,
-    })
-    // Unlike a streamed volume, the floor renders from CPU data: attach the
-    // decoded voxels to the img:null streaming skeleton (no chunkSource).
-    floor.img = img
-    return floor
-  } catch (err) {
-    console.warn('coarse floor unavailable:', err)
-    return null
-  }
-}
-
 async function loadActiveSource() {
   // Stamp this load with a fresh serial so its fetches/cache can tell whether
   // they are still the active source when they resolve (see isLiveSerial).
@@ -1650,6 +1602,11 @@ async function runReload(token, options) {
           // construction) -- the same value the explicit option used to pass.
           halo: STREAMING_CHUNK_HALO,
           minLevel: loadLevel,
+          // Back the octree with a coarse whole-volume floor (core builds it from
+          // the coarsest present pyramid level) so not-yet-streamed or
+          // under-opaque coarse far-field regions show continuous coarse detail
+          // instead of blank/see-through gaps; ?nofloor disables it for A/B.
+          coarseFloor: !NO_FLOOR,
         },
       )
       if (token !== reloadToken) {
@@ -1687,13 +1644,12 @@ async function runReload(token, options) {
     // The scene extents are only known now, and each source has its own scale, so
     // re-derive the crosshair size for the volume that just landed.
     applyCrosshair()
-    // Back the octree with a coarse whole-volume floor (on by default) so not-yet-
-    // streamed or under-opaque coarse far-field regions show continuous coarse
-    // detail instead of blank/see-through gaps; ?nofloor disables it for A/B.
-    if (activeSource.kind === 'omezarr' && !NO_FLOOR) {
-      const floor = await buildCoarseFloorVolume(activeSource)
-      if (token !== reloadToken) return
-      await nv.setBaseCoarseFloor(floor)
+    // loadChunkedVolume already installed the floor, but it ran while the
+    // outgoing volume was still the base (this reload is additive); re-apply now
+    // that the scene holds only the new one. The built floor is cached, so this
+    // costs no extra fetch. The synthetic path has no pyramid, so it clears.
+    if (activeSource.kind === 'omezarr' && activeCv) {
+      await activeCv.applyCoarseFloor()
     } else {
       await nv.setBaseCoarseFloor(null)
     }

@@ -218,6 +218,7 @@ type InfrastructureOpts = {
   boundsBorderThickness?: number
   maxTextureDimension3D?: number
   maxChunkResidencyBytes?: number
+  chunkFadeMs?: number
 }
 const DEFAULT_MATCAPS: Record<string, string> = { cortex }
 
@@ -474,6 +475,7 @@ export default class NiiVue extends EventTarget {
       boundsBorderThickness: options.boundsBorderThickness ?? 2,
       maxTextureDimension3D: options.maxTextureDimension3D,
       maxChunkResidencyBytes: options.maxChunkResidencyBytes,
+      chunkFadeMs: options.chunkFadeMs,
     }
     // Public properties (controller-level). isDragging defaults false via its
     // backing field; setting it here would run its model-mirroring setter before
@@ -3644,7 +3646,14 @@ export default class NiiVue extends EventTarget {
    *
    * ADDITIVE: the streamed volume is ADDED to the scene (via `addVolume`), not
    * swapped for the current volumes. To reload/replace a streamed volume, the
-   * caller removes the previous one first.
+   * caller removes the previous one first. Because the outgoing volume is still
+   * the base while this runs, a reload should call
+   * {@link NVChunkedVolume.applyCoarseFloor} once it has removed it.
+   *
+   * Unless the `coarseFloor` option turns it off, the coarsest pyramid level is
+   * also installed as the base coarse floor (see
+   * {@link NiiVue.setBaseCoarseFloor}), so regions whose bricks are not yet
+   * resident show coarse detail instead of the scene background.
    */
   async loadChunkedVolume(
     source: ChunkedVolumeSource,

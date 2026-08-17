@@ -2,7 +2,7 @@ import { mat4, vec3 } from 'gl-matrix'
 import { log } from '@/logger'
 import { SLICE_TYPE } from '@/NVConstants'
 import type NiiVue from '@/NVControlBase'
-import type { NVImage, VolumeChunkSource } from '@/NVTypes'
+import type { NVImage, TypedVoxelArray, VolumeChunkSource } from '@/NVTypes'
 import type { ChunkedVolumeSource } from './ChunkedVolumeSource'
 import {
   type ChunkPlan,
@@ -11,6 +11,7 @@ import {
   type Vec3i,
 } from './chunking'
 import { createStreamingNVImage } from './streamingVolume'
+import { getBitsPerVoxel, getTypedArrayConstructor } from './utils'
 
 /** Options for {@link NiiVue.loadChunkedVolume}. */
 export interface ChunkedVolumeOptions {
@@ -65,6 +66,17 @@ export interface ChunkedVolumeOptions {
   renderCentering?: 'pivot' | 'none'
   /** Debounce for focus-follow rebuilds, ms (default 150). */
   debounceMs?: number
+  /**
+   * Back the streamed bricks with a whole-volume coarse "floor", built from the
+   * coarsest pyramid level and installed via {@link NiiVue.setBaseCoarseFloor}
+   * (default true). A brick with no resident texture draws nothing, so without a
+   * floor the scene background shows through — briefly for EVERY region after a
+   * refocus swaps the plan, which is what reads as a flash while zooming. The
+   * floor also gives the streaming cross-fade something to dissolve in over.
+   * Skipped (with a warning) when the coarsest level is too large to upload as
+   * one texture, or carries a datatype with no per-voxel intensity.
+   */
+  coarseFloor?: boolean
 }
 
 interface ResolvedOptions {
@@ -77,9 +89,20 @@ interface ResolvedOptions {
   deviceLimit: number
   renderCentering: 'pivot' | 'none'
   debounceMs: number
+  coarseFloor: boolean
 }
 
 const DEFAULT_BUDGET_BYTES = 1_500_000_000
+
+/**
+ * Size guards for the auto-built coarse floor. It is oriented into ONE RGBA
+ * texture, so 256^3 voxels costs ~67 MB — negligible beside the default brick
+ * budget — while the edge cap keeps it inside the 3D texture dimension every
+ * WebGL2/WebGPU device in practice provides. A pyramid whose COARSEST level is
+ * bigger than this gets no floor rather than a multi-second stall on load.
+ */
+const COARSE_FLOOR_MAX_VOXELS = 256 ** 3
+const COARSE_FLOOR_MAX_EDGE = 512
 
 // --- pure helpers (unit-tested; no controller needed) -----------------------
 
@@ -124,12 +147,16 @@ export function mmToVolumeFraction(frac2mm: mat4, mm: Vec3f): Vec3f | null {
   return [clamp01(out[0]), clamp01(out[1]), clamp01(out[2])]
 }
 
-/** Build a crosshair-focused multi-LOD plan for a source at a focus + radius. */
+/**
+ * Build a crosshair-focused multi-LOD plan for a source at a focus + radius.
+ * Takes only the plan-shaping options: the coarse floor is a display backdrop,
+ * not an input to the octree.
+ */
 export function planForFocus(
   source: ChunkedVolumeSource,
   focusFrac: Vec3f,
   radius: number,
-  o: ResolvedOptions,
+  o: Omit<ResolvedOptions, 'coarseFloor'>,
 ): ChunkPlan {
   const levelDims = source.levels.map((l) => l.shape)
   const center = focusCenterBiased(levelDims[0], focusFrac, o.cellEdge)
@@ -270,6 +297,11 @@ export class NVChunkedVolume {
   private disposed = false
   private refocusHandle: ReturnType<typeof setTimeout> | null = null
   private swapChain: Promise<void> = Promise.resolve()
+  // Built once, on the first applyCoarseFloor; null once `floorBuilt` is set
+  // means "tried and cannot" (too large, or an unsupported datatype), so a
+  // repeat call does not re-fetch the coarse level.
+  private floorVolume: NVImage | null = null
+  private floorBuilt = false
 
   constructor(
     host: NiiVue,
@@ -291,6 +323,7 @@ export class NVChunkedVolume {
       deviceLimit: options.deviceLimit ?? hostDeviceLimit(host) ?? 256,
       renderCentering: options.renderCentering ?? 'none',
       debounceMs: options.debounceMs ?? 150,
+      coarseFloor: options.coarseFloor ?? true,
     }
     this.radiusOpt = options.radius ?? 'auto'
     const focus = options.focus ?? 'crosshair'
@@ -352,6 +385,31 @@ export class NVChunkedVolume {
     // (and can't fire against a torn-down view).
     this.host.addEventListener('viewDestroyed', this.onViewDestroyed)
     this.applyRenderCentering()
+    await this.applyCoarseFloor()
+  }
+
+  /**
+   * Install this volume's coarse floor as the host's base floor (fetching and
+   * building it on first call, then reusing it), and return whether a floor is
+   * now installed. Called by {@link init}; call it again after an ADDITIVE
+   * reload has removed the outgoing volume, since the floor belongs to whichever
+   * streamed volume is the base and `init` runs while the old one still is.
+   *
+   * When the `coarseFloor` option is on but no floor can be built, the host's
+   * floor is CLEARED rather than left alone: a floor from a previously loaded
+   * volume would otherwise keep drawing behind this one's bricks, on the wrong
+   * grid. No-op when the option is off, so an app supplying its own floor via
+   * {@link NiiVue.setBaseCoarseFloor} keeps it.
+   */
+  async applyCoarseFloor(): Promise<boolean> {
+    if (!this.o.coarseFloor || this.disposed) return false
+    if (!this.floorBuilt) {
+      this.floorVolume = await this.buildCoarseFloor()
+      this.floorBuilt = true
+    }
+    if (this.disposed) return false
+    await this.host.setBaseCoarseFloor(this.floorVolume)
+    return this.floorVolume !== null
   }
 
   /** The volume's stable id (used to target plan swaps). */
@@ -480,6 +538,63 @@ export class NVChunkedVolume {
     await applied
   }
 
+  /**
+   * Fetch the coarsest pyramid level whole and wrap it as an in-memory NVImage
+   * on the same mm box as the streamed volume, for the renderer to orient into
+   * the single floor texture. Unlike the streamed volume this one carries CPU
+   * voxels (`img`) and no `chunkSource`. Returns null (with a warning) when the
+   * level is too large to upload as one texture, when the datatype has no
+   * per-voxel intensity, or when the fetch fails — a missing floor degrades to
+   * today's behavior, so it must never fail the load.
+   */
+  private async buildCoarseFloor(): Promise<NVImage | null> {
+    const levelIndex = this.source.levels.length - 1
+    const coarse = this.source.levels[levelIndex]
+    const dims: Vec3i = [coarse.shape[0], coarse.shape[1], coarse.shape[2]]
+    const voxels = dims[0] * dims[1] * dims[2]
+    if (
+      voxels > COARSE_FLOOR_MAX_VOXELS ||
+      Math.max(dims[0], dims[1], dims[2]) > COARSE_FLOOR_MAX_EDGE
+    ) {
+      log.warn(
+        `NVChunkedVolume: no coarse floor, coarsest level ${dims.join('x')} exceeds the floor size cap`,
+      )
+      return null
+    }
+    const Ctor = getTypedArrayConstructor(this.source.datatypeCode)
+    if (!Ctor) {
+      log.warn(
+        `NVChunkedVolume: no coarse floor, unsupported datatype ${this.source.datatypeCode}`,
+      )
+      return null
+    }
+    try {
+      const bytesPerVoxel = getBitsPerVoxel(this.source.datatypeCode) / 8
+      const bytes = await this.source.fetchChunk({
+        levelIndex,
+        texOrigin: [0, 0, 0],
+        texDims: dims,
+        bytesPerVoxel,
+      })
+      const floor = createStreamingNVImage({
+        shape: dims,
+        spacing: coarse.spacing,
+        datatypeCode: this.source.datatypeCode,
+        calMin: this.volume.calMin ?? 0,
+        calMax: this.volume.calMax ?? 1,
+        colormap: this.volume.colormap,
+        isTransparentBelowCalMin: this.volume.isTransparentBelowCalMin,
+        name: `${this.volume.name} floor`,
+        id: `${this.volumeId}:floor`,
+      })
+      floor.img = toVoxelView(bytes, Ctor, bytesPerVoxel, voxels)
+      return floor
+    } catch (err) {
+      log.warn('NVChunkedVolume: coarse floor unavailable', err)
+      return null
+    }
+  }
+
   private applyRenderCentering(): void {
     if (this.o.renderCentering !== 'pivot') return
     const min = this.volume.extentsMin
@@ -491,6 +606,25 @@ export class NVChunkedVolume {
       min[2] + this.focusFrac[2] * (max[2] - min[2]),
     )
   }
+}
+
+/**
+ * Reinterpret the coarse level's raw bytes as the source's voxel type. The
+ * fetched `Uint8Array` may be a view into a larger buffer at a byte offset the
+ * wider element type cannot address, which a typed-array view would reject, so
+ * copy in that (rare) case rather than throw.
+ */
+function toVoxelView(
+  bytes: Uint8Array,
+  Ctor: NonNullable<ReturnType<typeof getTypedArrayConstructor>>,
+  bytesPerVoxel: number,
+  voxels: number,
+): TypedVoxelArray {
+  const aligned =
+    bytes.byteOffset % bytesPerVoxel === 0 ? bytes : new Uint8Array(bytes)
+  // `buffer` is typed ArrayBufferLike (it may be a SharedArrayBuffer); every
+  // typed-array constructor accepts either, so narrow for the signature.
+  return new Ctor(aligned.buffer as ArrayBuffer, aligned.byteOffset, voxels)
 }
 
 function clampLevel(levelIndex: number, source: ChunkedVolumeSource): number {

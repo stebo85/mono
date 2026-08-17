@@ -75,9 +75,15 @@ When a user explores a massive dataset, the client and server engage in a contin
 2. **Zooming In (Drill Down):**
    * As the camera moves closer, the screen-space error rises. NiiVue realizes it needs higher resolution data (Level 0) for the chunks specifically intersecting the center of the screen.
    * The Level 0 chunks are requested from the server.
-   * Because they take longer to download, NiiVue continues rendering the blurry Level 3 chunks as a placeholder.
-   * Once the Level 0 chunks arrive, the `ChunkResidencyManager` admits them to the GPU cache, instantly "popping" the view into sharp focus.
+   * They take longer to download, and the plan swap that asked for them has already released the GPU textures of the Level 3 chunks it could not carry over. What fills the gap in the meantime is the **coarse floor** (see below), not the outgoing chunks: a whole-volume low-resolution texture the renderer draws wherever a brick has no texture yet.
+   * Once the Level 0 chunks arrive, the `ChunkResidencyManager` admits them to the GPU cache and each one dissolves in over the floor across `chunkFadeMs` (120 ms by default; set it to 0 to make them pop in instantly).
    * Simultaneously, if the VRAM budget is exceeded, NiiVue evicts the high-resolution chunks that recently panned off the edges of the screen.
+
+### The coarse floor
+
+A brick with no resident texture draws **nothing**, so without a floor the scene background shows through — briefly for every region of the volume each time a refocus swaps the plan, which is what reads as a flash while zooming. `loadChunkedVolume` therefore builds a floor automatically from the coarsest pyramid level and installs it (`coarseFloor: false` opts out; it is skipped when that level is too large to upload as a single texture). An app that drives the chunked path itself can supply one with `setBaseCoarseFloor(image)` — a small in-memory `NVImage` covering the same mm box, with CPU voxels in `img` and no `chunkSource`.
+
+The floor is what the cross-fade dissolves into, so with no floor installed there is no fade either: `fadeFraction` returns 1 immediately and chunks pop in at full strength.
 
 ---
 

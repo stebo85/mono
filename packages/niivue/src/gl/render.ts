@@ -79,12 +79,17 @@ const MAX_CHUNKS_PER_TILE = 1024
  */
 const CHUNK_UPLOAD_BUDGET_MS = 8
 const MAX_CHUNK_UPLOADS_PER_FRAME = 24
-// Duration of the streaming-chunk cross-fade between LOD levels. A chunk
-// admitted this long ago (or longer) draws at full strength; younger chunks
-// dissolve in over the floor. Set to 0 to disable the cross-fade entirely:
-// fadeFraction then returns 1 immediately, so a fine chunk pops in at full
-// strength (the floor is still drawn for chunks that are not yet resident).
-const CHUNK_FADE_MS = 0
+/**
+ * Default duration of the streaming-chunk cross-fade between LOD levels, in ms.
+ * A chunk admitted this long ago (or longer) draws at full strength; younger
+ * chunks dissolve in over the coarse floor, so a plan swap reads as a soften-
+ * then-sharpen rather than a hard cut. Overridable per instance with the
+ * `chunkFadeMs` option; 0 disables the cross-fade entirely (fadeFraction then
+ * returns 1 immediately, so a fine chunk pops in at full strength — the floor
+ * is still drawn for chunks that are not yet resident). Kept short enough that
+ * it never reads as lag on a settled view.
+ */
+const DEFAULT_CHUNK_FADE_MS = 120
 /**
  * How many upcoming queued chunks the pump prefetches (source fetch) ahead of
  * upload, per chunked volume per pump. Matched to the uploader's internal
@@ -252,6 +257,9 @@ export class VolumeRenderer extends NVRenderer {
   // GPU memory budget for a chunked volume's resident chunk set. Set from the
   // maxChunkResidencyBytes option in init; passed to each ChunkResidencyManager.
   private _chunkResidencyBytes = DEFAULT_CHUNK_RESIDENCY_BYTES
+  // Cross-fade duration, ms, for a freshly-admitted streaming chunk. Set from
+  // the chunkFadeMs option when the view initializes; 0 disables the fade.
+  chunkFadeMs = DEFAULT_CHUNK_FADE_MS
   // Scene flag (set per-frame from md.scene): clip the overlay/PAQD/drawing passes
   // with the base volume instead of letting them ignore the clip plane.
   clipPlaneOverlay = false
@@ -868,7 +876,7 @@ export class VolumeRenderer extends NVRenderer {
 
   /**
    * Streaming cross-fade weight in [0,1] for one chunk of the active chunked
-   * base, for the 2D slice path: ramps 0->1 over CHUNK_FADE_MS from admit, so a
+   * base, for the 2D slice path: ramps 0->1 over `chunkFadeMs` from admit, so a
    * fine chunk slice dissolves in over the coarse floor instead of popping.
    * Returns 1 (no fade) when there is no floor to dissolve into or no active
    * chunked base. Flags fadeActive while a chunk is mid-fade so the view keeps
@@ -879,7 +887,7 @@ export class VolumeRenderer extends NVRenderer {
     const fade = this._activeChunked.manager.fadeFraction(
       chunkIndex,
       this._frameNow,
-      CHUNK_FADE_MS,
+      this.chunkFadeMs,
     )
     if (fade < 1) this._fadeActive = true
     return fade
@@ -2224,7 +2232,11 @@ export class VolumeRenderer extends NVRenderer {
       // the floor cube first (full strength), then the fine cube over it with
       // premultiplied weight `fade`. Settled (fade === 1) => fine only.
       const fade = floorActive
-        ? entry.manager.fadeFraction(chunkIndex, this._frameNow, CHUNK_FADE_MS)
+        ? entry.manager.fadeFraction(
+            chunkIndex,
+            this._frameNow,
+            this.chunkFadeMs,
+          )
         : 1
       if (fade < 1) {
         drawFloorCube(chunkIndex)

@@ -494,3 +494,121 @@ describe('NVChunkedVolume serialized refocus', () => {
     expect(applied[applied.length - 1]).toBe(mgr.currentPlan)
   })
 })
+
+// --- manager: automatic coarse floor ---------------------------------------
+
+/**
+ * Host stub that records every floor install. `setBaseCoarseFloor` is the only
+ * host call `applyCoarseFloor` makes, so nothing else needs stubbing.
+ */
+function makeFloorHost(): {
+  host: NiiVue
+  installs: Array<NVImage | null>
+} {
+  const installs: Array<NVImage | null> = []
+  const host = {
+    setBaseCoarseFloor: async (vol: NVImage | null) => {
+      installs.push(vol)
+    },
+  } as unknown as NiiVue
+  return { host, installs }
+}
+
+/** mgrSource with a recording fetchChunk that returns correctly-sized bytes. */
+function floorSource(levels: ChunkedVolumeSource['levels']): {
+  source: ChunkedVolumeSource
+  fetches: ChunkedVolumeFetch[]
+} {
+  const fetches: ChunkedVolumeFetch[] = []
+  const source: ChunkedVolumeSource = {
+    datatypeCode: 4, // INT16 -> 2 bytes per voxel
+    levels,
+    fetchChunk: async (r) => {
+      fetches.push(r)
+      const n = r.texDims[0] * r.texDims[1] * r.texDims[2] * r.bytesPerVoxel
+      return new Uint8Array(n)
+    },
+  }
+  return { source, fetches }
+}
+
+describe('NVChunkedVolume coarse floor', () => {
+  test('builds the floor from the coarsest level and installs it', async () => {
+    const { host, installs } = makeFloorHost()
+    const { source, fetches } = floorSource(mgrSource.levels)
+    const mgr = new NVChunkedVolume(host, source, { radius: 16 })
+
+    expect(await mgr.applyCoarseFloor()).toBe(true)
+    // Whole coarsest level, in that level's own grid.
+    expect(fetches).toHaveLength(1)
+    expect(fetches[0].levelIndex).toBe(source.levels.length - 1)
+    expect(fetches[0].texOrigin).toEqual([0, 0, 0])
+    expect(fetches[0].texDims).toEqual([64, 64, 64])
+    expect(fetches[0].bytesPerVoxel).toBe(2)
+
+    expect(installs).toHaveLength(1)
+    const floor = installs[0]
+    expect(floor).not.toBeNull()
+    // CPU voxels on the img:null streaming skeleton, reinterpreted as the
+    // source datatype (INT16), and no chunkSource: the floor is not streamed.
+    expect(floor?.img).toBeInstanceOf(Int16Array)
+    expect(floor?.img?.length).toBe(64 * 64 * 64)
+    expect(floor?.chunkSource).toBeUndefined()
+    expect(floor?.dims?.slice(1, 4)).toEqual([64, 64, 64])
+  })
+
+  test('a repeat apply reuses the built floor instead of re-fetching', async () => {
+    const { host, installs } = makeFloorHost()
+    const { source, fetches } = floorSource(mgrSource.levels)
+    const mgr = new NVChunkedVolume(host, source, { radius: 16 })
+
+    await mgr.applyCoarseFloor()
+    await mgr.applyCoarseFloor()
+    expect(fetches).toHaveLength(1)
+    expect(installs).toHaveLength(2)
+    expect(installs[1]).toBe(installs[0])
+  })
+
+  test('coarseFloor: false neither fetches nor touches the host floor', async () => {
+    const { host, installs } = makeFloorHost()
+    const { source, fetches } = floorSource(mgrSource.levels)
+    const mgr = new NVChunkedVolume(host, source, {
+      radius: 16,
+      coarseFloor: false,
+    })
+
+    expect(await mgr.applyCoarseFloor()).toBe(false)
+    expect(fetches).toHaveLength(0)
+    // An app-supplied floor set via setBaseCoarseFloor must survive.
+    expect(installs).toHaveLength(0)
+  })
+
+  test('an oversized coarsest level CLEARS the floor rather than leaving a stale one', async () => {
+    const { host, installs } = makeFloorHost()
+    // Coarsest level is 1024^3: past both the voxel and the edge cap.
+    const { source, fetches } = floorSource([
+      { level: 0, shape: [4096, 4096, 4096], spacing: [1, 1, 1] },
+      { level: 1, shape: [1024, 1024, 1024], spacing: [4, 4, 4] },
+    ])
+    const mgr = new NVChunkedVolume(host, source, { radius: 16 })
+
+    expect(await mgr.applyCoarseFloor()).toBe(false)
+    expect(fetches).toHaveLength(0)
+    expect(installs).toEqual([null])
+  })
+
+  test('a failed fetch degrades to no floor, not a thrown load', async () => {
+    const { host, installs } = makeFloorHost()
+    const source: ChunkedVolumeSource = {
+      datatypeCode: 4,
+      levels: mgrSource.levels,
+      fetchChunk: async () => {
+        throw new Error('coarse level 404')
+      },
+    }
+    const mgr = new NVChunkedVolume(host, source, { radius: 16 })
+
+    expect(await mgr.applyCoarseFloor()).toBe(false)
+    expect(installs).toEqual([null])
+  })
+})

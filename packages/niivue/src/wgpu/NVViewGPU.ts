@@ -2200,6 +2200,13 @@ export default class NVView {
       chunkLimit,
       chunkResidencyBytes,
     )
+    // `chunkFadeMs`, when set, overrides how long a freshly-streamed chunk
+    // dissolves in over the coarse floor; 0 disables the fade, so 0 is a
+    // meaningful value and only a negative/NaN setting falls back to the default.
+    const fadeMs = this.options.chunkFadeMs
+    if (typeof fadeMs === 'number' && fadeMs >= 0) {
+      this.volumeRenderer.chunkFadeMs = fadeMs
+    }
     // Storage Buffers
     this.maxGlyphs = 2048 // Increased for legends with many entries
     this.buffers.glyphStorage = this.device.createBuffer({

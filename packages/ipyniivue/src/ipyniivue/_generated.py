@@ -670,7 +670,14 @@ and its volumes alive."""
 
         ADDITIVE: the streamed volume is ADDED to the scene (via `addVolume`), not
         swapped for the current volumes. To reload/replace a streamed volume, the
-        caller removes the previous one first.
+        caller removes the previous one first. Because the outgoing volume is still
+        the base while this runs, a reload should call
+        {@link NVChunkedVolume.applyCoarseFloor} once it has removed it.
+
+        Unless the `coarseFloor` option turns it off, the coarsest pyramid level is
+        also installed as the base coarse floor (see
+        {@link NiiVue.setBaseCoarseFloor}), so regions whose bricks are not yet
+        resident show coarse detail instead of the scene background.
 
         Parameters
         ----------

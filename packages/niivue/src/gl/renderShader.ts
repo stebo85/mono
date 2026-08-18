@@ -3,6 +3,11 @@ import { fragmentPreamble, volumeVertexShader } from './volumeShaderLib'
 export const vertexShader = volumeVertexShader
 
 export const fragmentShader = `${fragmentPreamble}
+// Fine-march iteration ceiling. Sized for the maximum sample rate (4) at the
+// old one-sample-per-voxel budget of 2048 steps; every loop exits on ray length
+// long before this, so the ceiling costs nothing at the common rates.
+const int MAX_FINE_STEPS = 8192;
+
 uniform mat4 normMtx;
 uniform float gradientAmount;
 uniform float numVolumes;  // number of loaded volumes (1 = no overlay, 2+ = has overlay)
@@ -20,6 +25,12 @@ uniform float earlyTermination;
 // Per-brick source-level voxel dims for the ray-step density (multi-LOD). Equals
 // volumeTexDimsFull for single-level/non-chunked draws.
 uniform vec3 rayStepTexVox;
+// Samples per voxel along the ray in the fine march. One sample per voxel is at
+// the Nyquist limit of the trilinear reconstruction, so it aliases: the ray
+// integral gets quantized against a lattice that is coherent across the screen,
+// which paints concentric "wood grain" rings over smooth structures. Values
+// above 1 oversample and remove the banding.
+uniform float rayVoxSampleRate;
 uniform vec4 clipPlaneColor;
 uniform vec4 paqdUniforms;
 uniform sampler2D matcap;
@@ -133,9 +144,13 @@ RayResult rayMarchPass(
 
     samplePos -= deltaDirFast;
     if (samplePos.a < 0.0) { samplePos = samplePosStart; }
+    // Put the fine march back on the ray's deterministic lattice; the 1.9-voxel
+    // fast stride would otherwise set its phase from the depth of the first hit.
+    float snapped = snapToSampleLattice(samplePos.a, ran, stepSize);
+    samplePos = vec4(start + dir * snapped, snapped);
 
     // Fine pass
-    for (int i = 0; i < 2048; i++) {
+    for (int i = 0; i < MAX_FINE_STEPS; i++) {
         if (samplePos.a > len) { break; }
         if (clipMode > 0.5 && clipMode < 1.5 && samplePos.a > clipHi) { break; }
         if (clipPassSkip(samplePos.a, clipLo, clipHi, clipMode)) { samplePos += deltaDir; continue; }
@@ -217,9 +232,13 @@ RayResult rayMarchPaqd(
 
     samplePos -= deltaDirFast;
     if (samplePos.a < 0.0) { samplePos = samplePosStart; }
+    // Put the fine march back on the ray's deterministic lattice; the 1.9-voxel
+    // fast stride would otherwise set its phase from the depth of the first hit.
+    float snapped = snapToSampleLattice(samplePos.a, ran, stepSize);
+    samplePos = vec4(start + dir * snapped, snapped);
 
     // Fine pass: decode and accumulate PAQD colors
-    for (int i = 0; i < 2048; i++) {
+    for (int i = 0; i < MAX_FINE_STEPS; i++) {
         if (samplePos.a > len) { break; }
         if (clipMode > 0.5 && clipMode < 1.5 && samplePos.a > clipHi) { break; }
         if (clipPassSkip(samplePos.a, clipLo, clipHi, clipMode)) { samplePos += deltaDir; continue; }
@@ -312,19 +331,25 @@ void main() {
   vec3 dir = dirVec / len;
   // Step size is per-voxel of this brick's source level (rayStepTexVox); equals
   // volumeTexDimsFull for non-chunked/single-level draws, coarser for multi-LOD
-  // bricks so each steps at its own resolution.
-  vec3 texVox = rayStepTexVox;
+  // bricks so each steps at its own resolution. rayVoxSampleRate subdivides that
+  // step further to keep the march above the reconstruction's Nyquist rate.
+  vec3 texVox = rayStepTexVox * max(rayVoxSampleRate, 1.0);
   float lenVox = length(dirVec * texVox);
   if (lenVox < 0.5) {
     discard;
   }
   // Opacity (step-size) correction: a coarse multi-LOD brick takes fewer samples
   // along the ray, so without this it accumulates less alpha and renders dimmer —
-  // a brightness seam at LOD boundaries. Scale per-sample alpha up to the finest
-  // (common) sampling density. stepRatio == 1 for single-level/non-chunked draws
-  // (volumeTexDimsFull == rayStepTexVox), leaving them identical.
+  // a brightness seam at LOD boundaries. Rescale per-sample alpha to a fixed
+  // reference density, the finest level at one sample per voxel, so brightness is
+  // independent of both the brick's level and rayVoxSampleRate.
   float fineLenVox = length(dirVec * volumeTexDimsFull);
-  float stepRatio = max(1.0, fineLenVox / max(lenVox, 1e-6));
+  // stepRatio is this draw's physical step length over the reference step (the
+  // finest level at one sample per voxel). A coarse multi-LOD brick steps longer
+  // (> 1) and needs its alpha scaled up; oversampling steps shorter (< 1) and
+  // needs it scaled down. Both directions are correct, so this is not clamped to
+  // 1 -- only guarded away from zero for the pow() below.
+  float stepRatio = max(fineLenVox / max(lenVox, 1e-6), 1e-3);
   // Save original ray for overlay passes (overlay ignores clip planes)
   vec3 origStart = start;
   float origLen = len;
@@ -367,7 +392,7 @@ void main() {
   // lattice so adjacent chunks do not reset the ray phase at their seams.
   float origRan = raySamplePhase(origStart, stepSize);
   float ran = origRan;
-  float stepSizeFast = stepSize * 1.9;
+  float stepSizeFast = stepSize * 1.9 * max(rayVoxSampleRate, 1.0);
   vec4 deltaDirFast = vec4(dir * stepSizeFast, stepSizeFast);
   float localEarlyTermination = chunkedDraw ? 1.0 : earlyTermination;
   // --- Background passes ---
@@ -426,9 +451,14 @@ void main() {
       if (samplePos.a < 0.0) {
         samplePos = samplePosStart;
       }
+      // Put the fine march back on the ray's deterministic lattice; the
+      // 1.9-voxel fast stride would otherwise set its phase from the depth of
+      // the first hit.
+      float snappedBg = snapToSampleLattice(samplePos.a, ran, stepSize);
+      samplePos = vec4(start + dir * snappedBg, snappedBg);
       // --- Background Fine Pass ---
       mat3 norm3 = mat3(normMtx);
-      for (int fi = 0; fi < 2048; fi++) {
+      for (int fi = 0; fi < MAX_FINE_STEPS; fi++) {
         if (samplePos.a > len) { break; }
         if (cutaway && isClip && samplePos.a >= sampleRange.x && samplePos.a <= sampleRange.y) {
           samplePos += deltaDir;

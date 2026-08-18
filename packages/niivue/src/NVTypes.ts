@@ -688,6 +688,13 @@ export type VolumeRenderConfig = {
   transmittanceCutoff: number
   /** How the 3D ray-march combines samples. VOLUME_RENDER_MODE.COMPOSITE | MAXIMUM */
   renderMode: number
+  /**
+   * Samples per voxel along the ray in the 3D render. One sample per voxel sits at
+   * the Nyquist limit of the trilinear reconstruction and aliases, which shows up
+   * as concentric "wood grain" banding over smooth structures; oversampling removes
+   * it at a proportional fragment cost. Clamped to [1, 4].
+   */
+  sampleRate: number
 }
 
 /** Mesh rendering config: global settings for mesh display */
@@ -961,6 +968,8 @@ export type NiiVueOptions = {
   volumeTransmittanceCutoff?: number
   /** VOLUME_RENDER_MODE.COMPOSITE (default) | MAXIMUM */
   volumeRenderMode?: number
+  /** Samples per voxel along the ray in the 3D render, [1, 4]. See VolumeRenderConfig.sampleRate. */
+  volumeSampleRate?: number
 
   // Mesh (prefixed)
   meshXRay?: number

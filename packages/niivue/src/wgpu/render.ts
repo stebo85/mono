@@ -1,7 +1,7 @@
 import { log } from '@/logger'
 import * as NVTransforms from '@/math/NVTransforms'
 import * as NVShapes from '@/mesh/NVShapes'
-import { isPaqd } from '@/NVConstants'
+import { isPaqd, VOLUME_DEFAULTS } from '@/NVConstants'
 import type { NVImage, VolumeChunkExplode } from '@/NVTypes'
 import { NVRenderer } from '@/view/NVRenderer'
 import {
@@ -336,6 +336,10 @@ export class VolumeRenderer extends NVRenderer {
   // Volume flag (set per-frame from md.volume.renderMode): 0 = composite (OVER),
   // 1 = maximum-intensity projection. See VOLUME_RENDER_MODE.
   renderMode = 0
+  // Samples per voxel along the ray in the 3D fine march (from md.volume.sampleRate).
+  // One sample per voxel aliases against the trilinear reconstruction and shows as
+  // concentric banding on smooth structures; the default oversamples to remove it.
+  sampleRate = VOLUME_DEFAULTS.sampleRate
   private _matcapUrl: string | null = null
   private _bindTexVol: GPUTexture | null = null
   private _bindTexGrad: GPUTexture | null = null
@@ -2772,7 +2776,8 @@ export class VolumeRenderer extends NVRenderer {
         ...chunkUniforms.dataSizeTexFrac,
         1,
         ...chunkUniforms.rayStepTexVox,
-        1,
+        // .w lane: ray samples per voxel in the fine march (was pad).
+        this.sampleRate,
       ]),
     )
   }

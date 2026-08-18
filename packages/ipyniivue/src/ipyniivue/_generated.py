@@ -207,6 +207,7 @@ first such interaction warns). Turn one off before turning the other on.
     volume_outline_width = traitlets.Float(None, allow_none=True).tag(sync=True)
     volume_paqd_uniforms = traitlets.List(trait=traitlets.Float(None, allow_none=True), default_value=None, minlen=4, maxlen=4, allow_none=True).tag(sync=True)
     volume_render_mode = traitlets.Float(None, allow_none=True).tag(sync=True)
+    volume_sample_rate = traitlets.Float(None, allow_none=True).tag(sync=True)
     volume_transmittance_cutoff = traitlets.Float(None, allow_none=True).tag(sync=True)
 
     # Read-only properties (synced from JS to Python)

@@ -137,6 +137,9 @@ vec3 GetFullFrontPosition(vec3 startTex) {
   return (startObj - (rayDir * t)) / volScale;
 }
 
+// Phase of this ray's sample lattice, in steps, on (0,1]. It is anchored to the
+// full volume's front face, not to the chunk being drawn, so every chunk along
+// one ray shares a single lattice and seams do not reset the ray phase.
 float raySamplePhase(vec3 startTex, float stepSize) {
   vec3 fullFront = GetFullFrontPosition(startTex);
   float traveled = length(startTex - fullFront);
@@ -146,9 +149,22 @@ float raySamplePhase(vec3 startTex, float stepSize) {
   // sample in the nearer chunk so the boundary is not double-counted.
   float phase = floor(grid + 0.5) + 0.5 - grid;
   if (phase <= 0.001) {
-    phase = 1.0;
+    phase += 1.0;
   }
   return clamp(phase, 0.001, 1.0);
+}
+
+// Re-anchor a position handed over by the coarse (fast) pass onto the fine
+// sample lattice. The fast pass strides 1.9 voxels, which is not a whole number
+// of fine steps, so resuming the fine march exactly where the fast pass stopped
+// leaves the fine lattice with a phase set by how many fast steps were taken --
+// floor(depth / 1.9), a sawtooth in depth-to-first-hit. Snapping back to the
+// ray's own phase makes the fine samples land in the same places regardless of
+// where the fast pass stopped, so a chunk's samples do not shift when a
+// neighbouring chunk changes where empty-space skipping ends.
+float snapToSampleLattice(float dist, float phase, float stepSize) {
+  float n = floor(dist / max(stepSize, 1e-8) - phase);
+  return (phase + max(n, 0.0)) * stepSize;
 }
 
 // see if clip plane trims ray sampling range sampleStartEnd.x..y

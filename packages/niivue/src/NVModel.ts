@@ -321,6 +321,9 @@ export default class NVModel {
       ...(options.volumeRenderMode !== undefined && {
         renderMode: options.volumeRenderMode,
       }),
+      ...(options.volumeSampleRate !== undefined && {
+        sampleRate: options.volumeSampleRate,
+      }),
     }
     // Mesh — flat options mapped to mesh group
     this.mesh = {

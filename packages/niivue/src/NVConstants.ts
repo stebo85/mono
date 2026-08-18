@@ -213,6 +213,7 @@ export const VOLUME_DEFAULTS: VolumeRenderConfig = {
   paqdUniforms: [0.01, 0.5, 0.25, 0.4] as [number, number, number, number],
   transmittanceCutoff: 0.95,
   renderMode: VOLUME_RENDER_MODE.COMPOSITE,
+  sampleRate: 2,
 }
 
 export const MESH_DEFAULTS: MeshRenderConfig = {

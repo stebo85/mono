@@ -1,7 +1,7 @@
 import { log } from '@/logger'
 import * as NVTransforms from '@/math/NVTransforms'
 import * as NVShapes from '@/mesh/NVShapes'
-import { isPaqd } from '@/NVConstants'
+import { isPaqd, VOLUME_DEFAULTS } from '@/NVConstants'
 import { applyCORS } from '@/NVLoader'
 import type { NVImage, VolumeChunkExplode } from '@/NVTypes'
 import { blendOverlayData } from '@/view/NVMeshView'
@@ -266,6 +266,10 @@ export class VolumeRenderer extends NVRenderer {
   // Volume flag (set per-frame from md.volume.renderMode): 0 = composite (OVER),
   // 1 = maximum-intensity projection. See VOLUME_RENDER_MODE.
   renderMode = 0
+  // Samples per voxel along the ray in the 3D fine march (from md.volume.sampleRate).
+  // One sample per voxel aliases against the trilinear reconstruction and shows as
+  // concentric banding on smooth structures; the default oversamples to remove it.
+  sampleRate = VOLUME_DEFAULTS.sampleRate
   // Coarse whole-volume "floor" texture for the active base, drawn behind the
   // resident fine chunks on 2D slices so a deep-zoom slice never blanks while
   // finer chunks stream. Oriented once from a coarse pyramid level the app
@@ -2087,6 +2091,8 @@ export class VolumeRenderer extends NVRenderer {
       gl.uniform3fv(shader.uniforms.dataSizeTexFrac, u.dataSizeTexFrac)
     if (shader.uniforms.rayStepTexVox)
       gl.uniform3fv(shader.uniforms.rayStepTexVox, u.rayStepTexVox)
+    if (shader.uniforms.rayVoxSampleRate)
+      gl.uniform1f(shader.uniforms.rayVoxSampleRate, this.sampleRate)
   }
 
   /**

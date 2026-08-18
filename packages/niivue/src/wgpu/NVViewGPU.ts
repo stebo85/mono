@@ -774,6 +774,8 @@ export default class NVView {
     // Composite (OVER) vs maximum-intensity projection, for every volume pass this
     // frame (base, overlay, PAQD, drawing, and the independent hi-res overlay cube).
     this.volumeRenderer.renderMode = md.volume.renderMode
+    // Ray samples per voxel in the 3D fine march (anti-aliasing vs fragment cost).
+    this.volumeRenderer.sampleRate = md.volume.sampleRate
     markCpuStart()
     // Phase 3d: advance the chunk-residency LRU clock before the tile loop
     // requests this frame's working set, so eviction protects visible chunks.

@@ -1112,6 +1112,17 @@
       "doc": null
     },
     {
+      "jsName": "volumeSampleRate",
+      "pyName": "volume_sample_rate",
+      "tsType": "number",
+      "pyTraitlet": {
+        "kind": "Float"
+      },
+      "hasGetter": true,
+      "hasSetter": true,
+      "doc": null
+    },
+    {
       "jsName": "volumeTransmittanceCutoff",
       "pyName": "volume_transmittance_cutoff",
       "tsType": "number",

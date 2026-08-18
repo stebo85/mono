@@ -1265,6 +1265,24 @@ export default class NiiVue extends EventTarget {
     this.drawScene()
   }
 
+  /**
+   * Samples per voxel along the ray in the 3D render. 1 is one sample per voxel,
+   * which aliases into concentric banding on smooth structures; the default 2
+   * removes it. Higher values keep improving slightly at a proportional fragment
+   * cost. Clamped to [1, 4].
+   */
+  get volumeSampleRate(): number {
+    return this.model.volume.sampleRate
+  }
+  set volumeSampleRate(v: number) {
+    this.model.volume.sampleRate = Math.min(4, Math.max(1, v))
+    this.emit('change', {
+      property: 'volumeSampleRate',
+      value: this.model.volume.sampleRate,
+    })
+    this.drawScene()
+  }
+
   get volumeOutlineWidth(): number {
     return this.model.volume.outlineWidth
   }

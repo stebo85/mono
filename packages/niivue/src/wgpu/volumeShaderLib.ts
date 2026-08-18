@@ -55,6 +55,12 @@ struct Params {
     // Full-volume voxel dims at this brick's source pyramid level, used only for
     // the ray-march step density so a coarse multi-LOD brick steps at its own
     // resolution. Equals volumeTexDimsFull for single-level/non-chunked draws.
+    // .w carries samples per voxel along the ray in the fine march. One sample
+    // per voxel is at the Nyquist limit of the trilinear reconstruction, so it
+    // aliases: the ray integral gets quantized against a lattice that is
+    // coherent across the screen, which paints concentric "wood grain" rings
+    // over smooth structures. It rides in what was pad, so the struct size and
+    // every offset are unchanged.
     rayStepTexVox: vec4f,
 }
 
@@ -209,9 +215,22 @@ fn raySamplePhase(startTex: vec3f, stepSize: f32) -> f32 {
     // sample in the nearer chunk so the boundary is not double-counted.
     var phase = floor(grid + 0.5) + 0.5 - grid;
     if (phase <= 0.001) {
-        phase = 1.0;
+        phase += 1.0;
     }
     return clamp(phase, 0.001, 1.0);
+}
+
+// Re-anchor a position handed over by the coarse (fast) pass onto the fine
+// sample lattice. The fast pass strides 1.9 voxels, which is not a whole number
+// of fine steps, so resuming the fine march exactly where the fast pass stopped
+// leaves the fine lattice with a phase set by how many fast steps were taken --
+// floor(depth / 1.9), a sawtooth in depth-to-first-hit. Snapping back to the
+// ray's own phase makes the fine samples land in the same places regardless of
+// where the fast pass stopped, so a chunk's samples do not shift when a
+// neighbouring chunk changes where empty-space skipping ends.
+fn snapToSampleLattice(dist: f32, phase: f32, stepSize: f32) -> f32 {
+    let n = floor(dist / max(stepSize, 1e-8) - phase);
+    return (phase + max(n, 0.0)) * stepSize;
 }
 
 // see if clip plane trims ray sampling range sampleStartEnd.x..y

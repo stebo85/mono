@@ -116,6 +116,7 @@ const PROPS_RW = [
   ["volumeOutlineWidth", "volume_outline_width"],
   ["volumePaqdUniforms", "volume_paqd_uniforms"],
   ["volumeRenderMode", "volume_render_mode"],
+  ["volumeSampleRate", "volume_sample_rate"],
   ["volumeTransmittanceCutoff", "volume_transmittance_cutoff"],
 ]
 

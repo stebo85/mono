@@ -315,12 +315,12 @@ fn fragment_main(in: VertexOutput) -> FragmentOutput {
 	// fixed reference density, the finest level at one sample per voxel, so
 	// brightness is independent of both the brick's level and the sample rate.
 	let fineLenVox = length(dirVec * params.volumeTexDimsFull.xyz);
-	// stepRatio is this draw's physical step length over the reference step (the
-	// finest level at one sample per voxel). A coarse multi-LOD brick steps longer
-	// (> 1) and needs its alpha scaled up; oversampling steps shorter (< 1) and
-	// needs it scaled down. Both directions are correct, so this is not clamped to
-	// 1 -- only guarded away from zero for the pow() below.
-	let stepRatio = max(fineLenVox / max(lenVox, 1e-6), 1e-3);
+	// refPerLen converts a ray-length thickness into reference steps (the finest
+	// level at one sample per voxel). A coarse multi-LOD brick owns longer slabs
+	// and needs its alpha scaled up; oversampling owns shorter ones and needs it
+	// scaled down. Both directions are correct, so this is not clamped -- only
+	// guarded away from zero for the pow() below.
+	let refPerLen = max(fineLenVox, 1e-6) / max(len, 1e-6);
 	// Save original ray for overlay passes (overlay ignores clip planes)
 	let origStart = start;
 	let origLen = len;
@@ -431,9 +431,24 @@ fn fragment_main(in: VertexOutput) -> FragmentOutput {
 			let snappedBg = snapToSampleLattice(samplePos.a, ran, stepSize);
 			samplePos = vec4f(start + dir * snappedBg, snappedBg);
 			// --- Background Fine Pass ---
+			// Each sample owns the slab [bLo, bHi) it is the midpoint of, clipped
+			// to this brick's segment. The slabs therefore tile [0, len] EXACTLY,
+			// so a brick contributes the optical depth of the ray length it
+			// actually owns no matter where its sample lattice falls. Attributing
+			// a fixed stepSize per sample instead only tiles when neighbouring
+			// bricks share a lattice; at a LOD interface the step-D and step-2D
+			// lattices do not nest and the boundary gains or loses up to ~1.5 fine
+			// steps of material -- the bright and dark seams along level boundaries.
+			var bLo = select(max(snappedBg - 0.5 * stepSize, 0.0), 0.0, snappedBg <= stepSize);
 			let norm3 = mat3x3f(params.normMtx[0].xyz, params.normMtx[1].xyz, params.normMtx[2].xyz);
 			for (var fi: i32 = 0; fi < MAX_FINE_STEPS; fi++) {
-				if (samplePos.a > len) { break; }
+				if (bLo >= len) { break; }
+				// Clipped to len, so the final sample covers the trailing sliver
+				// past the last lattice point; it reads into the halo, which
+				// exists for it.
+				let bHi = min(samplePos.a + 0.5 * stepSize, len);
+				let slab = max(bHi - bLo, 0.0);
+				bLo = bHi;
 				if (cutaway && isClip && samplePos.a >= sampleRange.x && samplePos.a <= sampleRange.y) {
 					samplePos += deltaDir;
 					continue;
@@ -457,7 +472,7 @@ fn fragment_main(in: VertexOutput) -> FragmentOutput {
 					// sampling in an OVER accumulation. A max projection reads
 					// each sample independently, so correcting it would brighten
 					// coarse bricks instead of matching them.
-					let correctedA = select(1.0 - pow(1.0 - colorSample.a, stepRatio), colorSample.a, mip);
+					let correctedA = select(1.0 - pow(1.0 - colorSample.a, max(slab * refPerLen, 1e-3)), colorSample.a, mip);
 					let premultiplied = vec4f(finalRGB * correctedA, correctedA);
 					if (mip) {
 						colAcc = max(colAcc, premultiplied);

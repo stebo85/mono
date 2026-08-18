@@ -344,12 +344,12 @@ void main() {
   // reference density, the finest level at one sample per voxel, so brightness is
   // independent of both the brick's level and rayVoxSampleRate.
   float fineLenVox = length(dirVec * volumeTexDimsFull);
-  // stepRatio is this draw's physical step length over the reference step (the
-  // finest level at one sample per voxel). A coarse multi-LOD brick steps longer
-  // (> 1) and needs its alpha scaled up; oversampling steps shorter (< 1) and
-  // needs it scaled down. Both directions are correct, so this is not clamped to
-  // 1 -- only guarded away from zero for the pow() below.
-  float stepRatio = max(fineLenVox / max(lenVox, 1e-6), 1e-3);
+  // refPerLen converts a ray-length thickness into reference steps (the finest
+  // level at one sample per voxel). A coarse multi-LOD brick owns longer slabs
+  // and needs its alpha scaled up; oversampling owns shorter ones and needs it
+  // scaled down. Both directions are correct, so this is not clamped -- only
+  // guarded away from zero for the pow() below.
+  float refPerLen = max(fineLenVox, 1e-6) / max(len, 1e-6);
   // Save original ray for overlay passes (overlay ignores clip planes)
   vec3 origStart = start;
   float origLen = len;
@@ -457,9 +457,23 @@ void main() {
       float snappedBg = snapToSampleLattice(samplePos.a, ran, stepSize);
       samplePos = vec4(start + dir * snappedBg, snappedBg);
       // --- Background Fine Pass ---
+      // Each sample owns the slab [bLo, bHi) it is the midpoint of, clipped to
+      // this brick's segment. The slabs therefore tile [0, len] EXACTLY, so a
+      // brick contributes the optical depth of the ray length it actually owns
+      // no matter where its sample lattice falls. Attributing a fixed stepSize
+      // per sample instead only tiles when neighbouring bricks share a lattice;
+      // at a LOD interface the step-D and step-2D lattices do not nest and the
+      // boundary gains or loses up to ~1.5 fine steps of material -- the bright
+      // and dark seams along level boundaries.
+      float bLo = (snappedBg <= stepSize) ? 0.0 : max(snappedBg - 0.5 * stepSize, 0.0);
       mat3 norm3 = mat3(normMtx);
       for (int fi = 0; fi < MAX_FINE_STEPS; fi++) {
-        if (samplePos.a > len) { break; }
+        if (bLo >= len) { break; }
+        // Clipped to len, so the final sample covers the trailing sliver past
+        // the last lattice point; it reads into the halo, which exists for it.
+        float bHi = min(samplePos.a + 0.5 * stepSize, len);
+        float slab = max(bHi - bLo, 0.0);
+        bLo = bHi;
         if (cutaway && isClip && samplePos.a >= sampleRange.x && samplePos.a <= sampleRange.y) {
           samplePos += deltaDir;
           continue;
@@ -483,7 +497,7 @@ void main() {
           // in an OVER accumulation. A max projection reads each sample
           // independently, so correcting it would brighten coarse bricks
           // instead of matching them.
-          float correctedA = mip ? colorSample.a : (1.0 - pow(1.0 - colorSample.a, stepRatio));
+          float correctedA = mip ? colorSample.a : (1.0 - pow(1.0 - colorSample.a, max(slab * refPerLen, 1e-3)));
           vec4 premultiplied = vec4(finalRGB * correctedA, correctedA);
           if (mip) {
             colAcc = max(colAcc, premultiplied);

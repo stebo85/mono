@@ -422,6 +422,8 @@ const els = {
   zoomVal: el('zoomVal'),
   explode: el('explode'),
   explodeVal: el('explodeVal'),
+  samples: el('samples'),
+  samplesVal: el('samplesVal'),
   blocks: el('blocks'),
   crosshair: el('crosshair'),
   reload: el('reload'),
@@ -1231,6 +1233,14 @@ function syncZoomControl() {
 // the per-chunk outline boxes, the zoom focus-region box, and the loaded-chunks
 // indicator strip (which sits over a corner tile). All are cleared when the
 // toggle is off so nothing overlays the render.
+function applySampleRate() {
+  const rate = Number(els.samples.value) || 1
+  els.samplesVal.textContent = rate.toFixed(1)
+  if (!nv) return
+  // Pure render-time setting: no re-stream, and the setter already redraws.
+  nv.volumeSampleRate = rate
+}
+
 function applyBlocks() {
   if (!nv) return
   const show = els.blocks.checked
@@ -1673,6 +1683,9 @@ async function main() {
     maxChunkResidencyBytes: DEFAULT_RESIDENCY_BYTES,
   })
   await nv.attachToCanvas(els.canvas)
+  // Browsers restore a range input's value across a reload, so push the slider's
+  // current position into the fresh instance rather than assuming the default.
+  applySampleRate()
 
   els.source.addEventListener('change', async () => {
     setDefaultWindowForSelectedSource()
@@ -1697,6 +1710,7 @@ async function main() {
   // live on the resident volume instead of re-streaming.
   els.explode.addEventListener('input', applyExplode)
   els.zoom.addEventListener('input', applyZoom)
+  els.samples.addEventListener('input', applySampleRate)
   els.blocks.addEventListener('change', applyBlocks)
   els.crosshair.addEventListener('change', applyCrosshair)
   els.reload.addEventListener('click', () => {

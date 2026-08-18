@@ -316,6 +316,11 @@
           title="Uniformly spread the chunk bricks apart in x, y and z (1.00x = no gap)" />
       </span>
       <span class="control">
+        <label for="samples">samples <span id="samplesVal">2.0</span></label>
+        <input id="samples" type="range" min="1" max="4" step="0.5" value="2"
+          title="Ray samples per voxel in the 3D fine march. 1 is at the Nyquist limit of the trilinear reconstruction and shows concentric ringing; higher oversamples it away at a linear cost in fill rate" />
+      </span>
+      <span class="control">
         <label for="blocks">
           <input id="blocks" type="checkbox" />
           blocks

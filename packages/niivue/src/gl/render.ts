@@ -275,6 +275,8 @@ export class VolumeRenderer extends NVRenderer {
   // finer chunks stream. Oriented once from a coarse pyramid level the app
   // supplies (niivue stays LOD-agnostic). Null when unset.
   coarseFloorTexture: WebGLTexture | null = null
+  /** Voxel dims of `coarseFloorTexture` (drives the floor cubes' step count). */
+  coarseFloorDims: [number, number, number] | null = null
   // Gradient for the coarse floor, used by the 3D ray-march floor cubes for
   // matcap lighting consistent with the resident fine chunks. Null when unset.
   coarseFloorGradientTexture: WebGLTexture | null = null
@@ -1551,6 +1553,7 @@ export class VolumeRenderer extends NVRenderer {
         gl.deleteTexture(this.coarseFloorGradientTexture)
       this.coarseFloorTexture = null
       this.coarseFloorGradientTexture = null
+      this.coarseFloorDims = null
       this._coarseFloorKey = null
       return
     }
@@ -1562,12 +1565,17 @@ export class VolumeRenderer extends NVRenderer {
       coarseVol,
       coarseVol,
     )
+    // overlayOpacity 0: the floor stands in for the BASE volume, so it must be
+    // baked with base semantics (alpha straight from the colormap LUT). Passing
+    // 1 selects the overlay path, which makes alpha binary (`step()`); every
+    // voxel above threshold then reads fully opaque and a floor cube terminates
+    // its ray on the first surface hit, rendering as a dark shell.
     const tex = orientOverlay.overlay2Texture(
       gl,
       coarseVol,
       coarseVol,
       mtx as Float32Array,
-      1,
+      0,
     )
     // Gradient for the 3D floor cubes' matcap lighting (matches base shading).
     const dims: [number, number, number] = coarseVol.dimsRAS
@@ -1579,6 +1587,7 @@ export class VolumeRenderer extends NVRenderer {
       gl.deleteTexture(this.coarseFloorGradientTexture)
     this.coarseFloorTexture = tex
     this.coarseFloorGradientTexture = grad
+    this.coarseFloorDims = dims
     this._coarseFloorKey = key
   }
 
@@ -2200,9 +2209,12 @@ export class VolumeRenderer extends NVRenderer {
         chunkSubSize: cu.chunkSubSize,
         dataOriginTexFrac: cu.chunkSubOrigin,
         dataSizeTexFrac: cu.chunkSubSize,
-        // Coarse floor backdrop samples a single shared low-res texture by world
-        // position; keep stepRatio == 1 (common density) so it renders unchanged.
-        rayStepTexVox: cu.volumeTexDimsFull,
+        // March at the floor texture's OWN voxel density, not the fine common
+        // grid: the step-size correction turns each step into an optical depth
+        // of `fineVoxels / steps` reference steps, so oversampling a 64x coarser
+        // texture drives the first in-tissue sample to alpha 1 and the cube
+        // renders as a dark surface shell instead of an integrated backdrop.
+        rayStepTexVox: this.coarseFloorDims ?? cu.volumeTexDimsFull,
       })
       if (shader.uniforms.fadeAlpha)
         gl.uniform1f(shader.uniforms.fadeAlpha, 1.0)
@@ -2709,6 +2721,7 @@ export class VolumeRenderer extends NVRenderer {
       gl.deleteTexture(this.coarseFloorGradientTexture)
     this.coarseFloorTexture = null
     this.coarseFloorGradientTexture = null
+    this.coarseFloorDims = null
     this._coarseFloorKey = null
     this.clearOverlay(gl)
     if (this.paqdTexture) gl.deleteTexture(this.paqdTexture)

@@ -388,6 +388,8 @@ export class VolumeRenderer extends NVRenderer {
   // immediately and sharpens as chunks arrive. Oriented once from a coarse
   // pyramid level the app supplies (niivue stays LOD-agnostic). Null when unset.
   coarseFloorTexture: GPUTexture | null = null
+  /** Voxel dims of `coarseFloorTexture` (drives the floor cubes' step count). */
+  coarseFloorDims: [number, number, number] | null = null
   // Gradient for the coarse floor, used by the 3D ray-march floor cubes for
   // matcap lighting consistent with the resident fine chunks. Null when unset.
   coarseFloorGradientTexture: GPUTexture | null = null
@@ -2603,9 +2605,13 @@ export class VolumeRenderer extends NVRenderer {
           chunkSubSize: cu.chunkSubSize,
           dataOriginTexFrac: cu.chunkSubOrigin,
           dataSizeTexFrac: cu.chunkSubSize,
-          // Floor cube samples the coarse whole-volume texture; keep its step at
-          // the fine (common) density exactly as before this field existed.
-          rayStepTexVox: cu.volumeTexDimsFull,
+          // March at the floor texture's OWN voxel density, not the fine common
+          // grid: the step-size correction turns each step into an optical depth
+          // of `fineVoxels / steps` reference steps, so oversampling a much
+          // coarser texture drives the first in-tissue sample to alpha 1 and the
+          // cube renders as a dark surface shell instead of an integrated
+          // backdrop.
+          rayStepTexVox: this.coarseFloorDims ?? cu.volumeTexDimsFull,
         },
         0,
       )
@@ -2818,6 +2824,7 @@ export class VolumeRenderer extends NVRenderer {
       this.coarseFloorGradientTexture?.destroy()
       this.coarseFloorTexture = null
       this.coarseFloorGradientTexture = null
+      this.coarseFloorDims = null
       this._coarseFloorKey = null
       return
     }
@@ -2829,12 +2836,17 @@ export class VolumeRenderer extends NVRenderer {
       coarseVol,
       coarseVol,
     )
+    // overlayOpacity 0: the floor stands in for the BASE volume, so it must be
+    // baked with base semantics (alpha straight from the colormap LUT). Passing
+    // 1 selects the overlay path, which makes alpha binary (`step()`); every
+    // voxel above threshold then reads fully opaque and a floor cube terminates
+    // its ray on the first surface hit, rendering as a dark shell.
     const tex = await orient.volume2Texture(
       device,
       coarseVol,
       coarseVol,
       mtx as Float32Array,
-      1,
+      0,
     )
     // Gradient for the 3D floor cubes' matcap lighting (matches base shading).
     const grad = await wgpu.volume2TextureGradientRGBA(device, tex)
@@ -2842,6 +2854,7 @@ export class VolumeRenderer extends NVRenderer {
     this.coarseFloorGradientTexture?.destroy()
     this.coarseFloorTexture = tex
     this.coarseFloorGradientTexture = grad
+    this.coarseFloorDims = [tex.width, tex.height, tex.depthOrArrayLayers]
     this._coarseFloorKey = key
   }
 
@@ -2893,6 +2906,7 @@ export class VolumeRenderer extends NVRenderer {
     this.coarseFloorGradientTexture?.destroy()
     this.coarseFloorTexture = null
     this.coarseFloorGradientTexture = null
+    this.coarseFloorDims = null
     this._floorBindGroup = null
     this._coarseFloorKey = null
     this.clearOverlay()

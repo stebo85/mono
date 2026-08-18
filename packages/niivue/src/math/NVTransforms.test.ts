@@ -607,7 +607,9 @@ describe('rayBoxEntryMM', () => {
     ).toBeNull()
   })
 
-  test('skips clip refinement in cutaway mode', () => {
+  test('keeps the box face when the cutaway carves the far half', () => {
+    // Cutaway removes what a solid plane would keep (fx >= 0.5 -> mm x >= 5), so
+    // the +x ray still enters at the untouched near face.
     const entry = rayBoxEntryMM(
       [-5, 5, 5],
       [15, 5, 5],
@@ -616,7 +618,29 @@ describe('rayBoxEntryMM', () => {
       [1, 0, 0, 0],
       true,
     )
-    expect(entry?.[0]).toBeCloseTo(0) // box face, clip ignored
+    expect(entry?.[0]).toBeCloseTo(0)
+  })
+
+  test('advances past a cutaway that carves the near half', () => {
+    // Plane [-1,0,0,0]: solid would keep mm x <= 5, so the cutaway carves that
+    // near half out. The entry advances to where the ray leaves it (x=5).
+    const entry = rayBoxEntryMM(
+      [-5, 5, 5],
+      [15, 5, 5],
+      lo,
+      hi,
+      [-1, 0, 0, 0],
+      true,
+    )
+    expect(entry?.[0]).toBeCloseTo(5)
+  })
+
+  test('returns null when the cutaway carves the whole ray', () => {
+    // Plane [1,0,0,-0.6]: solid keeps fx >= -0.1, i.e. everything in the cube,
+    // so the cutaway removes the entire in-box segment.
+    expect(
+      rayBoxEntryMM([-5, 5, 5], [15, 5, 5], lo, hi, [1, 0, 0, -0.6], true),
+    ).toBeNull()
   })
 })
 
@@ -662,5 +686,37 @@ describe('rayMarchFirstVisibleMM', () => {
       () => 1,
     )
     expect(hit).toBeNull()
+  })
+
+  test('lands on tissue exposed by a solid clip plane, not the cut surface', () => {
+    // The clip keeps mm x >= 5, and the volume is hollow until x=7: the pick must
+    // reach the cavity wall, not stop at the cut surface (x=5).
+    const sampler = (x: number) => (x >= 7 ? 1 : 0)
+    const hit = rayMarchFirstVisibleMM(
+      [-5, 5, 5],
+      [15, 5, 5],
+      lo,
+      hi,
+      sampler,
+      [1, 0, 0, 0],
+    )
+    expect(hit?.[0]).toBeGreaterThanOrEqual(7)
+    expect(hit?.[0]).toBeLessThan(7.1)
+  })
+
+  test('skips voxels inside a cutaway slab', () => {
+    // Cutaway carves out mm x <= 5 (what plane [-1,0,0,0] would keep), so the
+    // visible-everywhere volume is first pickable where the ray leaves it.
+    const hit = rayMarchFirstVisibleMM(
+      [-5, 5, 5],
+      [15, 5, 5],
+      lo,
+      hi,
+      () => 1,
+      [-1, 0, 0, 0],
+      true,
+    )
+    expect(hit?.[0]).toBeGreaterThanOrEqual(5)
+    expect(hit?.[0]).toBeLessThan(5.1)
   })
 })

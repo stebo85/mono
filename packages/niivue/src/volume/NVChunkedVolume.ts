@@ -364,6 +364,7 @@ export class NVChunkedVolume {
     }
     this.volumeId = volumeId
     this.volume.chunkPlan = this.plan
+    this.volume.pickSampler = this.buildPickSampler()
     this.volume.chunkSource = createSourceChunkLoader(source, {
       maxConcurrentLoads: options.maxConcurrentLoads ?? 6,
       retryAttempts: options.retryAttempts ?? 3,
@@ -410,6 +411,64 @@ export class NVChunkedVolume {
     if (this.disposed) return false
     await this.host.setBaseCoarseFloor(this.floorVolume)
     return this.floorVolume !== null
+  }
+
+  /**
+   * Give the depth picker something to sample. A chunked volume has no single
+   * whole-volume texture, so the GPU depth pass cannot see it and the views fall
+   * back to CPU ray math; without a sampler that math can only land on the
+   * bounding box (or the clip surface), which puts the crosshair in mid-air in
+   * front of the tissue and makes a cavity opened by the clip plane unpickable.
+   * The coarse floor is a whole-volume image already in memory, so it is exactly
+   * the right lookup: low resolution, but enough to find the first voxel above
+   * the display window along the ray.
+   *
+   * Installed in the constructor, BEFORE `init` adds the volume — the host takes
+   * a shallow copy on add, so a sampler attached later would never reach the
+   * mounted volume. The floor is therefore resolved lazily (it is fetched after
+   * the add, and may never arrive): until then, and when no floor can be built at
+   * all, this returns 0 everywhere and the views fall back to the box entry.
+   */
+  private buildPickSampler(): (x: number, y: number, z: number) => number {
+    const vol = this.volume
+    let cachedFloor: NVImage | null = null
+    let img: TypedVoxelArray | null = null
+    let dims: Vec3i = [0, 0, 0]
+    let slope = 1
+    let inter = 0
+    return (x: number, y: number, z: number): number => {
+      const floor = this.floorVolume
+      if (!floor?.img) return 0
+      if (floor !== cachedFloor) {
+        cachedFloor = floor
+        img = floor.img
+        dims = [floor.hdr.dims[1], floor.hdr.dims[2], floor.hdr.dims[3]]
+        slope = floor.hdr.scl_slope || 1
+        inter = floor.hdr.scl_inter || 0
+      }
+      const min = vol.extentsMin
+      const max = vol.extentsMax
+      if (!img || !min || !max) return 0
+      // The floor is drawn stretched over the streamed volume's box (both
+      // renderers sample it with the volume's own texture coordinates), so
+      // normalize mm the same way rather than by the coarse level's own extents.
+      // The streaming affine is diag(spacing) in RAS, so the stored voxel order
+      // is already RAS: index straight into the fetched coarse level.
+      const mm = [x, y, z]
+      let idx = 0
+      let stride = 1
+      for (let i = 0; i < 3; i++) {
+        if (dims[i] < 1) return 0
+        const f = (mm[i] - min[i]) / (max[i] - min[i] || 1)
+        if (!(f >= 0 && f <= 1)) return 0
+        idx += Math.min(dims[i] - 1, Math.floor(f * dims[i])) * stride
+        stride *= dims[i]
+      }
+      const value = img[idx] * slope + inter
+      // Read the window live: the app may re-window the volume after load.
+      const calMin = vol.calMin ?? 0
+      return value > calMin ? value - calMin : 0
+    }
   }
 
   /** The volume's stable id (used to target plan swaps). */

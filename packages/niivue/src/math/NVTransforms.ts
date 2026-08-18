@@ -435,33 +435,30 @@ export function unprojectScreen(
   )
 }
 
-/**
- * Entry point (mm) where the segment `near`→`far` first crosses the axis-aligned
- * mm box `[lo, hi]` while staying on the kept side of any active clip planes, or
- * null if it misses. `near`/`far` are typically two `unprojectScreen` points
- * (depth 0 and 1) bounding the view ray. Used to pick a chunked/multi-LOD
- * volume's near *visible* surface for the crosshair when the GPU depth-pick
- * cannot sample its (non-single) texture.
- *
- * `clipPlanes` is the flat scene clip-plane array ([nx,ny,nz,a] per plane, in the
- * volume's [0,1] cube where the kept side is `dot(n, f-0.5) - a >= 0`; the
- * sentinel `|a| > 1` means "no clip"). When a solid clip plane has carved away
- * the near box face, the entry advances to the clip surface (the visible cut)
- * instead of the clipped-away box face. Cutaway mode carves an interior slab
- * rather than a half-space, so clip refinement is skipped there (box entry).
- */
+/** The part of a view ray that survives the volume box and the clip planes. */
 interface ClippedRaySegment {
   o: number[]
   d: number[]
   tmin: number
   tmax: number
+  /**
+   * Cutaway mode only: the carved-out sub-segment the ray passes through
+   * unseen. `skipMax <= skipMin` means nothing is carved.
+   */
+  skipMin: number
+  skipMax: number
 }
 
 /**
  * Intersect the segment `near`→`far` with the axis-aligned mm box `[lo, hi]`,
- * then trim to the kept side of each solid clip plane. Returns the surviving
- * `[tmin, tmax]` sub-segment (and the ray origin/direction), or null if nothing
- * survives. Shared by `rayBoxEntryMM` and `rayMarchFirstVisibleMM`.
+ * then account for the clip planes. Returns the surviving `[tmin, tmax]`
+ * sub-segment (and the ray origin/direction), or null if nothing survives.
+ * Shared by `rayBoxEntryMM` and `rayMarchFirstVisibleMM`.
+ *
+ * Solid mode trims the segment to the kept side of every plane. Cutaway mode
+ * carves that same region OUT instead (mirroring the render/depth-pick shaders,
+ * which skip `sampleRange` rather than clamp to it), so the segment keeps the
+ * full box range and reports the carved interval as `[skipMin, skipMax]`.
  */
 function clipRaySegment(
   near: ArrayLike<number>,
@@ -493,38 +490,47 @@ function clipRaySegment(
       if (tmin > tmax) return null
     }
   }
-  // Trim the in-box segment to the kept side of each solid clip plane. The plane
+  // Intersect the in-box segment with the kept side of each clip plane. The plane
   // value g(t) = dot(n, f(t)-0.5) - a is affine in t (f = (mm-lo)/(hi-lo)), so a
   // single crossing splits kept (g>=0) from removed (g<0).
-  if (clipPlanes && !isCutaway) {
-    const cx = [(lo[0] + hi[0]) / 2, (lo[1] + hi[1]) / 2, (lo[2] + hi[2]) / 2]
-    const sz = [hi[0] - lo[0] || 1, hi[1] - lo[1] || 1, hi[2] - lo[2] || 1]
-    const planeCount = Math.floor(clipPlanes.length / 4)
-    for (let p = 0; p < planeCount; p++) {
-      const nx = clipPlanes[p * 4 + 0]
-      const ny = clipPlanes[p * 4 + 1]
-      const nz = clipPlanes[p * 4 + 2]
-      const a = clipPlanes[p * 4 + 3]
-      if (a > 1 || a < -1) continue // sentinel: no clip
-      if (nx * nx + ny * ny + nz * nz < 1e-12) continue // degenerate normal
-      const n = [nx, ny, nz]
-      let g0 = -a
-      let gd = 0
-      for (let i = 0; i < 3; i++) {
-        g0 += (n[i] * (o[i] - cx[i])) / sz[i]
-        gd += (n[i] * d[i]) / sz[i]
-      }
-      if (Math.abs(gd) < 1e-12) {
-        if (g0 < 0) return null // ray wholly on the removed side
-      } else if (gd > 0) {
-        tmin = Math.max(tmin, -g0 / gd) // kept for t >= crossing
-      } else {
-        tmax = Math.min(tmax, -g0 / gd) // kept for t <= crossing
-      }
-      if (tmin > tmax) return null
+  const noSkip = { skipMin: 0, skipMax: -1 }
+  if (!clipPlanes) return { o, d, tmin, tmax, ...noSkip }
+  const cx = [(lo[0] + hi[0]) / 2, (lo[1] + hi[1]) / 2, (lo[2] + hi[2]) / 2]
+  const sz = [hi[0] - lo[0] || 1, hi[1] - lo[1] || 1, hi[2] - lo[2] || 1]
+  const planeCount = Math.floor(clipPlanes.length / 4)
+  let keptMin = tmin
+  let keptMax = tmax
+  let keptEmpty = false
+  for (let p = 0; p < planeCount && !keptEmpty; p++) {
+    const nx = clipPlanes[p * 4 + 0]
+    const ny = clipPlanes[p * 4 + 1]
+    const nz = clipPlanes[p * 4 + 2]
+    const a = clipPlanes[p * 4 + 3]
+    if (a > 1 || a < -1) continue // sentinel: no clip
+    if (nx * nx + ny * ny + nz * nz < 1e-12) continue // degenerate normal
+    const n = [nx, ny, nz]
+    let g0 = -a
+    let gd = 0
+    for (let i = 0; i < 3; i++) {
+      g0 += (n[i] * (o[i] - cx[i])) / sz[i]
+      gd += (n[i] * d[i]) / sz[i]
     }
+    if (Math.abs(gd) < 1e-12) {
+      if (g0 < 0) keptEmpty = true // ray wholly on the removed side
+    } else if (gd > 0) {
+      keptMin = Math.max(keptMin, -g0 / gd) // kept for t >= crossing
+    } else {
+      keptMax = Math.min(keptMax, -g0 / gd) // kept for t <= crossing
+    }
+    if (keptMin > keptMax) keptEmpty = true
   }
-  return { o, d, tmin, tmax }
+  if (isCutaway) {
+    // The kept region is what the cutaway carves away: skip it, keep the rest.
+    if (keptEmpty) return { o, d, tmin, tmax, ...noSkip }
+    return { o, d, tmin, tmax, skipMin: keptMin, skipMax: keptMax }
+  }
+  if (keptEmpty) return null
+  return { o, d, tmin: keptMin, tmax: keptMax, ...noSkip }
 }
 
 /**
@@ -539,8 +545,8 @@ function clipRaySegment(
  * volume's [0,1] cube where the kept side is `dot(n, f-0.5) - a >= 0`; the
  * sentinel `|a| > 1` means "no clip"). When a solid clip plane has carved away
  * the near box face, the entry advances to the clip surface (the visible cut)
- * instead of the clipped-away box face. Cutaway mode carves an interior slab
- * rather than a half-space, so clip refinement is skipped there (box entry).
+ * instead of the clipped-away box face. In cutaway mode the carved slab is
+ * skipped instead, so an entry inside it advances to where the ray leaves it.
  */
 export function rayBoxEntryMM(
   near: ArrayLike<number>,
@@ -552,8 +558,13 @@ export function rayBoxEntryMM(
 ): [number, number, number] | null {
   const seg = clipRaySegment(near, far, lo, hi, clipPlanes, isCutaway)
   if (!seg) return null
-  const { o, d, tmin } = seg
-  return [o[0] + d[0] * tmin, o[1] + d[1] * tmin, o[2] + d[2] * tmin]
+  const { o, d, tmax, skipMin, skipMax } = seg
+  let t = seg.tmin
+  if (skipMax > skipMin && t >= skipMin && t <= skipMax) {
+    t = skipMax // entry is inside the cutaway: land where the ray leaves it
+    if (t >= tmax - 1e-9) return null // nothing left: the cutaway took it all
+  }
+  return [o[0] + d[0] * t, o[1] + d[1] * t, o[2] + d[2] * t]
 }
 
 /**
@@ -576,10 +587,12 @@ export function rayMarchFirstVisibleMM(
 ): [number, number, number] | null {
   const seg = clipRaySegment(near, far, lo, hi, clipPlanes, isCutaway)
   if (!seg) return null
-  const { o, d, tmin, tmax } = seg
+  const { o, d, tmin, tmax, skipMin, skipMax } = seg
   const n = Math.max(1, Math.floor(steps))
   for (let s = 0; s <= n; s++) {
     const t = tmin + ((tmax - tmin) * s) / n
+    // Cutaway: the carved slab is not on screen, so it must not be pickable.
+    if (skipMax > skipMin && t >= skipMin && t <= skipMax) continue
     const x = o[0] + d[0] * t
     const y = o[1] + d[1] * t
     const z = o[2] + d[2] * t

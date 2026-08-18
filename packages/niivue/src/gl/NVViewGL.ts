@@ -1902,26 +1902,30 @@ export default class NVGlview {
           }
           return null
         }
-        // With a CPU sampler (app-supplied coarse data), march to the first
-        // window-visible voxel; otherwise land on the bounding-box / clip surface.
-        const hitMM = vol.pickSampler
-          ? NVTransforms.rayMarchFirstVisibleMM(
-              near,
-              far,
-              vol.extentsMin,
-              vol.extentsMax,
-              vol.pickSampler,
-              md.clipPlanes,
-              md.scene.isClipPlaneCutaway,
-            )
-          : NVTransforms.rayBoxEntryMM(
-              near,
-              far,
-              vol.extentsMin,
-              vol.extentsMax,
-              md.clipPlanes,
-              md.scene.isClipPlaneCutaway,
-            )
+        // With a CPU sampler (the streamed volume's coarse floor, or app-supplied
+        // data), march to the first window-visible voxel. Without one — or when
+        // the ray crosses nothing visible — land on the bounding-box / clip
+        // surface, which is what the GPU shader does with its own miss.
+        const hitMM =
+          (vol.pickSampler
+            ? NVTransforms.rayMarchFirstVisibleMM(
+                near,
+                far,
+                vol.extentsMin,
+                vol.extentsMax,
+                vol.pickSampler,
+                md.clipPlanes,
+                md.scene.isClipPlaneCutaway,
+              )
+            : null) ??
+          NVTransforms.rayBoxEntryMM(
+            near,
+            far,
+            vol.extentsMin,
+            vol.extentsMax,
+            md.clipPlanes,
+            md.scene.isClipPlaneCutaway,
+          )
         if (hitMM) return hitMM
       }
     }

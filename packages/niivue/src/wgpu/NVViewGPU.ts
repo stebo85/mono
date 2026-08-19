@@ -116,6 +116,7 @@ export default class NVView {
   device: GPUDevice | null
   /** Set when the GPU device is lost (e.g. GPU OOM); halts the render loop. */
   private _deviceLost = false
+  private _destroyed = false
   context: GPUCanvasContext | null
   preferredCanvasFormat: GPUTextureFormat
   sampler: GPUSampler | null
@@ -168,6 +169,18 @@ export default class NVView {
    * renderer can append draws to the same render pass. See view/NVOverlayHook.ts.
    */
   overlayDraw: ((frame: UIKitOverlayFrame) => void) | null = null
+
+  /**
+   * GPU-context-recovery hook, wired by the controller. Fires when this view has
+   * become unusable because the GPU dropped its device (typically VRAM
+   * exhaustion) AND a replacement is available. Every GPU object this view
+   * created died with the old device, so the only valid response is a full view
+   * rebuild — which the view cannot do itself. WebGPU has no "restored" event:
+   * a new device is obtained by re-running init, so this fires straight from
+   * `device.lost`. Mirrors the same field on NVViewGL, which defers it to
+   * 'webglcontextrestored'. See NVControlBase._onGpuContextLost.
+   */
+  onContextLost: (() => void) | null = null
   // Reusable scratch buffer for mesh uniform writes — avoids per-call Float32Array allocation
   private _uniformScratch = new Float32Array(mesh.MESH_UNIFORM_SIZE / 4)
   // Narrow public getters for bench.ts to read current render-area size
@@ -2084,12 +2097,15 @@ export default class NVView {
     // stop driving the render loop once lost.
     void this.device.lost.then((info) => {
       this._deviceLost = true
-      if (info.reason !== 'destroyed') {
-        log.error(
-          `WebGPU device lost (${info.reason}): ${info.message}. Likely GPU ` +
-            'out of memory — reduce maxChunkResidencyBytes or use a coarser level.',
-        )
-      }
+      // 'destroyed' means someone called device.destroy() (deliberate
+      // teardown), and _destroyed covers this view being torn down while the
+      // device died on its own — neither is a failure to rebuild from.
+      if (info.reason === 'destroyed' || this._destroyed) return
+      log.error(
+        `WebGPU device lost (${info.reason}): ${info.message}. Likely GPU ` +
+          'out of memory — reduce maxChunkResidencyBytes or use a coarser level.',
+      )
+      this.onContextLost?.()
     })
     this.context = this.canvas.getContext('webgpu')
     if (!this.context) {
@@ -2861,6 +2877,9 @@ export default class NVView {
   }
 
   destroy(): void {
+    // Latch teardown so a device-lost promise settling afterwards does not ask
+    // the controller to rebuild a view that is deliberately going away.
+    this._destroyed = true
     // Destroy GPU resources for volumes and remove .gpu structure
     const vols = this.model.getVolumes()
     for (const vol of vols) {

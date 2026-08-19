@@ -106,6 +106,17 @@ export default class NVGlview {
    * can draw into the same frame in screen space. See view/NVOverlayHook.ts.
    */
   overlayDraw: ((frame: UIKitOverlayFrame) => void) | null = null
+
+  /**
+   * GPU-context-recovery hook, wired by the controller. Fires when this view has
+   * become unusable because the GPU dropped its context (typically VRAM
+   * exhaustion) AND a replacement is available. Every GPU object this view
+   * created died with the old context, so the only valid response is a full view
+   * rebuild — which the view cannot do itself. On WebGL2 it fires on
+   * 'webglcontextrestored' (the browser owns the replacement); the WebGPU mirror
+   * fires straight from `device.lost`. See NVControlBase._onGpuContextLost.
+   */
+  onContextLost: (() => void) | null = null
   // Narrow public getters for bench.ts to read current render-area size
   // without making the backing fields public or mutable.
   get boundsWidth(): number {
@@ -218,17 +229,12 @@ export default class NVGlview {
     // Surface a lost WebGL context (commonly GPU VRAM exhaustion — e.g. too many
     // large streamed chunks resident at once) instead of a silently white
     // canvas, and stop driving the render loop once lost.
+    // preventDefault() is what makes the browser promise a later
+    // 'webglcontextrestored'; without it the context stays dead forever.
+    this.canvas.addEventListener('webglcontextlost', this._handleContextLost)
     this.canvas.addEventListener(
-      'webglcontextlost',
-      (event) => {
-        event.preventDefault()
-        this._contextLost = true
-        log.error(
-          'WebGL2 context lost — likely GPU out of memory. Reduce ' +
-            'maxChunkResidencyBytes or use a coarser level.',
-        )
-      },
-      { once: true },
+      'webglcontextrestored',
+      this._handleContextRestored,
     )
     let renderer = ''
     let vendor = ''
@@ -2023,7 +2029,36 @@ export default class NVGlview {
     return null
   }
 
+  /** The GPU dropped this context (commonly VRAM exhaustion -- e.g. too many
+   *  large streamed chunks resident at once). Latch it so render() stops driving
+   *  the streaming loop against a dead context, and ask the browser for a
+   *  replacement. The latch is never cleared: this view instance is
+   *  unrecoverable, and recovery replaces it wholesale. */
+  private _handleContextLost = (event: Event): void => {
+    event.preventDefault()
+    this._contextLost = true
+    log.error(
+      'WebGL2 context lost — likely GPU out of memory. Reduce ' +
+        'maxChunkResidencyBytes or use a coarser level.',
+    )
+  }
+
+  /** The browser handed back a usable context. Nothing this view owns survived,
+   *  so hand off to the controller for a full rebuild. */
+  private _handleContextRestored = (): void => {
+    log.info('WebGL2 context restored — rebuilding the view.')
+    this.onContextLost?.()
+  }
+
   destroy(): void {
+    // Detach before the gl guard: the listeners live on the canvas, not on the
+    // context, so a view torn down without a context must still release them
+    // (recreateView normally swaps in a fresh canvas, but a caller may not).
+    this.canvas.removeEventListener('webglcontextlost', this._handleContextLost)
+    this.canvas.removeEventListener(
+      'webglcontextrestored',
+      this._handleContextRestored,
+    )
     const gl = this.gl
     if (!gl) return
 

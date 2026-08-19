@@ -6,7 +6,12 @@ import { AnnotationUndoStack } from '@/annotation/undoRedo'
 import { ubuntu } from '@/assets/fonts'
 import { cortex } from '@/assets/matcaps'
 import * as NVCmaps from '@/cmap/NVCmaps'
-import { clearCanvasMessage } from '@/control/canvasMessage'
+import {
+  clearCanvasMessage,
+  GRAPHICS_LOST_MESSAGE,
+  GRAPHICS_RECOVERING_MESSAGE,
+  showCanvasMessage,
+} from '@/control/canvasMessage'
 import { removeInteractionListeners } from '@/control/interactions'
 import { buildLocationMessage } from '@/control/locationTracking'
 import {
@@ -187,6 +192,7 @@ type ViewBackend = {
   }
   rebakeChunkedOverlays: () => void
   overlayDraw: ((frame: UIKitOverlayFrame) => void) | null
+  onContextLost: (() => void) | null
 }
 
 export type { NiiVueOptions }
@@ -221,6 +227,13 @@ type InfrastructureOpts = {
   chunkFadeMs?: number
 }
 const DEFAULT_MATCAPS: Record<string, string> = { cortex }
+
+/**
+ * How many times a lost GPU context is automatically rebuilt before giving up.
+ * A scene that genuinely does not fit in VRAM loses the context again as soon as
+ * it re-streams, so an uncapped retry would loop forever.
+ */
+const MAX_CONTEXT_LOSS_RECOVERIES = 2
 
 type EventHandler = ((e: Event) => void) | ((e: Event) => Promise<void>)
 
@@ -335,6 +348,7 @@ export default class NiiVue extends EventTarget {
   /** Set once `destroy()` runs, so an in-flight async op (e.g. a deferred reload)
    *  can detect a torn-down controller and not mutate/upload against it. */
   private _destroyed = false
+  private _contextLossRecoveries = 0
   /** Live streamed-volume handles, so a setting that changes the required brick
    *  halo (currently only `volumeIsCubicInterpolation`) can re-plan them. Each
    *  handle adds itself on construction and removes itself on `dispose()`. */
@@ -4308,6 +4322,8 @@ export default class NiiVue extends EventTarget {
           // (streaming/fade) keep the last-set value on the same view instance.
           this.view.overlayDraw =
             this._overlayRenderers.length > 0 ? this._dispatchOverlay : null
+          // Same reasoning for the GPU-context-recovery hook.
+          this.view.onContextLost = this._onGpuContextLost
           this.view.render()
         }
       })
@@ -4337,6 +4353,45 @@ export default class NiiVue extends EventTarget {
       this.view.overlayDraw = null
     }
     this.drawScene()
+  }
+
+  /**
+   * Automatic recovery from a lost GPU context (WebGL2 'webglcontextrestored',
+   * or a WebGPU device-lost that isn't our own teardown). Everything the view
+   * owned died with the context, so the view is rebuilt wholesale; volumes and
+   * meshes live on the model and re-upload, and a streamed volume re-plans from
+   * its `chunkPlan` on the next frame.
+   *
+   * Capped: if the cause is that this scene simply does not fit in VRAM, an
+   * uncapped retry would loop lose -> rebuild -> lose forever. After the cap we
+   * leave the message up and stop.
+   */
+  private _onGpuContextLost = (): void => {
+    if (this._destroyed) return
+    // The canvas is captured now because recreateView swaps in a fresh one, and
+    // the overlay is keyed by the canvas it was shown for.
+    const canvas = this.canvas
+    if (this._contextLossRecoveries >= MAX_CONTEXT_LOSS_RECOVERIES) {
+      log.error(
+        `GPU context lost ${this._contextLossRecoveries} times; not rebuilding again.`,
+      )
+      if (canvas) showCanvasMessage(canvas, GRAPHICS_LOST_MESSAGE)
+      return
+    }
+    this._contextLossRecoveries += 1
+    if (canvas) showCanvasMessage(canvas, GRAPHICS_RECOVERING_MESSAGE)
+    void this._recreateView()
+      .then(() => {
+        if (canvas) clearCanvasMessage(canvas)
+        if (this.canvas && this.canvas !== canvas) {
+          clearCanvasMessage(this.canvas)
+        }
+        this.drawScene()
+      })
+      .catch((e) => {
+        log.error(`Failed to rebuild the view after a GPU context loss: ${e}`)
+        if (canvas) showCanvasMessage(canvas, GRAPHICS_LOST_MESSAGE)
+      })
   }
 
   /** Stable dispatcher fanned out to every registered overlay renderer. */

@@ -77,6 +77,10 @@
         opacity: 0.5;
       }
 
+      header .control[hidden] {
+        display: none;
+      }
+
       header input[type='text'] {
         width: 92px;
         padding: 3px 7px;
@@ -180,31 +184,19 @@
       }
 
       /* A/B comparison overlay. Sits above the live canvas but before the HUD
-         and chunk strip in DOM order, so those still read on top of it. The
-         overlay itself never takes pointer events -- only the divider handle
-         does -- so the volume stays rotatable while a split is up. */
+         and chunk strip in DOM order, so those still read on top of it. It takes
+         NO pointer events, so every drag, wheel and click still reaches the live
+         canvas and the volume rotates normally with a split up. The divider is a
+         header slider rather than a handle here for the same reason: nothing on
+         the canvas should compete with the camera for the mouse. */
       .ab-overlay {
         position: absolute;
         inset: 0;
         display: none;
+        pointer-events: none;
       }
 
       .ab-overlay.on {
-        display: block;
-      }
-
-      .ab-handle {
-        position: absolute;
-        top: 0;
-        bottom: 0;
-        width: 16px;
-        margin-left: -8px;
-        display: none;
-        cursor: ew-resize;
-        touch-action: none;
-      }
-
-      .ab-handle.on {
         display: block;
       }
 
@@ -378,11 +370,16 @@
       <span class="control">
         <label for="ab">A/B</label>
         <select id="ab"
-          title="Compare the two filters on the IDENTICAL camera and window. split = both rendered back-to-back and wiped side by side (drag the divider). flip = alternate the live render between them every 700 ms">
+          title="Compare the two filters on the IDENTICAL camera and window. split = both rendered back-to-back and wiped side by side. flip = alternate the live render between them every 700 ms">
           <option value="off" selected>off</option>
           <option value="split">split</option>
           <option value="flip">flip</option>
         </select>
+      </span>
+      <span class="control" id="splitCtl" hidden>
+        <label for="split">divider <span id="splitVal">50%</span></label>
+        <input id="split" type="range" min="2" max="98" step="0.5" value="50"
+          title="Move the A/B divider. It lives here rather than on the canvas so the mouse stays free to rotate the volume" />
       </span>
       <span class="control">
         <label for="blocks">
@@ -407,7 +404,6 @@
     <main>
       <canvas id="nv-canvas" aria-label="Client-side HTTP Range volume"></canvas>
       <canvas id="ab-overlay" class="ab-overlay" aria-hidden="true"></canvas>
-      <div class="ab-handle" id="ab-handle" aria-hidden="true"></div>
       <div class="ab-badge" id="ab-badge" aria-hidden="true"></div>
       <div class="hud" id="hud">Loading...</div>
       <div class="strip" id="chunkStrip" aria-hidden="true"></div>

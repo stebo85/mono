@@ -428,8 +428,10 @@ const els = {
   interp: el('interp'),
   ab: el('ab'),
   abOverlay: el('ab-overlay'),
-  abHandle: el('ab-handle'),
   abBadge: el('ab-badge'),
+  splitCtl: el('splitCtl'),
+  split: el('split'),
+  splitVal: el('splitVal'),
   blocks: el('blocks'),
   crosshair: el('crosshair'),
   reload: el('reload'),
@@ -1275,8 +1277,11 @@ function applyInterp() {
 //   flip  -- leave the live render alone and toggle the filter on a timer, so
 //            the eye does the differencing instead of memory.
 //
-// The overlay canvas never takes pointer events (only the divider handle does),
-// so the volume stays rotatable under a split; any interaction re-snapshots.
+// The overlay canvas takes no pointer events and the divider is a header slider,
+// so nothing on the canvas competes with the camera: the volume rotates, pans and
+// zooms normally under a split. Any such interaction drops straight back to the
+// live render (the captured pair is stale the moment the camera moves) and
+// re-snapshots once the interaction settles.
 const AB_FLIP_MS = 700
 const AB_CAPTURE_DEBOUNCE_MS = 220
 
@@ -1290,7 +1295,6 @@ const ab = {
   capturing: false,
   again: false,
   captureTimer: 0,
-  dragging: false,
 }
 
 function setAbMode(mode) {
@@ -1299,14 +1303,14 @@ function setAbMode(mode) {
     ab.flipTimer = 0
   }
   ab.mode = mode
-  els.abOverlay.classList.toggle('on', mode === 'split')
-  els.abHandle.classList.toggle('on', mode === 'split')
   els.abBadge.classList.toggle('on', mode === 'flip')
-  els.abHandle.style.left = `${ab.split * 100}%`
+  els.splitCtl.hidden = mode !== 'split'
   if (mode === 'split') {
+    // The overlay reveals itself once there is a pair to show (drawAbSplit).
     scheduleAbCapture()
     return
   }
+  els.abOverlay.classList.remove('on')
   ab.a = null
   ab.b = null
   if (mode === 'flip') {
@@ -1328,8 +1332,12 @@ function tickAbFlip() {
   els.abBadge.style.color = ab.flipCubic ? 'var(--green)' : 'var(--amber)'
 }
 
+// Called whenever something invalidates the captured pair. The overlay hides at
+// once so the user sees the LIVE render while they drag, and drawAbSplit brings
+// it back when the new pair lands.
 function scheduleAbCapture() {
   if (ab.mode !== 'split') return
+  els.abOverlay.classList.remove('on')
   if (ab.captureTimer) clearTimeout(ab.captureTimer)
   ab.captureTimer = window.setTimeout(() => {
     ab.captureTimer = 0
@@ -1421,6 +1429,16 @@ function drawAbSplit() {
   const gap = Math.round(10 * scale)
   abLabel(ctx, 'linear', x - gap, y, scale, 'right')
   abLabel(ctx, 'cubic B-spline', x + gap, y, scale, 'left')
+  c.classList.add('on')
+}
+
+// Slider-driven divider. Repositioning the wipe only re-blits the two captures,
+// so it needs no re-render and stays smooth during a drag.
+function applySplit() {
+  const pct = Number(els.split.value) || 50
+  els.splitVal.textContent = `${Math.round(pct)}%`
+  ab.split = pct / 100
+  drawAbSplit()
 }
 
 function applyBlocks() {
@@ -1871,6 +1889,7 @@ async function main() {
   applyInterp()
   // Same for the A/B select: a restored 'split' must re-arm the overlay, or the
   // page comes up showing a mode the control claims is active but nothing is.
+  applySplit()
   setAbMode(els.ab.value)
 
   els.source.addEventListener('change', async () => {
@@ -1899,27 +1918,21 @@ async function main() {
   els.samples.addEventListener('input', applySampleRate)
   els.interp.addEventListener('change', applyInterp)
   els.ab.addEventListener('change', () => setAbMode(els.ab.value))
+  els.split.addEventListener('input', applySplit)
   // Any control change or canvas interaction invalidates a captured split pair.
-  document.querySelector('header').addEventListener('change', scheduleAbCapture)
-  document.querySelector('header').addEventListener('input', scheduleAbCapture)
+  // The divider slider is the exception: it only moves the wipe, so re-rendering
+  // the pair on every tick would be pure waste.
+  const headerInvalidates = (e) => {
+    if (e.target !== els.split) scheduleAbCapture()
+  }
+  document.querySelector('header').addEventListener('change', headerInvalidates)
+  document.querySelector('header').addEventListener('input', headerInvalidates)
   window.addEventListener('resize', scheduleAbCapture)
+  // Rotating/panning: show the live render for the whole drag, then re-snapshot.
+  els.canvas.addEventListener('pointerdown', () => {
+    if (ab.mode === 'split') els.abOverlay.classList.remove('on')
+  })
   els.canvas.addEventListener('pointerup', scheduleAbCapture)
-  els.abHandle.addEventListener('pointerdown', (e) => {
-    ab.dragging = true
-    els.abHandle.setPointerCapture(e.pointerId)
-  })
-  els.abHandle.addEventListener('pointermove', (e) => {
-    if (!ab.dragging) return
-    const r = els.abOverlay.getBoundingClientRect()
-    if (r.width <= 0) return
-    ab.split = Math.min(0.98, Math.max(0.02, (e.clientX - r.left) / r.width))
-    els.abHandle.style.left = `${ab.split * 100}%`
-    drawAbSplit()
-  })
-  els.abHandle.addEventListener('pointerup', (e) => {
-    ab.dragging = false
-    els.abHandle.releasePointerCapture(e.pointerId)
-  })
   els.blocks.addEventListener('change', applyBlocks)
   els.crosshair.addEventListener('change', applyCrosshair)
   els.reload.addEventListener('click', () => {

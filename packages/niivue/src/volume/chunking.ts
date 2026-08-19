@@ -12,6 +12,8 @@
  * See `docs/tiled-volumes.md` for the broader design.
  */
 
+import { log } from '@/logger'
+
 export type Vec3i = [number, number, number]
 
 /** Three floating-point components. */
@@ -282,6 +284,88 @@ export function chunkVolumeGrid(
     deviceLimit,
     haloSize,
   }
+}
+
+/**
+ * Minimum per-face halo a brick needs for HARDWARE TRILINEAR reconstruction.
+ *
+ * `chunkTexCoord` maps a brick's owned world cube onto texture coordinates
+ * `[haloLow, haloLow + data]`, i.e. continuous voxel index
+ * `[haloLow - 0.5, haloLow + data - 0.5]`: a ray sample can land half a voxel
+ * PAST the outermost owned voxel centre, right on the brick face. A trilinear
+ * fetch there straddles the face, so it needs one voxel of neighbour data.
+ */
+export const LINEAR_MIN_HALO = 1
+
+/**
+ * Minimum per-face halo a brick needs for TRICUBIC B-spline reconstruction.
+ *
+ * `sampleTricubic` reads texels `floor(x) - 1 .. floor(x) + 2`. At the face
+ * sample above (`x = haloLow - 0.5`) that reaches `haloLow - 2`, so two voxels
+ * of neighbour data are required. Measured on chris_t1 with a 48-voxel brick:
+ * halo 1 leaves up to 0.42% of the intensity range of clamp-to-edge error in a
+ * half-voxel sheet on every internal face (1.8% on a binary worst case); halo 2
+ * reproduces the whole-volume reconstruction exactly.
+ */
+export const CUBIC_MIN_HALO = 2
+
+/**
+ * True when every brick in `plan` carries enough halo for a reconstruction
+ * kernel that reaches `minHalo` voxels past a face, so no sample inside a
+ * brick's owned region reads fabricated (clamp-to-edge) data at an INTERNAL
+ * boundary. A face that lies on the level's own boundary is always fine: there
+ * is no neighbour data, and the brick's clamp reproduces the whole-volume
+ * clamp exactly.
+ */
+export function planSupportsHalo(plan: ChunkPlan, minHalo: number): boolean {
+  for (const c of plan.chunks) {
+    const dims = plan.levelDims?.[c.sourceLevel ?? 0] ?? plan.volumeDims
+    for (let a = 0; a < 3; a++) {
+      // Low face: the kernel needs level voxels down to `dataOrigin - minHalo`,
+      // clamped at 0. They are all present iff the texture starts at or before
+      // that, which is either a full halo or the level boundary itself.
+      if (c.texOrigin[a] > 0 && c.haloLow[a] < minHalo) return false
+      // High face: mirror image.
+      const texEnd = c.texOrigin[a] + c.texDims[a]
+      if (texEnd < dims[a] && c.haloHigh[a] < minHalo) return false
+    }
+  }
+  return true
+}
+
+/** True when `plan`'s bricks can be tricubic-sampled without seaming. */
+export function planSupportsCubic(plan: ChunkPlan): boolean {
+  return planSupportsHalo(plan, CUBIC_MIN_HALO)
+}
+
+/** Last reported cubic safety per volume, so a re-plan only warns on a change. */
+const cubicWarned = new Map<string, boolean>()
+
+/**
+ * Warn once (per volume, per transition) when the tricubic filter is on but the
+ * volume's chunk plan cannot support it, so the renderer's silent fallback to
+ * trilinear is visible in the log rather than mistaken for a broken filter.
+ * Shared by both backends so the message and the trigger cannot drift apart.
+ */
+export function warnIfCubicUnsafe(
+  volumeName: string,
+  cubicSafe: boolean,
+  cubicRequested: boolean,
+): void {
+  if (cubicSafe) {
+    cubicWarned.delete(volumeName)
+    return
+  }
+  if (!cubicRequested || cubicWarned.get(volumeName)) return
+  cubicWarned.set(volumeName, true)
+  log.warn(
+    `Volume ${volumeName}: cubic interpolation is disabled for its streamed ` +
+      `chunks. The chunk plan carries less than ${CUBIC_MIN_HALO} voxels of ` +
+      `halo on at least one internal brick face, and the cubic kernel reads ` +
+      `${CUBIC_MIN_HALO} voxels past a face, so it would reconstruct from ` +
+      `clamp-to-edge data and seam. Re-plan with halo >= ${CUBIC_MIN_HALO} ` +
+      `(NVChunkedVolume does this automatically) to enable it.`,
+  )
 }
 
 /**

@@ -124,7 +124,7 @@ import { validateCustomLayout } from '@/view/NVSliceLayout'
 import type { ExplodedBlockFace } from '@/volume/ChunkExplode'
 import type { ChunkedVolumeSource } from '@/volume/ChunkedVolumeSource'
 import { chunksOverlappingVoxelBox } from '@/volume/ChunkVisibility'
-import type { ChunkPlan } from '@/volume/chunking'
+import { type ChunkPlan, CUBIC_MIN_HALO } from '@/volume/chunking'
 import {
   computeDescriptiveStats,
   type DescriptiveStats,
@@ -335,6 +335,20 @@ export default class NiiVue extends EventTarget {
   /** Set once `destroy()` runs, so an in-flight async op (e.g. a deferred reload)
    *  can detect a torn-down controller and not mutate/upload against it. */
   private _destroyed = false
+  /** Live streamed-volume handles, so a setting that changes the required brick
+   *  halo (currently only `volumeIsCubicInterpolation`) can re-plan them. Each
+   *  handle adds itself on construction and removes itself on `dispose()`. */
+  private _chunkedVolumes = new Set<NVChunkedVolume>()
+
+  /** @internal Registration hook for {@link NVChunkedVolume}. */
+  _registerChunkedVolume(chunked: NVChunkedVolume): void {
+    this._chunkedVolumes.add(chunked)
+  }
+
+  /** @internal Deregistration hook for {@link NVChunkedVolume}. */
+  _unregisterChunkedVolume(chunked: NVChunkedVolume): void {
+    this._chunkedVolumes.delete(chunked)
+  }
 
   /**
    * True once {@link destroy} has run. Lets external holders (e.g. an
@@ -1295,6 +1309,16 @@ export default class NiiVue extends EventTarget {
   }
   set volumeIsCubicInterpolation(v: boolean) {
     this.model.volume.isCubicInterpolation = v
+    // The cubic kernel reads two voxels past a brick face, so a streamed volume
+    // planned with the default trilinear halo would reconstruct from
+    // clamp-to-edge data and seam. Re-plan every live streamed volume with the
+    // larger halo; the renderer independently refuses cubic on any plan that
+    // still cannot feed the kernel (a hand-built chunkPlan, say), and warns.
+    if (v) {
+      for (const chunked of this._chunkedVolumes) {
+        chunked.raiseHaloTo(CUBIC_MIN_HALO)
+      }
+    }
     this.emit('change', {
       property: 'volumeIsCubicInterpolation',
       value: v,

@@ -6,6 +6,7 @@ import type { NVImage, TypedVoxelArray, VolumeChunkSource } from '@/NVTypes'
 import type { ChunkedVolumeSource } from './ChunkedVolumeSource'
 import {
   type ChunkPlan,
+  CUBIC_MIN_HALO,
   chunkVolumeMultiLOD,
   type Vec3f,
   type Vec3i,
@@ -46,7 +47,12 @@ export interface ChunkedVolumeOptions {
   maxBricks?: number
   /** Brick texture edge in level voxels (default 128). */
   cellEdge?: number
-  /** Per-axis halo in level voxels (default [1,1,1]). */
+  /**
+   * Per-axis halo in level voxels (default [1,1,1], which is what hardware
+   * trilinear sampling needs). Raised to at least {@link CUBIC_MIN_HALO} on
+   * every axis while the host has `volumeIsCubicInterpolation` on, because the
+   * cubic kernel reaches two voxels past a brick face; see {@link setHalo}.
+   */
   halo?: Vec3i
   /** LOD falloff factor (default 1 = 2:1-balanced octree). */
   detail?: number
@@ -317,7 +323,13 @@ export class NVChunkedVolume {
       budgetBytes: options.budgetBytes ?? DEFAULT_BUDGET_BYTES,
       maxBricks: options.maxBricks ?? 240,
       cellEdge: options.cellEdge ?? 128,
-      halo: options.halo ?? [1, 1, 1],
+      // Public default stays [1,1,1] (trilinear's requirement, and the cheapest
+      // brick). Cubic reads two voxels past a face, so an already-cubic host
+      // gets the larger halo from the first plan rather than a re-stream.
+      halo: raiseHalo(
+        options.halo ?? [1, 1, 1],
+        host.volumeIsCubicInterpolation ? CUBIC_MIN_HALO : 0,
+      ),
       detail: options.detail ?? 1,
       minLevel: clampLevel(options.minLevel ?? 0, source),
       deviceLimit: options.deviceLimit ?? hostDeviceLimit(host) ?? 256,
@@ -331,6 +343,7 @@ export class NVChunkedVolume {
     this.focusFrac = Array.isArray(focus)
       ? [focus[0], focus[1], focus[2]]
       : [0.5, 0.5, 0.5]
+    host._registerChunkedVolume(this)
     this.onLocationChange = () => this.handleLocationChange()
     // Only self-dispose on a REAL controller teardown. `viewDestroyed` also fires
     // on a transient view recreation (backend switch / init fallback), where the
@@ -504,6 +517,34 @@ export class NVChunkedVolume {
     this.refocus()
   }
 
+  /** The halo the current plan is being built with. */
+  get halo(): Vec3i {
+    return [this.o.halo[0], this.o.halo[1], this.o.halo[2]]
+  }
+
+  /**
+   * Raise the per-axis brick halo to at least `minHalo` and re-plan (debounced),
+   * so the next stream carries enough neighbour data for a wider reconstruction
+   * kernel. Raise-only: it never shrinks an existing halo, so two callers with
+   * different requirements cannot undercut each other. A no-op (and no re-plan)
+   * when the halo already satisfies the request.
+   *
+   * Note that a larger halo makes each brick bigger, so the same GPU budget
+   * buys fewer/coarser bricks -- that is the cost of a seam-free cubic filter.
+   */
+  raiseHaloTo(minHalo: number): void {
+    const next = raiseHalo(this.o.halo, minHalo)
+    if (
+      next[0] === this.o.halo[0] &&
+      next[1] === this.o.halo[1] &&
+      next[2] === this.o.halo[2]
+    ) {
+      return
+    }
+    this.o.halo = next
+    this.refocus()
+  }
+
   /** Streaming residency counters (delegates to the controller). */
   stats(): ReturnType<NiiVue['chunkStreamStats']> {
     return this.host.chunkStreamStats()
@@ -523,6 +564,7 @@ export class NVChunkedVolume {
   dispose(): void {
     if (this.disposed) return
     this.disposed = true
+    this.host._unregisterChunkedVolume(this)
     if (this.refocusHandle) {
       clearTimeout(this.refocusHandle)
       this.refocusHandle = null
@@ -684,6 +726,15 @@ function toVoxelView(
   // `buffer` is typed ArrayBufferLike (it may be a SharedArrayBuffer); every
   // typed-array constructor accepts either, so narrow for the signature.
   return new Ctor(aligned.buffer as ArrayBuffer, aligned.byteOffset, voxels)
+}
+
+/** Per-axis max of `halo` and `minHalo`; never shrinks an axis. */
+function raiseHalo(halo: Vec3i, minHalo: number): Vec3i {
+  return [
+    Math.max(halo[0], minHalo),
+    Math.max(halo[1], minHalo),
+    Math.max(halo[2], minHalo),
+  ]
 }
 
 function clampLevel(levelIndex: number, source: ChunkedVolumeSource): number {

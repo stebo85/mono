@@ -200,7 +200,18 @@ const OMEZARR_STORES = {
 // brick boundaries don't show grid-aligned gradient/lighting seams. Without it
 // loadChunkedVolume falls back to the core default [1,1,1] and the seams return.
 // 3 also covers the tricubic filter's 2-voxel reach (see applyInterp).
-const STREAMING_CHUNK_HALO = [3, 3, 3]
+// `?halo=N` overrides it, which is how the halo-vs-filter question is tested:
+// trilinear reaches 1 voxel past a face and cubic reaches 2. `?halo=1` plus
+// cubic is the case core now handles for itself: turning cubic on re-plans
+// every live streamed volume at halo >= 2, and the renderer refuses cubic on
+// any plan that still cannot feed the kernel rather than seaming silently.
+const HALO_PARAM = Number(
+  new URLSearchParams(location.search).get('halo') ?? Number.NaN,
+)
+let streamingChunkHalo =
+  Number.isFinite(HALO_PARAM) && HALO_PARAM >= 0
+    ? [HALO_PARAM, HALO_PARAM, HALO_PARAM]
+    : [3, 3, 3]
 const ZARR_BYTE_CACHE_BYTES = 512 * 1024 * 1024
 
 // --- multi-LOD (crosshair-focused mixed-resolution) -------------------------
@@ -962,6 +973,11 @@ function selectedLevelIndex(source) {
 
 // Single-level chunk plan for the SYNTHETIC single-shard source (OME-Zarr goes
 // through the core nv.loadChunkedVolume path). Its native grid fits one tile.
+// NOTE: halo 0. The shard is a flat array of exactly-sized chunk payloads and
+// createRangeChunkSource asserts the request matches one chunk's byte count, so
+// there is nowhere to read neighbour voxels from. Brick faces therefore show a
+// trilinear seam on this source, and the renderer declines the cubic filter on
+// it entirely (planSupportsCubic). The OME-Zarr sources have proper halos.
 function createChunkPlan(source) {
   const plan = chunkVolumeGrid(
     source.shape,
@@ -1248,10 +1264,17 @@ function applySampleRate() {
 // staircase; the cubic filter is C2 and removes it (it does NOT remove the
 // concentric ringing, which survives a C2 reconstruction unchanged). 8 fetches
 // per sample instead of 1, so pair it with a lower sample rate if fill rate
-// matters. Safe on this stream because STREAMING_CHUNK_HALO is 3 and the filter
-// reaches 2 voxels past the sample. The toggle stays here because a chunked
-// stream is where halo correctness matters; the side-by-side A/B comparison,
-// the benchmark and the figure export live on vox.interp.html.
+// matters. The toggle stays here because a chunked stream is where halo
+// correctness matters; the side-by-side A/B comparison, the benchmark and the
+// figure export live on vox.interp.html.
+//
+// Halo: the OME-Zarr sources stream through nv.loadChunkedVolume, which raises
+// the brick halo to 2 and re-plans when cubic is turned on, so cubic is always
+// fed real neighbour data there. The SYNTHETIC shard source cannot: its plan is
+// halo 0 (createChunkPlan) because the shard server serves exactly one chunk's
+// bytes per request and has no way to stitch neighbours. On that source the
+// renderer declines cubic and logs why, rather than reconstructing from
+// clamp-to-edge data at every brick face.
 function applyInterp() {
   if (!nv) return
   // Pure render-time setting: no re-stream, and the setter already redraws.
@@ -1627,7 +1650,7 @@ async function runReload(token, options) {
           // deviceLimit is omitted: core now defaults it from the host's
           // maxTextureDimension3D, which this demo sets to 256 (see the NiiVue
           // construction) -- the same value the explicit option used to pass.
-          halo: STREAMING_CHUNK_HALO,
+          halo: streamingChunkHalo,
           minLevel: loadLevel,
           // Back the octree with a coarse whole-volume floor (core builds it from
           // the coarsest present pyramid level) so not-yet-streamed or
@@ -1798,6 +1821,16 @@ async function main() {
       // emit locationChange, so this exercises the core setFocus path).
       driveFocus(frac) {
         activeCv?.setFocus(frac)
+      },
+      // Re-stream the same store with a different brick halo. This is the
+      // halo-vs-filter experiment: trilinear reaches 1 voxel past a brick face
+      // and the tricubic filter reaches 2, so a halo of 1 lets a cubic tap land
+      // on clamp-to-edge data at an internal face. Both halos can be captured
+      // in one page load, on one camera, so the two frames differ ONLY in halo.
+      async setHalo(n) {
+        streamingChunkHalo = [n, n, n]
+        await reloadVolume({ reloadSource: true })
+        return streamingChunkHalo
       },
     }
   }

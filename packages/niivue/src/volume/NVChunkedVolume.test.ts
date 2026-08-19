@@ -396,6 +396,8 @@ function makeHost(
 ): NiiVue {
   return {
     swapVolumeChunkPlan: swap,
+    _registerChunkedVolume: () => {},
+    _unregisterChunkedVolume: () => {},
   } as unknown as NiiVue
 }
 
@@ -423,6 +425,8 @@ describe('NVChunkedVolume deviceLimit default', () => {
     ({
       opts: { maxTextureDimension3D },
       swapVolumeChunkPlan: async () => {},
+      _registerChunkedVolume: () => {},
+      _unregisterChunkedVolume: () => {},
     }) as unknown as NiiVue
 
   test('defaults from the host maxTextureDimension3D option', () => {
@@ -510,6 +514,8 @@ function makeFloorHost(): {
     setBaseCoarseFloor: async (vol: NVImage | null) => {
       installs.push(vol)
     },
+    _registerChunkedVolume: () => {},
+    _unregisterChunkedVolume: () => {},
   } as unknown as NiiVue
   return { host, installs }
 }

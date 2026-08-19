@@ -33,7 +33,9 @@ import {
   chunkVolume,
   matchChunksByContent,
   needsChunking,
+  planSupportsCubic,
   type Vec3i,
+  warnIfCubicUnsafe,
 } from '@/volume/chunking'
 import { buildModulationParams } from '@/volume/modulation'
 import {
@@ -135,6 +137,14 @@ interface ChunkUniforms {
    * volumeTexDimsFull for single-level plans.
    */
   rayStepTexVox: Vec3f
+  /**
+   * False when this draw reads a brick whose halo is too thin for the tricubic
+   * kernel (see planSupportsCubic). The filter is forced off for that draw so
+   * it cannot reconstruct from clamp-to-edge data at an internal brick face,
+   * which would show as a seam. Defaults to true (non-chunked draws, and the
+   * coarse floor, which is one whole-volume texture).
+   */
+  cubicSafe?: boolean
 }
 
 /** Single-texture volume: fits within max3D on all axes. */
@@ -144,6 +154,8 @@ interface SingleTexEntry {
   volumeGradientTexture: WebGLTexture
   /** Full RAS volume dims — WebGL cannot query a texture's size. */
   dims: Vec3f
+  /** Categorical volume: never smooth its baked label colors (see _cubicVolumeSafe). */
+  isLabel: boolean
 }
 
 /** Chunked (tiled) volume: one or more axes exceed max3D. */
@@ -162,6 +174,8 @@ interface ChunkedTexEntry {
    * uploader rebuild + full re-stream (see _ensureChunkedVolumeEntry).
    */
   displayKey: string
+  /** planSupportsCubic(plan), cached: the plan is immutable for the entry's life. */
+  cubicSafe: boolean
 }
 
 type TexCacheEntry = SingleTexEntry | ChunkedTexEntry
@@ -274,7 +288,19 @@ export class VolumeRenderer extends NVRenderer {
   // Tricubic B-spline instead of hardware trilinear in the background fine pass
   // (from md.volume.isCubicInterpolation). Cures the blocky texel staircase that
   // C0 trilinear leaves on band edges, at 8 fetches per sample instead of 1.
-  isCubicInterpolation = VOLUME_DEFAULTS.isCubicInterpolation
+  // Assigned every frame by the view, so the setter is where an "on, but the
+  // active chunk plan cannot feed the kernel" warning is raised: it is the only
+  // point that sees the request and the current plan together (the entry may
+  // have been built long before the user turned cubic on).
+  private _isCubicInterpolation = VOLUME_DEFAULTS.isCubicInterpolation
+  get isCubicInterpolation(): boolean {
+    return this._isCubicInterpolation
+  }
+  set isCubicInterpolation(v: boolean) {
+    this._isCubicInterpolation = v
+    const entry = this._activeChunked
+    if (entry) warnIfCubicUnsafe(entry.volume.name, entry.cubicSafe, v)
+  }
   // Coarse whole-volume "floor" texture for the active base, drawn behind the
   // resident fine chunks on 2D slices so a deep-zoom slice never blanks while
   // finer chunks stream. Oriented once from a coarse pyramid level the app
@@ -300,6 +326,11 @@ export class VolumeRenderer extends NVRenderer {
   // Set when the active volume is chunked; null for single-texture volumes.
   // draw() branches on this to run the multi-chunk loop.
   private _activeChunked: ChunkedTexEntry | null = null
+  // False when the active volume is categorical (colormapLabel): the ray march
+  // samples an RGBA texture whose colors are already baked, so a smooth
+  // reconstruction would blend two unrelated labels into a third label's colour.
+  // Cubic is forced off for such a volume regardless of the global setting.
+  private _cubicVolumeSafe = true
   // Set when an independently-streamed hi-res overlay (chunkOverlayOf) is
   // loaded over a chunked base. It has its OWN ChunkPlan + residency manager
   // (a second _texCache entry, keyed by its own url/name) and draws as
@@ -535,6 +566,7 @@ export class VolumeRenderer extends NVRenderer {
         this._chunkResidencyBytes,
       )
       this._activeChunked = chunkedEntry
+      this._cubicVolumeSafe = !vol.colormapLabel
       this._activeDims = [rasDims[0], rasDims[1], rasDims[2]]
       this.volumeTexture =
         chunkedEntry.manager.getChunk(0)?.volumeTexture ?? null
@@ -547,6 +579,7 @@ export class VolumeRenderer extends NVRenderer {
     const mtx = NVTransforms.calculateOverlayTransformMatrix(vol, vol)
     const modParams = buildModulationParams(vol, vol, allVolumes)
     this._activeChunked = null
+    this._cubicVolumeSafe = !vol.colormapLabel
 
     if (perVolumeCache) {
       // Multi-instance / global3d: cache each volume's texture by key so the
@@ -580,6 +613,7 @@ export class VolumeRenderer extends NVRenderer {
           volumeTexture,
           volumeGradientTexture,
           dims: [rasDims[0], rasDims[1], rasDims[2]],
+          isLabel: !!vol.colormapLabel,
         }
         if (cacheKey) this._texCache.set(cacheKey, entry)
       }
@@ -721,7 +755,9 @@ export class VolumeRenderer extends NVRenderer {
       ),
       plan,
       displayKey,
+      cubicSafe: planSupportsCubic(plan),
     }
+    warnIfCubicUnsafe(vol.name, entry.cubicSafe, this.isCubicInterpolation)
     entry.manager = new ChunkResidencyManager<VolumeChunkGL>(
       plan.chunks.length,
       budgetBytes,
@@ -768,6 +804,12 @@ export class VolumeRenderer extends NVRenderer {
     entry.uploader = newUploader
     entry.manager.remap(oldToNew, newPlan.chunks.length)
     entry.plan = newPlan
+    entry.cubicSafe = planSupportsCubic(newPlan)
+    warnIfCubicUnsafe(
+      entry.volume.name,
+      entry.cubicSafe,
+      this.isCubicInterpolation,
+    )
     entry.volume = vol
     entry.displayKey = chunkedDisplayKey(vol)
     vol.chunkPlan = newPlan
@@ -812,6 +854,7 @@ export class VolumeRenderer extends NVRenderer {
       // single-texture pointers are best-effort aliases for callers that
       // inspect them, not the chunked volume's readiness signal.
       this._activeChunked = entry
+      this._cubicVolumeSafe = !entry.volume.colormapLabel
       this._activeDims = entry.plan.volumeDims
       this.volumeTexture = entry.manager.getChunk(0)?.volumeTexture ?? null
       this.volumeGradientTexture =
@@ -819,6 +862,7 @@ export class VolumeRenderer extends NVRenderer {
       return true
     }
     this._activeChunked = null
+    this._cubicVolumeSafe = !entry.isLabel
     this.volumeTexture = entry.volumeTexture
     this.volumeGradientTexture = entry.volumeGradientTexture
     this._activeDims = entry.dims
@@ -2107,11 +2151,12 @@ export class VolumeRenderer extends NVRenderer {
       gl.uniform3fv(shader.uniforms.rayStepTexVox, u.rayStepTexVox)
     if (shader.uniforms.rayVoxSampleRate)
       gl.uniform1f(shader.uniforms.rayVoxSampleRate, this.sampleRate)
+    const cubic =
+      this.isCubicInterpolation &&
+      this._cubicVolumeSafe &&
+      u.cubicSafe !== false
     if (shader.uniforms.cubicFilter)
-      gl.uniform1f(
-        shader.uniforms.cubicFilter,
-        this.isCubicInterpolation ? 1 : 0,
-      )
+      gl.uniform1f(shader.uniforms.cubicFilter, cubic ? 1 : 0)
   }
 
   /**
@@ -2225,6 +2270,12 @@ export class VolumeRenderer extends NVRenderer {
         // texture drives the first in-tissue sample to alpha 1 and the cube
         // renders as a dark surface shell instead of an integrated backdrop.
         rayStepTexVox: this.coarseFloorDims ?? cu.volumeTexDimsFull,
+        // The floor is one whole-volume texture, so the cubic kernel is always
+        // safely fed here. It still follows the fine bricks' verdict: when their
+        // halo is too thin and cubic is refused, a cubic floor under trilinear
+        // bricks would put a reconstruction change exactly at the edge of the
+        // resident region. One filter per volume, always.
+        cubicSafe: entry.cubicSafe,
       })
       if (shader.uniforms.fadeAlpha)
         gl.uniform1f(shader.uniforms.fadeAlpha, 1.0)
@@ -2295,11 +2346,10 @@ export class VolumeRenderer extends NVRenderer {
         gl.activeTexture(gl.TEXTURE7)
         gl.bindTexture(gl.TEXTURE_3D, drawingChunks[chunkIndex])
       }
-      this._setChunkUniforms(
-        gl,
-        shader,
-        chunkUniformsFor(entry.plan, chunkIndex),
-      )
+      this._setChunkUniforms(gl, shader, {
+        ...chunkUniformsFor(entry.plan, chunkIndex),
+        cubicSafe: entry.cubicSafe,
+      })
       if (shader.uniforms.fadeAlpha)
         gl.uniform1f(shader.uniforms.fadeAlpha, fade)
       if (shader.uniforms.matRAS) {

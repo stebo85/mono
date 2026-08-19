@@ -176,6 +176,11 @@ const MULTILOD_CELL_EDGE = 128
 // to keep an L0 focus AND smooth transitions. ?budgetGB overrides (lower it if
 // GPU memory is tight; the focus then coarsens gracefully).
 const MULTILOD_DEFAULT_BUDGET_BYTES = 2 * 1024 * 1024 * 1024
+// One voxel is enough for the trilinear reconstruction and the gradient tap,
+// which is all this demo uses. The tricubic filter (nv.volumeIsCubicInterpolation,
+// off here) reaches two voxels past a brick face, so niivue would decline it on a
+// halo-1 plan rather than reconstruct from clamp-to-edge data at the seams. Raise
+// this to 2 before turning cubic on; it costs ~ (d+4)^3/(d+2)^3 more brick memory.
 const MULTILOD_HALO: Shape3 = [1, 1, 1]
 // Cap below niivue's per-tile chunk limit (MAX_CHUNKS_PER_TILE = 256). The plan's
 // budget pass coarsens until it fits, so a focus that would otherwise generate

@@ -568,16 +568,21 @@ export class VolumeRenderer extends NVRenderer {
       this._activeChunked = chunkedEntry
       this._cubicVolumeSafe = !vol.colormapLabel
       this._activeDims = [rasDims[0], rasDims[1], rasDims[2]]
-      this.volumeTexture =
-        chunkedEntry.manager.getChunk(0)?.volumeTexture ?? null
-      this.volumeGradientTexture =
-        chunkedEntry.manager.getChunk(0)?.volumeGradientTexture ?? null
+      this._syncChunkedAliases(chunkedEntry)
       await this._ensureMatcap(gl, matcap)
       return
     }
 
     const mtx = NVTransforms.calculateOverlayTransformMatrix(vol, vol)
     const modParams = buildModulationParams(vol, vol, allVolumes)
+    // Leaving a chunked volume: the aliases below name textures the chunked
+    // cache entry still owns, and the single-volume paths that follow delete
+    // whatever they find in them. Drop the pointers first so a later switch
+    // back to the chunked volume doesn't bind a freed texture.
+    if (this._activeChunked) {
+      this.volumeTexture = null
+      this.volumeGradientTexture = null
+    }
     this._activeChunked = null
     this._cubicVolumeSafe = !vol.colormapLabel
 
@@ -779,6 +784,21 @@ export class VolumeRenderer extends NVRenderer {
    * GPU chunks to the new plan by content so unchanged bricks keep their
    * textures and only changed/new bricks stream. Mirrors the WebGPU backend.
    */
+  /**
+   * Refresh the whole-volume texture aliases for a chunked entry.
+   *
+   * A chunked volume has no single volume texture: `volumeTexture` /
+   * `volumeGradientTexture` are a best-effort alias of chunk 0. Chunk 0 is not
+   * guaranteed resident (a refocus can evict it, and `remap` destroys every chunk
+   * the new plan does not match), so re-derive them whenever residency changes --
+   * otherwise they dangle at a texture that has already been deleted.
+   */
+  private _syncChunkedAliases(entry: ChunkedTexEntry): void {
+    const chunk0 = entry.manager.getChunk(0)
+    this.volumeTexture = chunk0?.volumeTexture ?? null
+    this.volumeGradientTexture = chunk0?.volumeGradientTexture ?? null
+  }
+
   async swapChunkedVolumePlan(
     gl: WebGL2RenderingContext,
     vol: NVImage,
@@ -818,6 +838,9 @@ export class VolumeRenderer extends NVRenderer {
       if (!chunk0.hasGradient) this._uploadedUnlit = true
       entry.manager.admit(0, chunk0)
     }
+    // remap() destroyed every chunk the new plan does not match, so the aliases
+    // captured for the old plan may now name deleted textures.
+    if (this._activeChunked === entry) this._syncChunkedAliases(entry)
   }
 
   /**
@@ -856,9 +879,7 @@ export class VolumeRenderer extends NVRenderer {
       this._activeChunked = entry
       this._cubicVolumeSafe = !entry.volume.colormapLabel
       this._activeDims = entry.plan.volumeDims
-      this.volumeTexture = entry.manager.getChunk(0)?.volumeTexture ?? null
-      this.volumeGradientTexture =
-        entry.manager.getChunk(0)?.volumeGradientTexture ?? null
+      this._syncChunkedAliases(entry)
       return true
     }
     this._activeChunked = null
@@ -1958,10 +1979,17 @@ export class VolumeRenderer extends NVRenderer {
   ): void {
     if (!this.isReady || !this.shader || !this.cubeVAO || !this.indexBuffer)
       return
+    if (!this.matcapTexture) return
+    // A chunked volume binds its volume + gradient textures PER CHUNK below
+    // (and its coarse-floor cubes bind the floor textures), so it must not be
+    // gated on the whole-volume pointers: those are best-effort aliases of
+    // chunk 0 and go null as soon as a refocus evicts that chunk (e.g. moving
+    // the crosshair to the far face of a clipped volume), which silently
+    // blanked the entire volume. WebGPU already branches on the chunked entry
+    // before its equivalent guard.
     if (
-      !this.volumeTexture ||
-      !this.matcapTexture ||
-      !this.volumeGradientTexture
+      !this._activeChunked &&
+      (!this.volumeTexture || !this.volumeGradientTexture)
     )
       return
 

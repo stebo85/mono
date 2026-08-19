@@ -199,6 +199,7 @@ const OMEZARR_STORES = {
 // past each brick face; a 3-voxel halo keeps that reach inside resident data so
 // brick boundaries don't show grid-aligned gradient/lighting seams. Without it
 // loadChunkedVolume falls back to the core default [1,1,1] and the seams return.
+// 3 also covers the tricubic filter's 2-voxel reach (see applyInterp).
 const STREAMING_CHUNK_HALO = [3, 3, 3]
 const ZARR_BYTE_CACHE_BYTES = 512 * 1024 * 1024
 
@@ -424,6 +425,11 @@ const els = {
   explodeVal: el('explodeVal'),
   samples: el('samples'),
   samplesVal: el('samplesVal'),
+  interp: el('interp'),
+  ab: el('ab'),
+  abOverlay: el('ab-overlay'),
+  abHandle: el('ab-handle'),
+  abBadge: el('ab-badge'),
   blocks: el('blocks'),
   crosshair: el('crosshair'),
   reload: el('reload'),
@@ -1241,6 +1247,182 @@ function applySampleRate() {
   nv.volumeSampleRate = rate
 }
 
+// Texture reconstruction in the 3D fine march: hardware trilinear (default) or
+// tricubic B-spline. Trilinear is only C0, so band edges carry a blocky texel
+// staircase; the cubic filter is C2 and removes it (it does NOT remove the
+// concentric ringing, which survives a C2 reconstruction unchanged). 8 fetches
+// per sample instead of 1, so pair it with a lower sample rate if fill rate
+// matters. Safe on this stream because STREAMING_CHUNK_HALO is 3 and the filter
+// reaches 2 voxels past the sample.
+function applyInterp() {
+  if (!nv) return
+  // Pure render-time setting: no re-stream, and the setter already redraws.
+  nv.volumeIsCubicInterpolation = els.interp.value === 'cubic'
+  scheduleAbCapture()
+}
+
+// --------------------------------------------------------------------------
+// A/B filter comparison
+//
+// The two filters differ by a fraction of a gray level per pixel, so judging
+// them across a control change relies on memory of the previous frame and is
+// not trustworthy. Both modes pin everything except the filter:
+//
+//   split -- draw the SAME frame twice back to back inside ONE animation frame,
+//            changing only the uniform between the two view.render() calls, and
+//            snapshot each. Camera, window, resident bricks and stream state are
+//            identical by construction: nothing runs between the two draws.
+//   flip  -- leave the live render alone and toggle the filter on a timer, so
+//            the eye does the differencing instead of memory.
+//
+// The overlay canvas never takes pointer events (only the divider handle does),
+// so the volume stays rotatable under a split; any interaction re-snapshots.
+const AB_FLIP_MS = 700
+const AB_CAPTURE_DEBOUNCE_MS = 220
+
+const ab = {
+  mode: 'off',
+  a: null,
+  b: null,
+  split: 0.5,
+  flipTimer: 0,
+  flipCubic: false,
+  capturing: false,
+  again: false,
+  captureTimer: 0,
+  dragging: false,
+}
+
+function setAbMode(mode) {
+  if (ab.flipTimer) {
+    clearInterval(ab.flipTimer)
+    ab.flipTimer = 0
+  }
+  ab.mode = mode
+  els.abOverlay.classList.toggle('on', mode === 'split')
+  els.abHandle.classList.toggle('on', mode === 'split')
+  els.abBadge.classList.toggle('on', mode === 'flip')
+  els.abHandle.style.left = `${ab.split * 100}%`
+  if (mode === 'split') {
+    scheduleAbCapture()
+    return
+  }
+  ab.a = null
+  ab.b = null
+  if (mode === 'flip') {
+    ab.flipCubic = true
+    tickAbFlip()
+    ab.flipTimer = window.setInterval(tickAbFlip, AB_FLIP_MS)
+    return
+  }
+  els.abBadge.textContent = ''
+  // Hand the filter back to the Interp selector.
+  applyInterp()
+}
+
+function tickAbFlip() {
+  if (!nv) return
+  ab.flipCubic = !ab.flipCubic
+  nv.volumeIsCubicInterpolation = ab.flipCubic
+  els.abBadge.textContent = ab.flipCubic ? 'cubic B-spline' : 'linear'
+  els.abBadge.style.color = ab.flipCubic ? 'var(--green)' : 'var(--amber)'
+}
+
+function scheduleAbCapture() {
+  if (ab.mode !== 'split') return
+  if (ab.captureTimer) clearTimeout(ab.captureTimer)
+  ab.captureTimer = window.setTimeout(() => {
+    ab.captureTimer = 0
+    captureAbPair()
+  }, AB_CAPTURE_DEBOUNCE_MS)
+}
+
+// Snapshot the drawing buffer with one filter. Neither backend preserves the
+// drawing buffer, so the copy has to happen in the same task as the draw.
+function snapshotWith(cubic) {
+  nv.volumeIsCubicInterpolation = cubic
+  nv.view.render()
+  const src = els.canvas
+  const off = document.createElement('canvas')
+  off.width = src.width
+  off.height = src.height
+  off.getContext('2d').drawImage(src, 0, 0)
+  return off
+}
+
+function captureAbPair() {
+  if (!nv || ab.mode !== 'split') return
+  if (ab.capturing) {
+    ab.again = true
+    return
+  }
+  ab.capturing = true
+  requestAnimationFrame(() => {
+    const wanted = els.interp.value === 'cubic'
+    try {
+      ab.a = snapshotWith(false)
+      ab.b = snapshotWith(true)
+    } catch (err) {
+      ab.a = null
+      ab.b = null
+      console.warn('A/B capture failed', err)
+    } finally {
+      // Leave the live render on whatever the Interp selector asks for, so
+      // turning the split off does not silently change the picture.
+      nv.volumeIsCubicInterpolation = wanted
+      ab.capturing = false
+    }
+    drawAbSplit()
+    if (ab.again) {
+      ab.again = false
+      scheduleAbCapture()
+    }
+  })
+}
+
+function abLabel(ctx, text, x, y, scale, align) {
+  const fs = Math.max(10, Math.round(13 * scale))
+  const pad = Math.round(6 * scale)
+  ctx.font = `${fs}px ui-monospace, monospace`
+  ctx.textAlign = align
+  ctx.textBaseline = 'middle'
+  const tw = ctx.measureText(text).width
+  const bx = align === 'left' ? x - pad : x - tw - pad
+  ctx.fillStyle = 'rgba(5, 8, 8, 0.82)'
+  ctx.fillRect(bx, y - fs, tw + pad * 2, fs * 2)
+  ctx.fillStyle = '#edf4f1'
+  ctx.fillText(text, x, y)
+}
+
+function drawAbSplit() {
+  if (ab.mode !== 'split') return
+  const c = els.abOverlay
+  if (!ab.a || !ab.b) return
+  const w = ab.a.width
+  const h = ab.a.height
+  if (c.width !== w || c.height !== h) {
+    c.width = w
+    c.height = h
+  }
+  const ctx = c.getContext('2d')
+  const x = Math.round(w * ab.split)
+  ctx.clearRect(0, 0, w, h)
+  ctx.drawImage(ab.a, 0, 0, x, h, 0, 0, x, h)
+  ctx.drawImage(ab.b, x, 0, w - x, h, x, 0, w - x, h)
+  ctx.fillStyle = 'rgba(122, 215, 209, 0.85)'
+  ctx.fillRect(x - 1, 0, 2, h)
+  // The backing store is device pixels; scale the chrome so it matches the HUD.
+  const scale = c.clientWidth > 0 ? w / c.clientWidth : 1
+  // Flank the divider rather than the frame corners: the corners already hold
+  // the HUD and the orientation cube, and a label at the seam is unambiguous
+  // about which side it names. A label runs off-canvas once the divider is
+  // dragged to that edge, which is fine -- that side has no image left to name.
+  const y = h - Math.round(26 * scale)
+  const gap = Math.round(10 * scale)
+  abLabel(ctx, 'linear', x - gap, y, scale, 'right')
+  abLabel(ctx, 'cubic B-spline', x + gap, y, scale, 'left')
+}
+
 function applyBlocks() {
   if (!nv) return
   const show = els.blocks.checked
@@ -1686,6 +1868,10 @@ async function main() {
   // Browsers restore a range input's value across a reload, so push the slider's
   // current position into the fresh instance rather than assuming the default.
   applySampleRate()
+  applyInterp()
+  // Same for the A/B select: a restored 'split' must re-arm the overlay, or the
+  // page comes up showing a mode the control claims is active but nothing is.
+  setAbMode(els.ab.value)
 
   els.source.addEventListener('change', async () => {
     setDefaultWindowForSelectedSource()
@@ -1711,6 +1897,29 @@ async function main() {
   els.explode.addEventListener('input', applyExplode)
   els.zoom.addEventListener('input', applyZoom)
   els.samples.addEventListener('input', applySampleRate)
+  els.interp.addEventListener('change', applyInterp)
+  els.ab.addEventListener('change', () => setAbMode(els.ab.value))
+  // Any control change or canvas interaction invalidates a captured split pair.
+  document.querySelector('header').addEventListener('change', scheduleAbCapture)
+  document.querySelector('header').addEventListener('input', scheduleAbCapture)
+  window.addEventListener('resize', scheduleAbCapture)
+  els.canvas.addEventListener('pointerup', scheduleAbCapture)
+  els.abHandle.addEventListener('pointerdown', (e) => {
+    ab.dragging = true
+    els.abHandle.setPointerCapture(e.pointerId)
+  })
+  els.abHandle.addEventListener('pointermove', (e) => {
+    if (!ab.dragging) return
+    const r = els.abOverlay.getBoundingClientRect()
+    if (r.width <= 0) return
+    ab.split = Math.min(0.98, Math.max(0.02, (e.clientX - r.left) / r.width))
+    els.abHandle.style.left = `${ab.split * 100}%`
+    drawAbSplit()
+  })
+  els.abHandle.addEventListener('pointerup', (e) => {
+    ab.dragging = false
+    els.abHandle.releasePointerCapture(e.pointerId)
+  })
   els.blocks.addEventListener('change', applyBlocks)
   els.crosshair.addEventListener('change', applyCrosshair)
   els.reload.addEventListener('click', () => {
@@ -1736,9 +1945,14 @@ async function main() {
   // the octree re-plan here (event-driven, so no perpetual re-fire); core debounces
   // refocus, and a wheel that only steps the crosshair re-plans an unchanged zoom
   // (cheap no-op). The poll reconciles the slider/label afterward.
-  els.canvas.addEventListener('wheel', () => activeCv?.refocus(), {
-    passive: true,
-  })
+  els.canvas.addEventListener(
+    'wheel',
+    () => {
+      activeCv?.refocus()
+      scheduleAbCapture()
+    },
+    { passive: true },
+  )
 
   await reloadVolume({ reloadSource: true })
   startHudPolling()

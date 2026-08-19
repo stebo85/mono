@@ -201,6 +201,7 @@ first such interaction warns). Turn one off before turning the other on.
     volume_is_alpha_clip_dark = traitlets.Bool(None, allow_none=True).tag(sync=True)
     volume_is_background_masking = traitlets.Bool(None, allow_none=True).tag(sync=True)
     volume_is_colormap_alpha_on_2d = traitlets.Bool(None, allow_none=True).tag(sync=True)
+    volume_is_cubic_interpolation = traitlets.Bool(None, allow_none=True).tag(sync=True)
     volume_is_nearest_interpolation = traitlets.Bool(None, allow_none=True).tag(sync=True)
     volume_is_v1_slice_shader = traitlets.Bool(None, allow_none=True).tag(sync=True)
     volume_matcap = traitlets.Unicode(None, allow_none=True).tag(sync=True)

@@ -1042,6 +1042,17 @@
       "doc": null
     },
     {
+      "jsName": "volumeIsCubicInterpolation",
+      "pyName": "volume_is_cubic_interpolation",
+      "tsType": "boolean",
+      "pyTraitlet": {
+        "kind": "Bool"
+      },
+      "hasGetter": true,
+      "hasSetter": true,
+      "doc": null
+    },
+    {
       "jsName": "volumeIsNearestInterpolation",
       "pyName": "volume_is_nearest_interpolation",
       "tsType": "boolean",

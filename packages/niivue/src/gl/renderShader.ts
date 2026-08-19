@@ -25,12 +25,18 @@ uniform float earlyTermination;
 // Per-brick source-level voxel dims for the ray-step density (multi-LOD). Equals
 // volumeTexDimsFull for single-level/non-chunked draws.
 uniform vec3 rayStepTexVox;
-// Samples per voxel along the ray in the fine march. One sample per voxel is at
-// the Nyquist limit of the trilinear reconstruction, so it aliases: the ray
-// integral gets quantized against a lattice that is coherent across the screen,
-// which paints concentric "wood grain" rings over smooth structures. Values
-// above 1 oversample and remove the banding.
+// Samples per voxel along the ray in the fine march. Values above 1 oversample
+// and converge the ray integral. This does NOT remove concentric "wood grain"
+// banding on smooth structures: measured relative ring contrast is flat from 1
+// to 4, because the banding is in the integrand rather than in how densely the
+// ray samples it. Keep it for integral accuracy, not as an anti-banding knob.
 uniform float rayVoxSampleRate;
+// 0 = hardware trilinear, 1 = tricubic B-spline reconstruction in the background
+// fine pass (mirrored in wgpu/volumeShaderLib.ts + wgpu/render.wgsl). Trilinear is
+// only C0, so its slope creases show as a blocky texel staircase along band edges;
+// the cubic filter is C2 and removes that. It does not touch the wood-grain rings,
+// which survive a C2 reconstruction unchanged.
+uniform float cubicFilter;
 uniform vec4 clipPlaneColor;
 uniform vec4 paqdUniforms;
 uniform sampler2D matcap;
@@ -85,6 +91,50 @@ vec3 layerShade(sampler3D tex, vec3 p, float amount) {
   vec2 uv = n.xy * 0.5 + 0.5;
   vec3 mc_rgb = texture(matcap, uv).rgb * (1.0 + (amount / 3.0));
   return mix(vec3(1.0), mc_rgb, amount);
+}
+
+// Tricubic B-spline reconstruction in 8 hardware-trilinear fetches
+// (Sigg & Hadwiger, GPU Gems 2 ch. 20; Ruijters & Thevenaz formulation). The
+// 4x4x4 kernel has non-negative weights only, so each opposed pair of taps
+// collapses into one linear fetch at a weighted offset. Approximating, not
+// interpolating: it smooths by design, which is the point here. Requires the
+// texture to be LINEAR-filtered, which the orient prepass already guarantees.
+//
+// Support reaches 2 texels either side of the sample, so a CHUNKED volume needs
+// a brick halo of at least 2 or brick faces read past their owned data and seam.
+// See VolumeRenderConfig.isCubicInterpolation.
+//
+// coord is already in THIS texture's [0,1] space (post chunkTexCoord).
+vec4 sampleTricubic(sampler3D tex, vec3 coord) {
+  vec3 dims = vec3(textureSize(tex, 0));
+  vec3 grid = coord * dims - 0.5;
+  vec3 idx = floor(grid);
+  vec3 f = grid - idx;
+  vec3 g = 1.0 - f;
+  vec3 w0 = (1.0 / 6.0) * g * g * g;
+  vec3 w1 = 2.0 / 3.0 - 0.5 * f * f * (2.0 - f);
+  vec3 w2 = 2.0 / 3.0 - 0.5 * g * g * (2.0 - g);
+  vec3 w3 = (1.0 / 6.0) * f * f * f;
+  vec3 s0 = w0 + w1;
+  vec3 s1 = w2 + w3;
+  vec3 inv = 1.0 / dims;
+  vec3 h0 = inv * ((w1 / s0) - 0.5 + idx);
+  vec3 h1 = inv * ((w3 / s1) + 1.5 + idx);
+  vec4 c000 = texture(tex, vec3(h0.x, h0.y, h0.z));
+  vec4 c100 = texture(tex, vec3(h1.x, h0.y, h0.z));
+  c000 = mix(c100, c000, s0.x);
+  vec4 c010 = texture(tex, vec3(h0.x, h1.y, h0.z));
+  vec4 c110 = texture(tex, vec3(h1.x, h1.y, h0.z));
+  c010 = mix(c110, c010, s0.x);
+  c000 = mix(c010, c000, s0.y);
+  vec4 c001 = texture(tex, vec3(h0.x, h0.y, h1.z));
+  vec4 c101 = texture(tex, vec3(h1.x, h0.y, h1.z));
+  c001 = mix(c101, c001, s0.x);
+  vec4 c011 = texture(tex, vec3(h0.x, h1.y, h1.z));
+  vec4 c111 = texture(tex, vec3(h1.x, h1.y, h1.z));
+  c011 = mix(c111, c011, s0.x);
+  c001 = mix(c011, c001, s0.y);
+  return mix(c001, c000, s0.z);
 }
 
 struct RayResult {
@@ -479,7 +529,11 @@ void main() {
           continue;
         }
         vec3 volCoord = chunkTexCoord(samplePos.xyz);
-        vec4 colorSample = texture(volume, volCoord);
+        // Fine pass only. The fast skip pass stays trilinear: it only needs a
+        // coarse alpha test, so paying 8 fetches there would be waste.
+        vec4 colorSample = (cubicFilter > 0.5)
+          ? sampleTricubic(volume, volCoord)
+          : texture(volume, volCoord);
         if (colorSample.a >= 0.01) {
           if (!bgHasHit) {
             bgHasHit = true;

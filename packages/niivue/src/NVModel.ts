@@ -324,6 +324,9 @@ export default class NVModel {
       ...(options.volumeSampleRate !== undefined && {
         sampleRate: options.volumeSampleRate,
       }),
+      ...(options.volumeIsCubicInterpolation !== undefined && {
+        isCubicInterpolation: options.volumeIsCubicInterpolation,
+      }),
     }
     // Mesh — flat options mapped to mesh group
     this.mesh = {

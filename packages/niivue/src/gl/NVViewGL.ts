@@ -511,6 +511,8 @@ export default class NVGlview {
     this.volumeRenderer.renderMode = md.volume.renderMode
     // Ray samples per voxel in the 3D fine march (anti-aliasing vs fragment cost).
     this.volumeRenderer.sampleRate = md.volume.sampleRate
+    // Tricubic B-spline reconstruction in the fine march (8 fetches vs 1).
+    this.volumeRenderer.isCubicInterpolation = md.volume.isCubicInterpolation
     // Off-screen after viewport transform: skip the entire render pass — scissor would
     // clip everything and the work is wasted. preserveDrawingBuffer keeps prior pixels.
     if (this._isSubCanvasBounds && this._isBoundsOffscreen) return

@@ -214,6 +214,7 @@ export const VOLUME_DEFAULTS: VolumeRenderConfig = {
   transmittanceCutoff: 0.95,
   renderMode: VOLUME_RENDER_MODE.COMPOSITE,
   sampleRate: 2,
+  isCubicInterpolation: false,
 }
 
 export const MESH_DEFAULTS: MeshRenderConfig = {

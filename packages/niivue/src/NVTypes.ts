@@ -689,12 +689,28 @@ export type VolumeRenderConfig = {
   /** How the 3D ray-march combines samples. VOLUME_RENDER_MODE.COMPOSITE | MAXIMUM */
   renderMode: number
   /**
-   * Samples per voxel along the ray in the 3D render. One sample per voxel sits at
-   * the Nyquist limit of the trilinear reconstruction and aliases, which shows up
-   * as concentric "wood grain" banding over smooth structures; oversampling removes
-   * it at a proportional fragment cost. Clamped to [1, 4].
+   * Samples per voxel along the ray in the 3D render. Oversampling converges the
+   * ray integral at a proportional fragment cost. Clamped to [1, 4]. NOTE: this
+   * does NOT remove concentric banding on smooth structures -- measured ring
+   * contrast is flat from 1 to 4 -- because that banding is in the integrand,
+   * not the sampling of it. See isCubicInterpolation for the reconstruction-side
+   * knob, which cures a different artifact (the trilinear texel staircase).
    */
   sampleRate: number
+  /**
+   * Reconstruct the volume with a tricubic B-spline instead of hardware
+   * trilinear in the 3D ray-march (2D slices are unaffected). Trilinear is only
+   * C0, so band edges show a blocky texel staircase; the cubic filter is C2 and
+   * removes it. Approximating, not interpolating, so it also smooths genuine
+   * fine detail slightly. Costs 8 texture fetches per sample instead of 1
+   * (roughly 1.9x fragment cost at sampleRate 2, or about break-even against
+   * trilinear if sampleRate is dropped to 1 alongside it).
+   *
+   * For a CHUNKED volume the filter reads 2 voxels either side of the sample, so
+   * the brick halo must be at least 2 or brick faces will seam. NVChunkedVolume
+   * defaults to a halo of 1; pass `halo: [2, 2, 2]` (or wider) when enabling this.
+   */
+  isCubicInterpolation: boolean
 }
 
 /** Mesh rendering config: global settings for mesh display */
@@ -970,6 +986,8 @@ export type NiiVueOptions = {
   volumeRenderMode?: number
   /** Samples per voxel along the ray in the 3D render, [1, 4]. See VolumeRenderConfig.sampleRate. */
   volumeSampleRate?: number
+  /** Tricubic B-spline reconstruction in the 3D ray-march. See VolumeRenderConfig.isCubicInterpolation. */
+  volumeIsCubicInterpolation?: boolean
 
   // Mesh (prefixed)
   meshXRay?: number

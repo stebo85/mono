@@ -35,7 +35,11 @@ struct Params {
     // projection. Sits in the implicit padding f32 between fadeAlpha and the
     // 8-byte-aligned _pad0, so struct size and all later offsets are unchanged.
     renderMode: f32,
-    _pad0: vec2f,
+    // 0 = hardware trilinear, 1 = tricubic B-spline reconstruction in the
+    // background fine pass. Occupies what was _pad0's first lane, so the struct
+    // size and every later offset are unchanged.
+    cubicFilter: f32,
+    _pad0: f32,
     // Tiled-volume fields. Pass-through values for non-chunked volumes:
     //   volumeTexDimsFull = textureDimensions(volume, 0)
     //   chunkSubOrigin    = (0,0,0)
@@ -55,12 +59,12 @@ struct Params {
     // Full-volume voxel dims at this brick's source pyramid level, used only for
     // the ray-march step density so a coarse multi-LOD brick steps at its own
     // resolution. Equals volumeTexDimsFull for single-level/non-chunked draws.
-    // .w carries samples per voxel along the ray in the fine march. One sample
-    // per voxel is at the Nyquist limit of the trilinear reconstruction, so it
-    // aliases: the ray integral gets quantized against a lattice that is
-    // coherent across the screen, which paints concentric "wood grain" rings
-    // over smooth structures. It rides in what was pad, so the struct size and
-    // every offset are unchanged.
+    // .w carries samples per voxel along the ray in the fine march. Above 1 it
+    // oversamples and converges the ray integral; it does NOT remove concentric
+    // "wood grain" banding on smooth structures (measured ring contrast is flat
+    // from 1 to 4, because the banding is in the integrand, not the sampling of
+    // it). It rides in what was pad, so the struct size and every offset are
+    // unchanged.
     rayStepTexVox: vec4f,
 }
 
@@ -70,6 +74,51 @@ struct Params {
 fn chunkTexCoord(samplePos: vec3f) -> vec3f {
     let chunkLocal = (samplePos - params.chunkSubOrigin.xyz) / params.chunkSubSize.xyz;
     return params.dataOriginTexFrac.xyz + chunkLocal * params.dataSizeTexFrac.xyz;
+}
+
+// Tricubic B-spline reconstruction in 8 hardware-trilinear fetches
+// (Sigg & Hadwiger, GPU Gems 2 ch. 20; Ruijters & Thevenaz formulation). The
+// 4x4x4 kernel has non-negative weights only, so each opposed pair of taps
+// collapses into one linear fetch at a weighted offset. Approximating, not
+// interpolating: it smooths by design, which is the point here. Requires a
+// LINEAR-filtered sampler, which tex_sampler is.
+//
+// Support reaches 2 texels either side of the sample, so a CHUNKED volume needs
+// a brick halo of at least 2 or brick faces read past their owned data and seam.
+// See VolumeRenderConfig.isCubicInterpolation. Mirrors sampleTricubic in
+// gl/renderShader.ts -- keep the two in step.
+//
+// coord is already in THIS texture's [0,1] space (post chunkTexCoord).
+fn sampleTricubic(tex: texture_3d<f32>, samp: sampler, coord: vec3f) -> vec4f {
+    let dims = vec3f(textureDimensions(tex, 0));
+    let grid = coord * dims - 0.5;
+    let idx = floor(grid);
+    let f = grid - idx;
+    let g = vec3f(1.0) - f;
+    let w0 = (1.0 / 6.0) * g * g * g;
+    let w1 = vec3f(2.0 / 3.0) - 0.5 * f * f * (vec3f(2.0) - f);
+    let w2 = vec3f(2.0 / 3.0) - 0.5 * g * g * (vec3f(2.0) - g);
+    let w3 = (1.0 / 6.0) * f * f * f;
+    let s0 = w0 + w1;
+    let s1 = w2 + w3;
+    let inv = vec3f(1.0) / dims;
+    let h0 = inv * ((w1 / s0) - 0.5 + idx);
+    let h1 = inv * ((w3 / s1) + 1.5 + idx);
+    var c000 = textureSampleLevel(tex, samp, vec3f(h0.x, h0.y, h0.z), 0.0);
+    let c100 = textureSampleLevel(tex, samp, vec3f(h1.x, h0.y, h0.z), 0.0);
+    c000 = mix(c100, c000, s0.x);
+    var c010 = textureSampleLevel(tex, samp, vec3f(h0.x, h1.y, h0.z), 0.0);
+    let c110 = textureSampleLevel(tex, samp, vec3f(h1.x, h1.y, h0.z), 0.0);
+    c010 = mix(c110, c010, s0.x);
+    c000 = mix(c010, c000, s0.y);
+    var c001 = textureSampleLevel(tex, samp, vec3f(h0.x, h0.y, h1.z), 0.0);
+    let c101 = textureSampleLevel(tex, samp, vec3f(h1.x, h0.y, h1.z), 0.0);
+    c001 = mix(c101, c001, s0.x);
+    var c011 = textureSampleLevel(tex, samp, vec3f(h0.x, h1.y, h1.z), 0.0);
+    let c111 = textureSampleLevel(tex, samp, vec3f(h1.x, h1.y, h1.z), 0.0);
+    c011 = mix(c111, c011, s0.x);
+    c001 = mix(c011, c001, s0.y);
+    return mix(c001, c000, s0.z);
 }
 
 fn rayAxisRange(start: f32, dir: f32, boxMin: f32, boxMax: f32) -> vec2f {

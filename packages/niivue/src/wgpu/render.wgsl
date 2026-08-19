@@ -454,7 +454,12 @@ fn fragment_main(in: VertexOutput) -> FragmentOutput {
 					continue;
 				}
 				let volCoord = chunkTexCoord(samplePos.xyz);
-				let colorSample = textureSampleLevel(volume, tex_sampler, volCoord, 0.0);
+				// Fine pass only. The fast skip pass stays trilinear: it only needs a
+				// coarse alpha test, so paying 8 fetches there would be waste.
+				var colorSample = textureSampleLevel(volume, tex_sampler, volCoord, 0.0);
+				if (params.cubicFilter > 0.5) {
+					colorSample = sampleTricubic(volume, tex_sampler, volCoord);
+				}
 				if (colorSample.a >= 0.01) {
 					if (!bgHasHit) {
 						bgHasHit = true;

@@ -1266,10 +1266,10 @@ export default class NiiVue extends EventTarget {
   }
 
   /**
-   * Samples per voxel along the ray in the 3D render. 1 is one sample per voxel,
-   * which aliases into concentric banding on smooth structures; the default 2
-   * removes it. Higher values keep improving slightly at a proportional fragment
-   * cost. Clamped to [1, 4].
+   * Samples per voxel along the ray in the 3D render. Higher values converge the
+   * ray integral at a proportional fragment cost. Clamped to [1, 4]. This does
+   * NOT remove concentric banding on smooth structures; for the reconstruction
+   * filter see volumeIsCubicInterpolation.
    */
   get volumeSampleRate(): number {
     return this.model.volume.sampleRate
@@ -1279,6 +1279,25 @@ export default class NiiVue extends EventTarget {
     this.emit('change', {
       property: 'volumeSampleRate',
       value: this.model.volume.sampleRate,
+    })
+    this.drawScene()
+  }
+
+  /**
+   * Reconstruct the volume with a tricubic B-spline instead of hardware
+   * trilinear in the 3D ray-march, removing the blocky texel staircase that C0
+   * trilinear leaves on band edges. 2D slices are unaffected. Costs 8 fetches
+   * per sample instead of 1. Chunked volumes need a brick halo of at least 2.
+   * See VolumeRenderConfig.isCubicInterpolation.
+   */
+  get volumeIsCubicInterpolation(): boolean {
+    return this.model.volume.isCubicInterpolation
+  }
+  set volumeIsCubicInterpolation(v: boolean) {
+    this.model.volume.isCubicInterpolation = v
+    this.emit('change', {
+      property: 'volumeIsCubicInterpolation',
+      value: v,
     })
     this.drawScene()
   }

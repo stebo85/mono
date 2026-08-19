@@ -267,9 +267,14 @@ export class VolumeRenderer extends NVRenderer {
   // 1 = maximum-intensity projection. See VOLUME_RENDER_MODE.
   renderMode = 0
   // Samples per voxel along the ray in the 3D fine march (from md.volume.sampleRate).
-  // One sample per voxel aliases against the trilinear reconstruction and shows as
-  // concentric banding on smooth structures; the default oversamples to remove it.
+  // Converges the ray integral at a proportional fragment cost. It does NOT remove
+  // concentric banding on smooth structures (measured ring contrast is flat from 1
+  // to 4) -- that banding is in the integrand, not in how densely it is sampled.
   sampleRate = VOLUME_DEFAULTS.sampleRate
+  // Tricubic B-spline instead of hardware trilinear in the background fine pass
+  // (from md.volume.isCubicInterpolation). Cures the blocky texel staircase that
+  // C0 trilinear leaves on band edges, at 8 fetches per sample instead of 1.
+  isCubicInterpolation = VOLUME_DEFAULTS.isCubicInterpolation
   // Coarse whole-volume "floor" texture for the active base, drawn behind the
   // resident fine chunks on 2D slices so a deep-zoom slice never blanks while
   // finer chunks stream. Oriented once from a coarse pyramid level the app
@@ -2102,6 +2107,11 @@ export class VolumeRenderer extends NVRenderer {
       gl.uniform3fv(shader.uniforms.rayStepTexVox, u.rayStepTexVox)
     if (shader.uniforms.rayVoxSampleRate)
       gl.uniform1f(shader.uniforms.rayVoxSampleRate, this.sampleRate)
+    if (shader.uniforms.cubicFilter)
+      gl.uniform1f(
+        shader.uniforms.cubicFilter,
+        this.isCubicInterpolation ? 1 : 0,
+      )
   }
 
   /**

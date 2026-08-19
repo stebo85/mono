@@ -180,17 +180,19 @@ RayResult rayMarchPass(
     float stepSize = deltaDir.w;
     vec4 samplePos = vec4(start + dir * (stepSize * ran), stepSize * ran);
     vec4 samplePosStart = samplePos;
+    // The skip probes one stride PAST the segment end (see fastLimit in main).
+    float fastLimit = len + deltaDirFast.w;
 
     // Fast pass
     for (int j = 0; j < 1024; j++) {
-        if (samplePos.a > len) { break; }
+        if (samplePos.a > fastLimit) { break; }
         if (clipMode > 0.5 && clipMode < 1.5 && samplePos.a > clipHi) { break; }
         if (clipPassSkip(samplePos.a, clipLo, clipHi, clipMode)) { samplePos += deltaDirFast; continue; }
         float alpha = texture(tex, chunkTexCoord(samplePos.xyz)).a;
         if (alpha >= 0.01) { break; }
         samplePos += deltaDirFast;
     }
-    if (samplePos.a >= len) { return result; }
+    if (samplePos.a > fastLimit) { return result; }
 
     samplePos -= deltaDirFast;
     if (samplePos.a < 0.0) { samplePos = samplePosStart; }
@@ -265,11 +267,13 @@ RayResult rayMarchPaqd(
     float stepSize = deltaDir.w;
     vec4 samplePos = vec4(start + dir * (stepSize * ran), stepSize * ran);
     vec4 samplePosStart = samplePos;
+    // The skip probes one stride PAST the segment end (see fastLimit in main).
+    float fastLimit = len + deltaDirFast.w;
 
     // Fast pass: skip until prob1 > easing threshold t0
     float t0 = paqdUni[0];
     for (int j = 0; j < 1024; j++) {
-        if (samplePos.a > len) { break; }
+        if (samplePos.a > fastLimit) { break; }
         if (clipMode > 0.5 && clipMode < 1.5 && samplePos.a > clipHi) { break; }
         if (clipPassSkip(samplePos.a, clipLo, clipHi, clipMode)) { samplePos += deltaDirFast; continue; }
         // chunkTexCoord remaps into the per-chunk PAQD texture (identity when not chunked).
@@ -278,7 +282,7 @@ RayResult rayMarchPaqd(
         if (raw.b > t0) { break; }
         samplePos += deltaDirFast;
     }
-    if (samplePos.a >= len) { return result; }
+    if (samplePos.a > fastLimit) { return result; }
 
     samplePos -= deltaDirFast;
     if (samplePos.a < 0.0) { samplePos = samplePosStart; }
@@ -466,9 +470,18 @@ void main() {
     ran = raySamplePhase(start, stepSize);
     vec4 samplePos = vec4(start + dir * (stepSize * ran), stepSize * ran);
     // --- Background Fast Pass ---
+    // The skip probes one stride PAST the segment end. Without this a chunk
+    // whose only material lies in the last <1 fast stride never registers a
+    // hit, so the whole cube contributes nothing and its exit face draws as a
+    // dark line -- the seam grid at chunk / floor-cube boundaries. Probing past
+    // the face reads halo (or clamp-to-edge) texels, which is safe: it can only
+    // ever cause a false HIT, and the fine march that follows is still clipped
+    // to [0, len], so an over-eager probe costs a few empty samples and changes
+    // no output.
+    float fastLimit = len + stepSizeFast;
     vec4 samplePosStart = samplePos;
     for (int j = 0; j < 1024; j++) {
-      if (samplePos.a > len) { break; }
+      if (samplePos.a > fastLimit) { break; }
       if (cutaway && isClip && samplePos.a >= sampleRange.x && samplePos.a <= sampleRange.y) {
         samplePos += deltaDirFast;
         continue;
@@ -479,7 +492,7 @@ void main() {
       }
       samplePos += deltaDirFast;
     }
-    if (samplePos.a >= len) {
+    if (samplePos.a > fastLimit) {
       // Background fast pass found nothing — use clip plane color as fallback
       if (isClip && !chunkedDraw) {
         float clipAlpha = clipPlaneColorX.a;

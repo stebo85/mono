@@ -77,10 +77,6 @@
         opacity: 0.5;
       }
 
-      header .control[hidden] {
-        display: none;
-      }
-
       header input[type='text'] {
         width: 92px;
         padding: 3px 7px;
@@ -181,41 +177,6 @@
 
       .hud .bad {
         color: var(--red);
-      }
-
-      /* A/B comparison overlay. Sits above the live canvas but before the HUD
-         and chunk strip in DOM order, so those still read on top of it. It takes
-         NO pointer events, so every drag, wheel and click still reaches the live
-         canvas and the volume rotates normally with a split up. The divider is a
-         header slider rather than a handle here for the same reason: nothing on
-         the canvas should compete with the camera for the mouse. */
-      .ab-overlay {
-        position: absolute;
-        inset: 0;
-        display: none;
-        pointer-events: none;
-      }
-
-      .ab-overlay.on {
-        display: block;
-      }
-
-      .ab-badge {
-        position: absolute;
-        top: 12px;
-        right: 12px;
-        display: none;
-        border: 1px solid rgba(122, 215, 209, 0.35);
-        background: rgba(5, 8, 8, 0.82);
-        border-radius: 6px;
-        padding: 6px 10px;
-        font-family: ui-monospace, monospace;
-        font-size: 0.78rem;
-        pointer-events: none;
-      }
-
-      .ab-badge.on {
-        display: block;
       }
 
       .strip {
@@ -362,24 +323,10 @@
       <span class="control">
         <label for="interp">Interp</label>
         <select id="interp"
-          title="Texture reconstruction in the 3D fine march. linear = hardware trilinear (C0: leaves a blocky texel staircase along band edges). cubic B-spline = 8-tap C2 reconstruction (smooth, ~1.9x fragment cost). Opt-in; linear is the default">
+          title="Texture reconstruction in the 3D fine march. linear = hardware trilinear (C0: leaves a blocky texel staircase along band edges). cubic B-spline = 8-tap C2 reconstruction (smooth, ~1.9x fragment cost). Opt-in; linear is the default. vox.interp.html has the side-by-side A/B, a benchmark and a figure export">
           <option value="linear" selected>linear</option>
           <option value="cubic">cubic B-spline</option>
         </select>
-      </span>
-      <span class="control">
-        <label for="ab">A/B</label>
-        <select id="ab"
-          title="Compare the two filters on the IDENTICAL camera and window. split = both rendered back-to-back and wiped side by side. flip = alternate the live render between them every 700 ms">
-          <option value="off" selected>off</option>
-          <option value="split">split</option>
-          <option value="flip">flip</option>
-        </select>
-      </span>
-      <span class="control" id="splitCtl" hidden>
-        <label for="split">divider <span id="splitVal">50%</span></label>
-        <input id="split" type="range" min="2" max="98" step="0.5" value="50"
-          title="Move the A/B divider. It lives here rather than on the canvas so the mouse stays free to rotate the volume" />
       </span>
       <span class="control">
         <label for="blocks">
@@ -403,8 +350,6 @@
     </header>
     <main>
       <canvas id="nv-canvas" aria-label="Client-side HTTP Range volume"></canvas>
-      <canvas id="ab-overlay" class="ab-overlay" aria-hidden="true"></canvas>
-      <div class="ab-badge" id="ab-badge" aria-hidden="true"></div>
       <div class="hud" id="hud">Loading...</div>
       <div class="strip" id="chunkStrip" aria-hidden="true"></div>
       <div class="fallback" id="fallback" aria-hidden="true"></div>

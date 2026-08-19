@@ -72,7 +72,16 @@ let appliedExplodeScale = 1
 // far larger than this still cannot render whole -- richtmyer-meshkov L0 is
 // 8.05 Gvoxel, which needs tens of GB once expanded to RGBA plus its gradient
 // texture -- so they are region-of-interest only.
-const DEFAULT_RESIDENCY_BYTES = 8192 * 1024 * 1024
+//
+// WebGL2 gets a much smaller budget. A WebGL2 3D texture is a single immutable
+// allocation with no sub-allocation or eviction of its own, and this demo was
+// measured holding 1.67 GB across 177 bricks on hoa_heart L0 before the driver
+// started dropping the context. Below the plan budget on purpose: with the GPU
+// budget above it the LRU never evicts, so a refocus (moving the crosshair to
+// the far face of a clipped volume) just piles the new bricks on top of the old
+// ones until the context dies and streaming stops for good.
+const DEFAULT_RESIDENCY_BYTES =
+  backend === 'webgpu' ? 8192 * 1024 * 1024 : 1280 * 1024 * 1024
 const SYNTHETIC_DEFAULT_WINDOW = { min: 24, max: 210 }
 
 // OME-Zarr stores resolve against a local copy first and the public Open SciVis
@@ -228,7 +237,9 @@ const ZARR_BYTE_CACHE_BYTES = 512 * 1024 * 1024
 //
 // Cap on brick count (< core MAX_CHUNKS_PER_TILE=1024); the budget pass coarsens
 // until the plan fits. Budget keeps resident VRAM ~this regardless of the level
-// the user picks (kept below DEFAULT_RESIDENCY_BYTES so no planned brick evicts).
+// the user picks. On WebGPU it stays below DEFAULT_RESIDENCY_BYTES so no planned
+// brick evicts; on WebGL2 the GPU budget is deliberately lower than this, so the
+// LRU keeps the visible bricks and evicts the rest.
 const MULTILOD_MAX_BRICKS = 240
 const MULTILOD_BUDGET_BYTES = 2048 * 1024 * 1024
 // The core NVChunkedVolume handle for the active OME-Zarr source (null for

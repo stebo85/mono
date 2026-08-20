@@ -125,10 +125,16 @@ export function invGamma(gamma: number): number {
   return 1 / Math.min(Math.max(gamma, GAMMA_RANGE[0]), GAMMA_RANGE[1])
 }
 
-/** Accepted range for volume.lodBrightnessCompensation. 0 disables it. */
-export const LOD_BRIGHTNESS_RANGE: [number, number] = [0, 0.2]
+/**
+ * Accepted range for volume.lodBrightnessCompensation. 0 disables it. Shares
+ * the range of LOD_OPACITY_RANGE so the two settings obey one rule.
+ */
+export const LOD_BRIGHTNESS_RANGE: [number, number] = [0, 1]
 
 /**
+ * COARSE BRICKS LOOK TOO DARK -> raise the coefficient. That is the whole rule;
+ * the rest is why.
+ *
  * Shader exponent that compensates the brightness a coarse pyramid brick loses
  * relative to the finest level, for a brick whose linear downsample factor is
  * `downsample` (see `chunkLodDownsample`).
@@ -146,6 +152,12 @@ export const LOD_BRIGHTNESS_RANGE: [number, number] = [0, 0.2]
  * 4% across levels 1-3, down from 16%) while UNDERCORRECTING sparse, thin
  * material, where the correlation loss is far larger than any single global
  * exponent can absorb. Set the coefficient to 0 to disable it.
+ *
+ * Useful magnitudes are SMALL: the default is 0.022 and 0.1 is already strong.
+ * The returned exponent is floored at 0.25 so a deep level cannot blow out,
+ * which is why the accepted range runs to 1 without the top end being useful.
+ * Applies only to a multi-LOD chunked volume; on anything else it is an exact
+ * no-op (ask `nv.lodCompensation()` whether it is doing anything).
  */
 export function lodGammaExponent(
   downsample: number,
@@ -165,6 +177,10 @@ export const LOD_OPACITY_RANGE: [number, number] = [0, 1]
 const LOD_OPACITY_MAX_SCALE = 8
 
 /**
+ * COARSE BRICKS LOOK TOO TRANSPARENT (not too dark) -> raise the coefficient.
+ * If they look too dark, use `lodGammaExponent` instead. That is the whole
+ * rule; the rest is why.
+ *
  * Multiplier on a coarse brick's step-size opacity exponent, for a brick whose
  * linear downsample factor is `downsample` (see `chunkLodDownsample`).
  *
@@ -194,7 +210,9 @@ const LOD_OPACITY_MAX_SCALE = 8
  * still look too transparent rather than too dark.
  *
  * Ray-march only. A 2D slice tile shows ONE sample with no accumulation, so
- * there is no aggregated alpha to correct there.
+ * there is no aggregated alpha to correct there. Applies only to a multi-LOD
+ * chunked volume; on anything else it is an exact no-op (ask
+ * `nv.lodCompensation()` whether it is doing anything).
  */
 export function lodOpacityScale(
   downsample: number,

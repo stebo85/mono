@@ -109,6 +109,8 @@ export type {
   CustomLayoutTile,
   DragReleaseInfo,
   ImageFromUrlOptions,
+  LodCompensationLevel,
+  LodCompensationReport,
   MeasurementScreenLine,
   MeshFromUrlOptions,
   MeshLayerFromUrlOptions,

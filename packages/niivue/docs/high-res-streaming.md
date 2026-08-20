@@ -87,9 +87,11 @@ The floor is what the cross-fade dissolves into, so with no floor installed ther
 
 ### Per-level brightness compensation
 
+**Which knob:** coarse bricks look too *dark* -> `volumeLodBrightnessCompensation`. Coarse bricks look too *transparent* -> `volumeLodOpacityCompensation` (next section). Both are exact no-ops on anything that is not a multi-LOD chunked volume; `nv.lodCompensation()` says whether either is doing anything, and what.
+
 A coarse brick does not merely look softer than the fine data it stands in for: it looks **darker**. Downsampling averages voxels, which destroys the correlation between a sample's colour and its opacity, and front-to-back compositing weights each sample's colour by its opacity. The averaged brick therefore integrates to less light than the fine data over the same span, and the boundary between a level-0 brick and its level-3 neighbour reads as a brightness step, not just a sharpness one.
 
-`volumeLodBrightnessCompensation` (default `0.022`, range `[0, 0.2]`, `0` disables) lifts each brick by an exponent derived from its own pyramid level:
+`volumeLodBrightnessCompensation` (default `0.022`, range `[0, 1]`, `0` disables) lifts each brick by an exponent derived from its own pyramid level:
 
 ```
 e = 1 - coefficient * (k - 1)
@@ -112,6 +114,27 @@ Sparse thin material is the one place with a genuine alpha deficit (about -30% a
 It is exposed because the trade is data-dependent: a volume that is mostly thin structure gains more from the alpha than it loses on the colour. Reach for `volumeLodBrightnessCompensation` first, and turn this up only if coarse bricks read as too *transparent* rather than too *dark*. The range demo exposes it as a second slider beside `LOD comp`.
 
 This one is **ray-march only**. A 2D slice tile shows a single sample with no accumulation, so there is no aggregated alpha to correct; the slice renderers take the brightness exponent but not this one.
+
+### Checking what the settings are doing
+
+Both settings only reach bricks fetched from a *coarse* level of a *multi-LOD* plan, so on an ordinary volume they change nothing and nothing on screen says so. `nv.lodCompensation()` answers that directly:
+
+```js
+const report = nv.lodCompensation()
+if (!report.isActive) {
+  console.log(report.inactiveReason)  // e.g. 'volume 0 is not a chunked volume'
+}
+for (const l of report.levels) {
+  // level index, linear downsample k, bricks drawn from this level, and the
+  // exact numbers the shader gets: exponent on RGB, multiplier on the
+  // step-size opacity exponent. Both are 1 where the setting is inert.
+  console.log(l.level, l.downsample, l.brickCount, l.brightnessExponent, l.opacityScale)
+}
+```
+
+`isActive` is true only when a coarse brick is actually drawn *and* a coefficient is non-zero; otherwise `inactiveReason` names the missing precondition. `floor` reports the whole-volume coarse floor separately, since it is not a member of the chunk plan (`level` -1). Setting a non-zero coefficient while no loaded volume is multi-LOD also emits a `log.warn` at the moment of the set. The range demo prints the report as a `LOD comp` row in its HUD.
+
+Both coefficients share the range `[0, 1]`, so a value copied from one into the other is never silently clamped. Useful magnitudes differ: brightness is strong by 0.1 (its exponent is floored at 0.25), opacity is a linear scale on the step exponent and is capped at 8x.
 
 ---
 

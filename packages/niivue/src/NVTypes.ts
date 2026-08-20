@@ -723,7 +723,13 @@ export type VolumeRenderConfig = {
   /**
    * Coefficient for the per-level brightness compensation applied to bricks
    * fetched from a coarse pyramid level of a multi-LOD chunked volume. 0
-   * disables it; clamped to [0, 0.2].
+   * disables it; clamped to [0, 1] (useful magnitudes are small -- the default
+   * is 0.022 and 0.1 is already strong).
+   *
+   * WHEN TO REACH FOR IT: coarse bricks look too DARK next to fine ones. If
+   * they look too TRANSPARENT instead, use `lodOpacityCompensation`. Both are
+   * exact no-ops on any volume that is not multi-LOD chunked -- call
+   * `nv.lodCompensation()` to see whether either is doing anything.
    *
    * A coarse brick renders DARKER than the fine data it stands in for:
    * downsampling averages voxels, destroying the correlation between a sample's
@@ -743,7 +749,14 @@ export type VolumeRenderConfig = {
 
   /**
    * Per-level OPACITY compensation for coarse multi-LOD bricks, applied in the
-   * 3D ray-march. 0 disables it (the default); clamped to [0, 1].
+   * 3D ray-march. 0 disables it (the default); clamped to [0, 1], the same
+   * range as `lodBrightnessCompensation`.
+   *
+   * WHEN TO REACH FOR IT: coarse bricks look too TRANSPARENT next to fine ones.
+   * If they look too DARK instead, use `lodBrightnessCompensation` -- that is
+   * the one to try first. Both are exact no-ops on any volume that is not
+   * multi-LOD chunked -- call `nv.lodCompensation()` to see whether either is
+   * doing anything.
    *
    * The march already raises a coarse sample's alpha to the number of reference
    * steps it stands for, which is exact only if the coarse voxel is
@@ -758,6 +771,69 @@ export type VolumeRenderConfig = {
    * a 2D slice tile shows one sample with no accumulation.
    */
   lodOpacityCompensation: number
+}
+
+/**
+ * One pyramid level's share of a `LodCompensationReport`. `level` indexes the
+ * multi-LOD pyramid (0 is finest); a level with `downsample` 1 is uncompensated
+ * by definition.
+ */
+export type LodCompensationLevel = {
+  /** Pyramid level index; 0 is the finest (full-resolution) level. */
+  level: number
+  /**
+   * Linear downsample factor versus the finest grid: the geometric mean of the
+   * three per-axis dimension ratios. 1 at the finest level, ~2 one level up.
+   */
+  downsample: number
+  /** Voxel dims of this level's full-volume grid. */
+  levelDims: [number, number, number]
+  /** Bricks in the current plan drawn from this level. */
+  brickCount: number
+  /**
+   * Exponent applied to this level's classified RGB. Below 1 brightens; exactly
+   * 1 means the brightness setting is doing nothing here.
+   */
+  brightnessExponent: number
+  /**
+   * Multiplier on this level's step-size opacity exponent. Above 1 makes it
+   * more opaque; exactly 1 means the opacity setting is doing nothing here.
+   */
+  opacityScale: number
+}
+
+/**
+ * What `NiiVue.lodCompensation()` reports: whether the two LOD compensation
+ * settings are affecting the current scene, and the exact numbers each pyramid
+ * level is sending to the shader. Both settings are silent no-ops on a volume
+ * that is not multi-LOD chunked, so `isActive` plus `inactiveReason` is the
+ * cheap way to tell "correctly configured but the data is uniform" from
+ * "configured against a volume that cannot use it".
+ */
+export type LodCompensationReport = {
+  /**
+   * True when at least one coarse level is present AND at least one of the two
+   * coefficients is non-zero, i.e. some brick is actually being compensated.
+   */
+  isActive: boolean
+  /**
+   * Why nothing is being compensated, in plain words, or null when `isActive`.
+   * e.g. 'no volume is loaded', 'volume 0 is not a chunked volume', 'the
+   * chunked volume has a single resolution level', 'both coefficients are 0'.
+   */
+  inactiveReason: string | null
+  /** Current `volumeLodBrightnessCompensation`. */
+  brightnessCompensation: number
+  /** Current `volumeLodOpacityCompensation`. */
+  opacityCompensation: number
+  /** One entry per pyramid level in the current plan, finest first. */
+  levels: LodCompensationLevel[]
+  /**
+   * The whole-volume coarse floor texture drawn behind the bricks, when one is
+   * installed. It is not a member of the chunk plan, so it is reported apart
+   * from `levels` (its `level` is -1 and `brickCount` is 1).
+   */
+  floor: LodCompensationLevel | null
 }
 
 /** Mesh rendering config: global settings for mesh display */

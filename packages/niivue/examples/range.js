@@ -1569,10 +1569,34 @@ function renderHud() {
     <div class="row"><span class="key">cache</span><span>${stats.cacheHits} hits, ${formatBytes(stats.cacheBytes)}</span></div>
     <div class="row"><span class="key">empty chunks</span><span>${stats.emptyChunks} absent, ${stats.emptySkips} refetches avoided</span></div>
     <div class="row"><span class="key">resident</span><span>${stream ? `${stream.resident} resident, ${stream.pending} pending, ${stream.inFlight} in flight` : 'pending'}</span></div>
+    <div class="row"><span class="key">LOD comp</span><span>${html(lodCompensationSummary())}</span></div>
     <div class="row"><span class="key">failures</span><span>${failures}</span></div>
     <div class="row"><span class="key">last requests</span><span>${html(stats.lastRequests.join(' | ') || 'none')}</span></div>
   `
   renderChunkStrip()
+}
+
+// One line of nv.lodCompensation(). Both LOD compensation settings are exact
+// no-ops on anything that is not a multi-LOD chunked volume, so the report is
+// the only way to tell "the knob is doing nothing" from "the knob is doing
+// nothing VISIBLE"; the HUD shows the exact exponent/scale each drawn level is
+// handing the shader.
+function lodCompensationSummary() {
+  const report = nv?.lodCompensation()
+  if (!report) return 'pending'
+  if (!report.isActive) return `off (${report.inactiveReason})`
+  const parts = report.levels
+    .filter((l) => l.brickCount > 0 && l.downsample > 1)
+    .map(
+      (l) =>
+        `L${l.level} k${l.downsample.toFixed(1)} x${l.brickCount} g${l.brightnessExponent.toFixed(3)} a${l.opacityScale.toFixed(2)}`,
+    )
+  if (report.floor && report.floor.downsample > 1) {
+    parts.push(
+      `floor k${report.floor.downsample.toFixed(1)} g${report.floor.brightnessExponent.toFixed(3)} a${report.floor.opacityScale.toFixed(2)}`,
+    )
+  }
+  return parts.join(' | ') || 'active, no coarse brick drawn'
 }
 
 function chunkShapeFromPlan(plan) {

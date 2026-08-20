@@ -2318,6 +2318,16 @@
       "returnsDoc": null
     },
     {
+      "jsName": "lodCompensation",
+      "pyName": "lod_compensation",
+      "isAsync": false,
+      "returnsValue": true,
+      "params": [],
+      "returns": "LodCompensationReport",
+      "doc": "What the two LOD compensation settings are actually doing right now.\n\n`volumeLodBrightnessCompensation` and `volumeLodOpacityCompensation` only\naffect bricks fetched from a COARSE level of a multi-LOD chunked volume, so\non an ordinary volume they are exact no-ops with nothing on screen to say\nso. This is the way to check: `isActive` answers \"is anything being\ncompensated\", `inactiveReason` says why not, and each level reports the\nexponent and scale being handed to the shader for its bricks.\n\n```js\nconst report = nv.lodCompensation()\nif (!report.isActive) console.log(report.inactiveReason)\nfor (const each of report.levels) {\n  console.log(each.level, each.downsample, each.brickCount, each.brightnessExponent)\n}\n```\n\nReads the background volume (`volumes[0]`), which is the volume both\nsettings act on. Cheap enough to call per frame for a debug HUD.",
+      "returnsDoc": null
+    },
+    {
       "jsName": "markDrawDirty",
       "pyName": "mark_draw_dirty",
       "isAsync": false,

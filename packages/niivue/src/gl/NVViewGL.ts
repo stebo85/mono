@@ -1702,6 +1702,10 @@ export default class NVGlview {
     this.volumeRenderer.rebakeChunkedOverlays()
   }
 
+  coarseFloorDims(): [number, number, number] | null {
+    return this.volumeRenderer.coarseFloorDims
+  }
+
   _getMeshGpu(m: NVMesh): MeshGpuWithShader | null {
     return this.meshResources.get(m) ?? null
   }

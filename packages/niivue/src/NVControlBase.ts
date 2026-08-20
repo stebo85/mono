@@ -47,6 +47,8 @@ import {
   GAMMA_RANGE,
   LOD_BRIGHTNESS_RANGE,
   LOD_OPACITY_RANGE,
+  lodGammaExponent,
+  lodOpacityScale,
   NUM_CLIP_PLANE,
   SLICE_TYPE,
   sliceTypeDim,
@@ -73,6 +75,8 @@ import type {
   CustomLayoutTile,
   FocusBox,
   ImageFromUrlOptions,
+  LodCompensationLevel,
+  LodCompensationReport,
   LUT,
   MeasurementScreenLine,
   MeshFromUrlOptions,
@@ -133,7 +137,11 @@ import { validateCustomLayout } from '@/view/NVSliceLayout'
 import type { ExplodedBlockFace } from '@/volume/ChunkExplode'
 import type { ChunkedVolumeSource } from '@/volume/ChunkedVolumeSource'
 import { chunksOverlappingVoxelBox } from '@/volume/ChunkVisibility'
-import { type ChunkPlan, CUBIC_MIN_HALO } from '@/volume/chunking'
+import {
+  type ChunkPlan,
+  CUBIC_MIN_HALO,
+  dimsDownsample,
+} from '@/volume/chunking'
 import {
   computeDescriptiveStats,
   type DescriptiveStats,
@@ -195,6 +203,12 @@ type ViewBackend = {
     total: number
   }
   rebakeChunkedOverlays: () => void
+  /**
+   * Voxel dims of the whole-volume coarse floor texture, or null when none is
+   * installed. Renderer-owned state (the floor is not a member of
+   * `plan.chunks`), surfaced so `lodCompensation()` can report it.
+   */
+  coarseFloorDims: () => [number, number, number] | null
   overlayDraw: ((frame: UIKitOverlayFrame) => void) | null
   onContextLost: (() => void) | null
 }
@@ -1353,12 +1367,37 @@ export default class NiiVue extends EventTarget {
   }
 
   /**
+   * Both LOD compensation settings are exact no-ops unless a multi-LOD chunked
+   * volume is loaded, and nothing on screen says so. Surface that at the moment
+   * the setting is made rather than leaving the caller to wonder. Silent when
+   * no volume is loaded at all: setting these before `loadVolumes` is normal.
+   */
+  private _warnIfLodCompensationInert(property: string, value: number): void {
+    if (value <= 0 || !this.model.volumes.length) return
+    const multiLod = this.model.volumes.some(
+      (v) => (v.chunkPlan?.levelDims?.length ?? 0) > 1,
+    )
+    if (multiLod) return
+    log.warn(
+      `${property} = ${value} has no effect: no loaded volume is a multi-LOD chunked volume. It only changes bricks fetched from a coarse pyramid level. Call lodCompensation() to see what applies.`,
+    )
+  }
+
+  /**
+   * COARSE BRICKS LOOK TOO DARK next to fine ones -> raise this. (Too
+   * TRANSPARENT rather than too dark -> `volumeLodOpacityCompensation`.)
+   *
    * Coefficient for the per-level brightness compensation applied to coarse
-   * multi-LOD bricks; 0 disables it, clamped to [0, 0.2]. A coarse brick
-   * integrates darker than the fine data it stands in for (averaging voxels
-   * destroys the colour/opacity correlation that front-to-back compositing
-   * weights by), which reads as a brightness step at a LOD boundary. Empirical:
-   * it holds for dense structure and undercorrects sparse material. See
+   * multi-LOD bricks; 0 disables it, clamped to [0, 1]. Useful magnitudes are
+   * small: the default is 0.022 and 0.1 is already strong.
+   *
+   * A coarse brick integrates darker than the fine data it stands in for
+   * (averaging voxels destroys the colour/opacity correlation that front-to-back
+   * compositing weights by), which reads as a brightness step at a LOD boundary.
+   * Empirical: it holds for dense structure and undercorrects sparse material.
+   *
+   * No-op on any volume that is not a multi-LOD chunked volume. Call
+   * `lodCompensation()` to see whether it applies and what each level gets. See
    * VolumeRenderConfig.lodBrightnessCompensation.
    */
   get volumeLodBrightnessCompensation(): number {
@@ -1368,6 +1407,10 @@ export default class NiiVue extends EventTarget {
     this.model.volume.lodBrightnessCompensation = Number.isFinite(v)
       ? Math.min(Math.max(v, LOD_BRIGHTNESS_RANGE[0]), LOD_BRIGHTNESS_RANGE[1])
       : VOLUME_DEFAULTS.lodBrightnessCompensation
+    this._warnIfLodCompensationInert(
+      'volumeLodBrightnessCompensation',
+      this.model.volume.lodBrightnessCompensation,
+    )
     this.emit('change', {
       property: 'volumeLodBrightnessCompensation',
       value: this.model.volume.lodBrightnessCompensation,
@@ -1376,15 +1419,24 @@ export default class NiiVue extends EventTarget {
   }
 
   /**
+   * COARSE BRICKS LOOK TOO TRANSPARENT next to fine ones -> raise this. (Too
+   * DARK rather than too transparent -> `volumeLodBrightnessCompensation`,
+   * which is the one to try first.)
+   *
    * Coefficient for the per-level OPACITY compensation applied to coarse
    * multi-LOD bricks in the 3D ray-march; 0 disables it (the default), clamped
-   * to [0, 1]. The march's step-size correction assumes a coarse voxel is
-   * homogeneous; where it is not, the brick renders too see-through. This
-   * scales that exponent by `1 + c * (k - 1)`.
+   * to [0, 1], the same range as `volumeLodBrightnessCompensation`. The march's
+   * step-size correction assumes a coarse voxel is homogeneous; where it is not,
+   * the brick renders too see-through. This scales that exponent by
+   * `1 + c * (k - 1)`.
    *
    * Measured off by default: it makes dense structure worse (the alpha there is
    * already correct, and inflating it front-loads the march onto nearer, dimmer
-   * samples). Reach for `volumeLodBrightnessCompensation` first. See
+   * samples).
+   *
+   * No-op on any volume that is not a multi-LOD chunked volume, and on 2D slice
+   * tiles (one sample, no accumulation). Call `lodCompensation()` to see whether
+   * it applies and what each level gets. See
    * VolumeRenderConfig.lodOpacityCompensation.
    */
   get volumeLodOpacityCompensation(): number {
@@ -1394,6 +1446,10 @@ export default class NiiVue extends EventTarget {
     this.model.volume.lodOpacityCompensation = Number.isFinite(v)
       ? Math.min(Math.max(v, LOD_OPACITY_RANGE[0]), LOD_OPACITY_RANGE[1])
       : VOLUME_DEFAULTS.lodOpacityCompensation
+    this._warnIfLodCompensationInert(
+      'volumeLodOpacityCompensation',
+      this.model.volume.lodOpacityCompensation,
+    )
     this.emit('change', {
       property: 'volumeLodOpacityCompensation',
       value: this.model.volume.lodOpacityCompensation,
@@ -3724,6 +3780,106 @@ export default class NiiVue extends EventTarget {
     total: number
   } | null {
     return this.view?.chunkStreamStats() ?? null
+  }
+
+  /**
+   * What the two LOD compensation settings are actually doing right now.
+   *
+   * `volumeLodBrightnessCompensation` and `volumeLodOpacityCompensation` only
+   * affect bricks fetched from a COARSE level of a multi-LOD chunked volume, so
+   * on an ordinary volume they are exact no-ops with nothing on screen to say
+   * so. This is the way to check: `isActive` answers "is anything being
+   * compensated", `inactiveReason` says why not, and each level reports the
+   * exponent and scale being handed to the shader for its bricks.
+   *
+   * ```js
+   * const report = nv.lodCompensation()
+   * if (!report.isActive) console.log(report.inactiveReason)
+   * for (const each of report.levels) {
+   *   console.log(each.level, each.downsample, each.brickCount, each.brightnessExponent)
+   * }
+   * ```
+   *
+   * Reads the background volume (`volumes[0]`), which is the volume both
+   * settings act on. Cheap enough to call per frame for a debug HUD.
+   */
+  lodCompensation(): LodCompensationReport {
+    const brightness = this.model.volume.lodBrightnessCompensation
+    const opacity = this.model.volume.lodOpacityCompensation
+    const describe = (
+      level: number,
+      levelDims: [number, number, number],
+      brickCount: number,
+      volumeDims: readonly number[],
+    ): LodCompensationLevel => {
+      const downsample = dimsDownsample(
+        [volumeDims[0], volumeDims[1], volumeDims[2]],
+        levelDims,
+      )
+      return {
+        level,
+        downsample,
+        levelDims,
+        brickCount,
+        brightnessExponent: lodGammaExponent(downsample, brightness),
+        opacityScale: lodOpacityScale(downsample, opacity),
+      }
+    }
+
+    const plan = this.model.volumes[0]?.chunkPlan
+    const floorDims = this.view?.coarseFloorDims() ?? null
+    const levels: LodCompensationLevel[] = []
+    let inactiveReason: string | null = null
+    if (!this.model.volumes.length) {
+      inactiveReason = 'no volume is loaded'
+    } else if (!plan) {
+      inactiveReason = 'volume 0 is not a chunked volume'
+    } else if (!plan.levelDims || plan.levelDims.length < 2) {
+      // A single-level plan (chunkVolumeGrid) tiles the finest data only, so
+      // every brick is at downsample 1 and both settings are no-ops.
+      inactiveReason = 'the chunked volume has a single resolution level'
+    } else {
+      const counts = new Map<number, number>()
+      for (const chunk of plan.chunks) {
+        const level = chunk.sourceLevel ?? 0
+        counts.set(level, (counts.get(level) ?? 0) + 1)
+      }
+      for (let level = 0; level < plan.levelDims.length; level++) {
+        const dims = plan.levelDims[level]
+        if (!dims) continue
+        levels.push(
+          describe(
+            level,
+            [dims[0], dims[1], dims[2]],
+            counts.get(level) ?? 0,
+            plan.volumeDims,
+          ),
+        )
+      }
+    }
+
+    const floor =
+      plan && floorDims ? describe(-1, floorDims, 1, plan.volumeDims) : null
+    // Active means some drawn brick is being changed: a coarse level has to be
+    // present AND a coefficient has to be non-zero. The coefficients are checked
+    // first because that is the reason the caller can act on directly.
+    if (!inactiveReason && brightness <= 0 && opacity <= 0) {
+      inactiveReason = 'both coefficients are 0'
+    }
+    const hasCoarse =
+      levels.some((l) => l.brickCount > 0 && l.downsample > 1) ||
+      (floor?.downsample ?? 1) > 1
+    if (!inactiveReason && !hasCoarse) {
+      inactiveReason = 'no coarse brick is currently drawn'
+    }
+    return {
+      isActive: inactiveReason === null,
+      inactiveReason,
+      brightnessCompensation: brightness,
+      opacityCompensation: opacity,
+      levels,
+      floor,
+    }
   }
 
   /**

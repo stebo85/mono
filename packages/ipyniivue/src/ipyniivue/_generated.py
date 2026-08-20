@@ -756,6 +756,33 @@ and its volumes alive."""
     def load_volumes(self, volumes: Any) -> None:
         self.send({"cmd": "loadVolumes", "args": _make_args(volumes)})
 
+    async def lod_compensation(self) -> Any:
+        """What the two LOD compensation settings are actually doing right now.
+
+        `volumeLodBrightnessCompensation` and `volumeLodOpacityCompensation` only
+        affect bricks fetched from a COARSE level of a multi-LOD chunked volume, so
+        on an ordinary volume they are exact no-ops with nothing on screen to say
+        so. This is the way to check: `isActive` answers \"is anything being
+        compensated\", `inactiveReason` says why not, and each level reports the
+        exponent and scale being handed to the shader for its bricks.
+
+        ```js
+        const report = nv.lodCompensation()
+        if (!report.isActive) console.log(report.inactiveReason)
+        for (const each of report.levels) {
+          console.log(each.level, each.downsample, each.brickCount, each.brightnessExponent)
+        }
+        ```
+
+        Reads the background volume (`volumes[0]`), which is the volume both
+        settings act on. Cheap enough to call per frame for a debug HUD.
+
+        Returns
+        -------
+        LodCompensationReport
+        """
+        return await self._request("lodCompensation", [])
+
     def mark_draw_dirty(self, x: Any, y: Any, z: Any, radius: Any = _UNSET) -> None:
         """Expand the pending pen-stroke dirty box by a voxel and its pen radius, so the next drawing flush re-uploads only the chunks that region touches.
 

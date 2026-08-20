@@ -588,6 +588,15 @@ export type SceneConfig = {
   // (sliceType === RENDER). Each component is in NDC units, so renderPan = [0.5, 0.5]
   // shifts the volume half the viewport right and up. Ignored in 2D / mosaic.
   renderPan: vec2
+  /**
+   * Display gamma for the 3D volume render: each sample's classified RGB is
+   * raised to 1/gamma, so values above 1 brighten and below 1 darken (1 is a
+   * strict no-op). Alpha is deliberately untouched -- gamma is a brightness
+   * control, and raising alpha with it would change how much each sample
+   * occludes what is behind it, flattening the image instead of brightening it.
+   * It also narrows the gap between a coarse LOD brick and a fine one, since
+   * mean-downsampled data classifies darker. 2D slices are unaffected.
+   */
   gamma: number
   backgroundColor: [number, number, number, number]
   clipPlaneColor: number[]
@@ -919,6 +928,7 @@ export type NiiVueOptions = {
   pan2Dxyzmm?: [number, number, number, number]
   scaleMultiplier?: number
   renderPan?: [number, number]
+  /** Display gamma for the 3D volume render, >1 brightens. See SceneConfig.gamma. */
   gamma?: number
   backgroundColor?: [number, number, number, number]
   clipPlaneColor?: number[]

@@ -1,7 +1,12 @@
 import { log } from '@/logger'
 import * as NVTransforms from '@/math/NVTransforms'
 import * as NVShapes from '@/mesh/NVShapes'
-import { isPaqd, VOLUME_DEFAULTS } from '@/NVConstants'
+import {
+  invGamma,
+  isPaqd,
+  SCENE_DEFAULTS,
+  VOLUME_DEFAULTS,
+} from '@/NVConstants'
 import { applyCORS } from '@/NVLoader'
 import type { NVImage, VolumeChunkExplode } from '@/NVTypes'
 import { blendOverlayData } from '@/view/NVMeshView'
@@ -280,6 +285,10 @@ export class VolumeRenderer extends NVRenderer {
   // Volume flag (set per-frame from md.volume.renderMode): 0 = composite (OVER),
   // 1 = maximum-intensity projection. See VOLUME_RENDER_MODE.
   renderMode = 0
+  // Scene display gamma (set per-frame from md.scene.gamma). Applied to the
+  // classified RGB of every volume sample, never to alpha, so brightening does
+  // not change how much a ray occludes. 1.0 is a strict no-op.
+  gamma = SCENE_DEFAULTS.gamma
   // Samples per voxel along the ray in the 3D fine march (from md.volume.sampleRate).
   // Converges the ray integral at a proportional fragment cost. It does NOT remove
   // concentric banding on smooth structures (measured ring contrast is flat from 1
@@ -2185,6 +2194,10 @@ export class VolumeRenderer extends NVRenderer {
       u.cubicSafe !== false
     if (shader.uniforms.cubicFilter)
       gl.uniform1f(shader.uniforms.cubicFilter, cubic ? 1 : 0)
+    // The shader raises the classified RGB to this power, so upload the
+    // reciprocal of the user-facing gamma.
+    if (shader.uniforms.invGamma)
+      gl.uniform1f(shader.uniforms.invGamma, invGamma(this.gamma))
   }
 
   /**

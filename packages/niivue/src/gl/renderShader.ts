@@ -37,6 +37,11 @@ uniform float rayVoxSampleRate;
 // the cubic filter is C2 and removes that. It does not touch the wood-grain rings,
 // which survive a C2 reconstruction unchanged.
 uniform float cubicFilter;
+// Display gamma exponent for the classified RGB (alpha untouched, so the ray's
+// occlusion is unchanged). Already inverted on the CPU: the shader does
+// pow(rgb, invGamma), where invGamma = 1 / scene.gamma, so gamma > 1 brightens.
+// 1.0 is a strict no-op. Mirrors invGamma in wgpu/volumeShaderLib.ts.
+uniform float invGamma;
 uniform vec4 clipPlaneColor;
 uniform vec4 paqdUniforms;
 uniform sampler2D matcap;
@@ -91,6 +96,16 @@ vec3 layerShade(sampler3D tex, vec3 p, float amount) {
   vec2 uv = n.xy * 0.5 + 0.5;
   vec3 mc_rgb = texture(matcap, uv).rgb * (1.0 + (amount / 3.0));
   return mix(vec3(1.0), mc_rgb, amount);
+}
+
+// Display gamma on a classified colour. ALPHA IS DELIBERATELY UNTOUCHED: gamma
+// is a brightness control, and raising alpha with it would change how much each
+// sample occludes what is behind it (the ray would saturate sooner and the image
+// would get flatter, not brighter). Mirrors applyGamma in wgpu/volumeShaderLib.ts
+// -- keep the two in step.
+vec3 applyGamma(vec3 rgb) {
+  if (invGamma == 1.0) { return rgb; }
+  return pow(max(rgb, vec3(0.0)), vec3(invGamma));
 }
 
 // Tricubic B-spline reconstruction in 8 hardware-trilinear fetches
@@ -212,7 +227,7 @@ RayResult rayMarchPass(
                 result.firstHit = samplePos;
             }
             result.farthest = samplePos.a;
-            vec3 rgb = colorSample.rgb;
+            vec3 rgb = applyGamma(colorSample.rgb);
             if (shadeAmount > 0.0) {
                 // colorSample.rgb is straight (non-premultiplied) here, so
                 // clamping the lit colour to 1.0 keeps the premultiplied
@@ -559,7 +574,7 @@ void main() {
           float lightingAmount = localGradientAmount;
           vec3 mc_rgb = texture(matcap, uv).rgb * (1.0 + (lightingAmount / 3.0));
           vec3 blendedRGB = mix(vec3(1.0), mc_rgb, lightingAmount);
-          vec3 finalRGB = blendedRGB * colorSample.rgb;
+          vec3 finalRGB = blendedRGB * applyGamma(colorSample.rgb);
           // Step-size correction compensates a coarse brick's sparser sampling
           // in an OVER accumulation. A max projection reads each sample
           // independently, so correcting it would brighten coarse bricks

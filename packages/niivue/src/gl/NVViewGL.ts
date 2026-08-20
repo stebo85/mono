@@ -519,6 +519,9 @@ export default class NVGlview {
     this.volumeRenderer.sampleRate = md.volume.sampleRate
     // Tricubic B-spline reconstruction in the fine march (8 fetches vs 1).
     this.volumeRenderer.isCubicInterpolation = md.volume.isCubicInterpolation
+    // Display gamma for the classified RGB of every volume sample (alpha, and
+    // therefore occlusion, is untouched).
+    this.volumeRenderer.gamma = md.scene.gamma
     // Off-screen after viewport transform: skip the entire render pass — scissor would
     // clip everything and the work is wasted. preserveDrawingBuffer keeps prior pixels.
     if (this._isSubCanvasBounds && this._isBoundsOffscreen) return

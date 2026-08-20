@@ -39,7 +39,12 @@ struct Params {
     // background fine pass. Occupies what was _pad0's first lane, so the struct
     // size and every later offset are unchanged.
     cubicFilter: f32,
-    _pad0: f32,
+    // Display gamma exponent for the classified RGB (alpha untouched, so the
+    // ray's occlusion is unchanged). Already inverted on the CPU: the shader
+    // does pow(rgb, invGamma), where invGamma = 1 / scene.gamma, so gamma > 1
+    // brightens. 1.0 is a strict no-op. Occupies what was _pad0, so the struct
+    // size and every later offset are unchanged.
+    invGamma: f32,
     // Tiled-volume fields. Pass-through values for non-chunked volumes:
     //   volumeTexDimsFull = textureDimensions(volume, 0)
     //   chunkSubOrigin    = (0,0,0)
@@ -74,6 +79,16 @@ struct Params {
 fn chunkTexCoord(samplePos: vec3f) -> vec3f {
     let chunkLocal = (samplePos - params.chunkSubOrigin.xyz) / params.chunkSubSize.xyz;
     return params.dataOriginTexFrac.xyz + chunkLocal * params.dataSizeTexFrac.xyz;
+}
+
+// Display gamma on a classified colour. ALPHA IS DELIBERATELY UNTOUCHED: gamma
+// is a brightness control, and raising alpha with it would change how much each
+// sample occludes what is behind it (the ray would saturate sooner and the image
+// would get flatter, not brighter). e is params.invGamma, already reciprocated
+// on the CPU. Mirrors applyGamma in gl/renderShader.ts -- keep the two in step.
+fn applyGamma(rgb: vec3f, e: f32) -> vec3f {
+    if (e == 1.0) { return rgb; }
+    return pow(max(rgb, vec3f(0.0)), vec3f(e));
 }
 
 // Tricubic B-spline reconstruction in 8 hardware-trilinear fetches

@@ -111,6 +111,20 @@ export const SLICE_TYPE = Object.freeze({
   NONE: 5,
 } as const)
 
+/** Accepted range for scene.gamma. 1 is the neutral no-op. */
+export const GAMMA_RANGE: [number, number] = [0.1, 10]
+
+/**
+ * Shader exponent for a user-facing display gamma: the shaders raise the
+ * classified RGB to this power, so gamma > 1 brightens (pow(rgb, 1/gamma) on a
+ * value in [0,1] moves it toward 1). Clamped away from 0 so a slider dragged to
+ * its floor cannot produce a division by zero or an infinite exponent.
+ */
+export function invGamma(gamma: number): number {
+  if (!Number.isFinite(gamma)) return 1
+  return 1 / Math.min(Math.max(gamma, GAMMA_RANGE[0]), GAMMA_RANGE[1])
+}
+
 /** Maps AXIAL→2, CORONAL→1, SAGITTAL→0 (the RAS dimension perpendicular to the slice). */
 export function sliceTypeDim(sliceType: number): number {
   if (sliceType === SLICE_TYPE.CORONAL) return 1

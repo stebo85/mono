@@ -44,6 +44,7 @@ import * as NVMesh from '@/mesh/NVMesh'
 import type { WriteOptions } from '@/mesh/writers'
 import {
   DRAG_MODE,
+  GAMMA_RANGE,
   NUM_CLIP_PLANE,
   SLICE_TYPE,
   sliceTypeDim,
@@ -745,12 +746,20 @@ export default class NiiVue extends EventTarget {
     return true
   }
 
+  /**
+   * Display gamma for the 3D volume render. Applied to each sample's classified
+   * RGB, never to its alpha, so brightening the image does not change how much
+   * a ray occludes. Values above 1 brighten, below 1 darken; 1 (the default) is
+   * a strict no-op. Clamped to GAMMA_RANGE.
+   */
   get gamma(): number {
     return this.model.scene.gamma
   }
   set gamma(v: number) {
-    this.model.scene.gamma = v
-    this.emit('change', { property: 'gamma', value: v })
+    this.model.scene.gamma = Number.isFinite(v)
+      ? Math.min(Math.max(v, GAMMA_RANGE[0]), GAMMA_RANGE[1])
+      : 1
+    this.emit('change', { property: 'gamma', value: this.model.scene.gamma })
     this.drawScene()
   }
 

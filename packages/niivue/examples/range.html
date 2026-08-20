@@ -321,6 +321,11 @@
           title="Ray samples per voxel in the 3D fine march. Higher converges the ray integral at a linear cost in fill rate. It does not remove the concentric ringing (that is in the data, not the sampling)" />
       </span>
       <span class="control">
+        <label for="gamma">gamma <span id="gammaVal">1.00</span></label>
+        <input id="gamma" type="range" min="0.5" max="3" step="0.05" value="1"
+          title="Display gamma for the 3D render. Raises each sample's classified RGB to 1/gamma, so above 1 brightens. Alpha is untouched, so occlusion is unchanged. It also narrows the gap between a coarse LOD brick and a fine one, since mean-downsampled data classifies darker" />
+      </span>
+      <span class="control">
         <label for="interp">Interp</label>
         <select id="interp"
           title="Texture reconstruction in the 3D fine march. linear = hardware trilinear (C0: leaves a blocky texel staircase along band edges). cubic B-spline = 8-tap C2 reconstruction (smooth, ~1.9x fragment cost). Opt-in; linear is the default. vox.interp.html has the side-by-side A/B, a benchmark and a figure export">

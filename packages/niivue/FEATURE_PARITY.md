@@ -173,7 +173,7 @@ Tracking which features from the old `niivue` package exist in the new rewrite.
 | Custom gradient texture | ❌ | No `setCustomGradientTexture` / `getGradientTextureData` |
 | MatCap texture | ✅ | `loadMatcap()` / `volumeMatcap` |
 | Maximum-intensity projection | ✅ | `volumeRenderMode = VOLUME_RENDER_MODE.MAXIMUM` (both backends). Not the old `setAdditiveBlend` API — the ray-march combines samples with a component-wise max instead of OVER, and it applies to every volume pass (base, overlay, PAQD, drawing) |
-| Gamma correction | ✅ | `gamma` property |
+| Gamma correction | ✅ | `gamma` property (both backends). Scope differs from the old package: the shaders raise the classified RGB of the 3D volume ray-march to `1/gamma` (alpha untouched, so `gamma > 1` brightens), instead of baking the exponent into the colormap LUT. 2D slice tiles are therefore unaffected |
 | Volume alpha shader | ✅ | `volumeAlphaShader` |
 
 ## 13. Clip Planes

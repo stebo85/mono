@@ -127,7 +127,7 @@ fn rayMarchPass(
                 result.firstHit = samplePos;
             }
             result.farthest = samplePos.a;
-            var rgb = colorSample.rgb;
+            var rgb = applyGamma(colorSample.rgb, params.invGamma);
             if (shadeAmount > 0.0) {
                 // colorSample.rgb is straight (non-premultiplied) here, so
                 // clamping the lit colour to 1.0 keeps the premultiplied
@@ -485,7 +485,7 @@ fn fragment_main(in: VertexOutput) -> FragmentOutput {
 					let lightingAmount = localGradientAmount;
 					let mc_rgb = textureSampleLevel(matcap, tex_sampler, uv, 0.0).rgb * (1.0 + (lightingAmount / 3.0));
 					let blendedRGB = mix(vec3f(1.0), mc_rgb, lightingAmount);
-					let finalRGB = blendedRGB * colorSample.rgb;
+					let finalRGB = blendedRGB * applyGamma(colorSample.rgb, params.invGamma);
 					// Step-size correction compensates a coarse brick's sparser
 					// sampling in an OVER accumulation. A max projection reads
 					// each sample independently, so correcting it would brighten

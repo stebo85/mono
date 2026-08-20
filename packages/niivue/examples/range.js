@@ -447,6 +447,8 @@ const els = {
   explodeVal: el('explodeVal'),
   samples: el('samples'),
   samplesVal: el('samplesVal'),
+  gamma: el('gamma'),
+  gammaVal: el('gammaVal'),
   interp: el('interp'),
   blocks: el('blocks'),
   crosshair: el('crosshair'),
@@ -1270,6 +1272,20 @@ function applySampleRate() {
   nv.volumeSampleRate = rate
 }
 
+// Display gamma for the 3D render. The exponent lands on each sample's
+// classified RGB only, never on its alpha, so raising it brightens the image
+// without changing how much any sample occludes what is behind it. It also
+// closes most of the coarse-vs-fine LOD brightness gap: a mean-downsampled
+// brick attenuates the peaks it averaged over, so it classifies darker than the
+// fine data at the same place, and the gamma lifts it back.
+function applyGamma() {
+  const g = Number(els.gamma.value) || 1
+  els.gammaVal.textContent = g.toFixed(2)
+  if (!nv) return
+  // Pure render-time setting: no re-stream, and the setter already redraws.
+  nv.gamma = g
+}
+
 // Texture reconstruction in the 3D fine march: hardware trilinear (default) or
 // tricubic B-spline. Trilinear is only C0, so band edges carry a blocky texel
 // staircase; the cubic filter is C2 and removes it (it does NOT remove the
@@ -1737,6 +1753,7 @@ async function main() {
   // Browsers restore a range input's value across a reload, so push the slider's
   // current position into the fresh instance rather than assuming the default.
   applySampleRate()
+  applyGamma()
   applyInterp()
 
   els.source.addEventListener('change', async () => {
@@ -1763,6 +1780,7 @@ async function main() {
   els.explode.addEventListener('input', applyExplode)
   els.zoom.addEventListener('input', applyZoom)
   els.samples.addEventListener('input', applySampleRate)
+  els.gamma.addEventListener('input', applyGamma)
   els.interp.addEventListener('change', applyInterp)
   els.blocks.addEventListener('change', applyBlocks)
   els.crosshair.addEventListener('change', applyCrosshair)

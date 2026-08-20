@@ -1,5 +1,7 @@
 import { describe, expect, test } from 'bun:test'
 import {
+  GAMMA_RANGE,
+  invGamma,
   isPaqd,
   NiiDataType,
   NiiIntentCode,
@@ -59,5 +61,39 @@ describe('sliceTypeDim', () => {
     const values = Object.values(SLICE_TYPE)
     expect(SLICE_TYPE.NONE).toBe(5)
     expect(new Set(values).size).toBe(values.length) // all enum values unique
+  })
+})
+
+describe('invGamma', () => {
+  test('neutralGammaIsExactlyOne', () => {
+    // The shaders skip the pow() on an exact 1.0, so the default must land
+    // there bit-for-bit rather than at 0.9999.
+    expect(invGamma(1)).toBe(1)
+  })
+
+  test('aboveOneBrightens', () => {
+    // pow(rgb, e) with e < 1 moves a value in [0,1] toward 1.
+    const e = invGamma(2)
+    expect(e).toBeCloseTo(0.5, 10)
+    expect(0.25 ** e).toBeGreaterThan(0.25)
+  })
+
+  test('belowOneDarkens', () => {
+    const e = invGamma(0.5)
+    expect(e).toBeCloseTo(2, 10)
+    expect(0.25 ** e).toBeLessThan(0.25)
+  })
+
+  test('clampsToRange', () => {
+    expect(invGamma(0)).toBe(1 / GAMMA_RANGE[0])
+    expect(invGamma(-5)).toBe(1 / GAMMA_RANGE[0])
+    expect(invGamma(1e6)).toBe(1 / GAMMA_RANGE[1])
+  })
+
+  test('nonFiniteIsNeutral', () => {
+    // A NaN exponent would blank every sample, so it must fall back to the
+    // no-op rather than reach the shader.
+    expect(invGamma(Number.NaN)).toBe(1)
+    expect(invGamma(Number.POSITIVE_INFINITY)).toBe(1)
   })
 })

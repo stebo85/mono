@@ -45,6 +45,14 @@ struct Params {
     // brightens. 1.0 is a strict no-op. Occupies what was _pad0, so the struct
     // size and every later offset are unchanged.
     invGamma: f32,
+    // Multiplier on this brick's step-size opacity exponent, compensating the
+    // fact that a coarse voxel is not homogeneous (so its true transmittance is
+    // lower than the homogeneous approximation the step correction assumes).
+    // 1.0 is a strict no-op and is the default. Occupies the first of the two
+    // implicit padding lanes before the 16-byte-aligned volumeTexDimsFull, so
+    // the struct size and every later offset are unchanged. Mirrors
+    // lodOpacityScale in gl/renderShader.ts.
+    lodOpacityScale: f32,
     // Tiled-volume fields. Pass-through values for non-chunked volumes:
     //   volumeTexDimsFull = textureDimensions(volume, 0)
     //   chunkSubOrigin    = (0,0,0)

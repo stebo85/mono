@@ -4,7 +4,9 @@ import {
   invGamma,
   isPaqd,
   LOD_BRIGHTNESS_RANGE,
+  LOD_OPACITY_RANGE,
   lodGammaExponent,
+  lodOpacityScale,
   NiiDataType,
   NiiIntentCode,
   SLICE_TYPE,
@@ -142,5 +144,47 @@ describe('lodGammaExponent', () => {
     expect(lodGammaExponent(Number.NaN, beta)).toBe(1)
     expect(lodGammaExponent(Number.POSITIVE_INFINITY, beta)).toBe(1)
     expect(lodGammaExponent(4, Number.NaN)).toBe(1)
+  })
+})
+
+describe('lodOpacityScale', () => {
+  const c = 0.1
+
+  test('defaults to a strict no-op', () => {
+    // The default coefficient is 0: measured, this correction costs more in
+    // accumulated colour than it recovers in alpha on dense structure.
+    expect(lodOpacityScale(8, 0)).toBe(1)
+    expect(lodOpacityScale(2, 0)).toBe(1)
+  })
+
+  test('is an exact no-op at the finest level', () => {
+    expect(lodOpacityScale(1, c)).toBe(1)
+    expect(lodOpacityScale(0.5, c)).toBe(1)
+  })
+
+  test('follows 1 + coefficient * (downsample - 1)', () => {
+    expect(lodOpacityScale(2, c)).toBeCloseTo(1 + c, 10)
+    expect(lodOpacityScale(4, c)).toBeCloseTo(1 + 3 * c, 10)
+  })
+
+  test('makes a coarser brick more opaque, never less', () => {
+    const a = lodOpacityScale(2, c)
+    const b = lodOpacityScale(4, c)
+    expect(a).toBeGreaterThan(1)
+    expect(b).toBeGreaterThan(a)
+  })
+
+  test('clamps the coefficient to the accepted range', () => {
+    expect(lodOpacityScale(2, 10)).toBeCloseTo(1 + LOD_OPACITY_RANGE[1], 10)
+  })
+
+  test('caps the scale so a deep pyramid cannot go fully opaque', () => {
+    expect(lodOpacityScale(1e6, LOD_OPACITY_RANGE[1])).toBe(8)
+  })
+
+  test('non-finite inputs are a no-op rather than reaching the shader', () => {
+    expect(lodOpacityScale(Number.NaN, c)).toBe(1)
+    expect(lodOpacityScale(Number.POSITIVE_INFINITY, c)).toBe(1)
+    expect(lodOpacityScale(4, Number.NaN)).toBe(1)
   })
 })

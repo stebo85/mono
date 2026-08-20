@@ -799,6 +799,11 @@ export default class NVView {
     // single-level and non-chunked volumes whatever the coefficient.
     this.volumeRenderer.lodBrightnessCompensation =
       md.volume.lodBrightnessCompensation
+    // Per-level opacity compensation. Ray-march only: the slice renderer shows
+    // one sample per tile with no accumulation, so there is no aggregated alpha
+    // to correct there.
+    this.volumeRenderer.lodOpacityCompensation =
+      md.volume.lodOpacityCompensation
     // 2D slice tiles read the same two exponents so a slice and the 3D render
     // panel agree on brightness.
     this.sliceRenderer.gamma = md.scene.gamma

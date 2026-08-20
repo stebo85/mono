@@ -451,6 +451,8 @@ const els = {
   gammaVal: el('gammaVal'),
   lodComp: el('lodComp'),
   lodCompVal: el('lodCompVal'),
+  lodOpacity: el('lodOpacity'),
+  lodOpacityVal: el('lodOpacityVal'),
   interp: el('interp'),
   blocks: el('blocks'),
   crosshair: el('crosshair'),
@@ -1308,6 +1310,27 @@ function applyLodCompensation() {
   nv.volumeLodBrightnessCompensation = c
 }
 
+// Per-level OPACITY compensation, the other half of the same problem and OFF by
+// default. The march already raises a coarse sample's alpha to the number of
+// reference steps it stands for, which is exact only for a homogeneous coarse
+// voxel; real ones are not, and since log(1-a) is concave the true transmittance
+// through the fine voxels is LOWER than that approximation, so a coarse brick is
+// too see-through. This scales that exponent by 1 + c*(k-1).
+//
+// It defaults to 0 because simulating the march over this pyramid says the
+// deficit is ~0 wherever structure is dense enough to saturate the ray, and
+// inflating alpha there front-loads accumulation onto the nearer, dimmer samples
+// and makes the accumulated colour worse. Sparse thin material does have a real
+// deficit, but no global scale recovers much of it -- that needs the per-voxel
+// variance mean-downsampling discarded. Slide it up if coarse bricks read as too
+// transparent rather than too dark on YOUR data.
+function applyLodOpacity() {
+  const c = Number(els.lodOpacity.value)
+  els.lodOpacityVal.textContent = c.toFixed(2)
+  if (!nv) return
+  nv.volumeLodOpacityCompensation = c
+}
+
 // Texture reconstruction in the 3D fine march: hardware trilinear (default) or
 // tricubic B-spline. Trilinear is only C0, so band edges carry a blocky texel
 // staircase; the cubic filter is C2 and removes it (it does NOT remove the
@@ -1777,6 +1800,7 @@ async function main() {
   applySampleRate()
   applyGamma()
   applyLodCompensation()
+  applyLodOpacity()
   applyInterp()
 
   els.source.addEventListener('change', async () => {
@@ -1805,6 +1829,7 @@ async function main() {
   els.samples.addEventListener('input', applySampleRate)
   els.gamma.addEventListener('input', applyGamma)
   els.lodComp.addEventListener('input', applyLodCompensation)
+  els.lodOpacity.addEventListener('input', applyLodOpacity)
   els.interp.addEventListener('change', applyInterp)
   els.blocks.addEventListener('change', applyBlocks)
   els.crosshair.addEventListener('change', applyCrosshair)

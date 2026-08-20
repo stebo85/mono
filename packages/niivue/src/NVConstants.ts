@@ -158,6 +158,54 @@ export function lodGammaExponent(
   return Math.max(0.25, 1 - beta * (downsample - 1))
 }
 
+/** Accepted range for volume.lodOpacityCompensation. 0 disables it. */
+export const LOD_OPACITY_RANGE: [number, number] = [0, 1]
+
+/** Ceiling on the returned scale, so a deep pyramid level cannot go fully opaque. */
+const LOD_OPACITY_MAX_SCALE = 8
+
+/**
+ * Multiplier on a coarse brick's step-size opacity exponent, for a brick whose
+ * linear downsample factor is `downsample` (see `chunkLodDownsample`).
+ *
+ * The ray-march already corrects for a coarse brick taking fewer, longer steps:
+ * each sample's alpha is raised to the number of reference steps it stands for,
+ * `a' = 1 - (1-a)^k`. That is exact only if the coarse voxel is HOMOGENEOUS.
+ * It is not: the true transmittance through the k fine voxels it replaces is
+ * `prod(1-a_i)`, and since `log(1-a)` is concave that product is SMALLER than
+ * `(1-mean(a))^k`. So a coarse brick is systematically too see-through, by an
+ * amount set by the intensity variance inside the coarse voxel. This scales the
+ * exponent by `1 + c*(k-1)` to push it back.
+ *
+ * DEFAULT 0 (off), and that is a measured choice, not an oversight. Simulating
+ * the march over a real OME-Zarr pyramid says the variance term is ~0 wherever
+ * the structure is dense enough to saturate the ray: those regions already
+ * integrate the right alpha, and inflating it only front-loads the march onto
+ * the nearer, dimmer samples, which makes the accumulated COLOUR worse. Over
+ * four probe regions, raising `c` from 0 to 0.5 cut mean alpha error from 6.7%
+ * to 5.1% while driving colour error from 15.3% to 25.7%. Only sparse, thin
+ * material has a real alpha deficit, and no single global scale recovers much
+ * of it (a -30% deficit improves to -30.6% at c=0.5) because the correction
+ * needs the per-voxel variance that mean-downsampling threw away.
+ *
+ * It is exposed because the trade is data-dependent: a volume that is mostly
+ * thin structure gets more from the alpha than it loses on the colour. Use
+ * `volumeLodBrightnessCompensation` first; reach for this only if coarse bricks
+ * still look too transparent rather than too dark.
+ *
+ * Ray-march only. A 2D slice tile shows ONE sample with no accumulation, so
+ * there is no aggregated alpha to correct there.
+ */
+export function lodOpacityScale(
+  downsample: number,
+  coefficient: number,
+): number {
+  if (!Number.isFinite(downsample) || !Number.isFinite(coefficient)) return 1
+  if (downsample <= 1 || coefficient <= 0) return 1
+  const c = Math.min(coefficient, LOD_OPACITY_RANGE[1])
+  return Math.min(LOD_OPACITY_MAX_SCALE, 1 + c * (downsample - 1))
+}
+
 /** Maps AXIAL→2, CORONAL→1, SAGITTAL→0 (the RAS dimension perpendicular to the slice). */
 export function sliceTypeDim(sliceType: number): number {
   if (sliceType === SLICE_TYPE.CORONAL) return 1
@@ -263,6 +311,7 @@ export const VOLUME_DEFAULTS: VolumeRenderConfig = {
   sampleRate: 2,
   isCubicInterpolation: false,
   lodBrightnessCompensation: 0.022,
+  lodOpacityCompensation: 0,
 }
 
 export const MESH_DEFAULTS: MeshRenderConfig = {

@@ -46,6 +46,7 @@ import {
   DRAG_MODE,
   GAMMA_RANGE,
   LOD_BRIGHTNESS_RANGE,
+  LOD_OPACITY_RANGE,
   NUM_CLIP_PLANE,
   SLICE_TYPE,
   sliceTypeDim,
@@ -1370,6 +1371,32 @@ export default class NiiVue extends EventTarget {
     this.emit('change', {
       property: 'volumeLodBrightnessCompensation',
       value: this.model.volume.lodBrightnessCompensation,
+    })
+    this.drawScene()
+  }
+
+  /**
+   * Coefficient for the per-level OPACITY compensation applied to coarse
+   * multi-LOD bricks in the 3D ray-march; 0 disables it (the default), clamped
+   * to [0, 1]. The march's step-size correction assumes a coarse voxel is
+   * homogeneous; where it is not, the brick renders too see-through. This
+   * scales that exponent by `1 + c * (k - 1)`.
+   *
+   * Measured off by default: it makes dense structure worse (the alpha there is
+   * already correct, and inflating it front-loads the march onto nearer, dimmer
+   * samples). Reach for `volumeLodBrightnessCompensation` first. See
+   * VolumeRenderConfig.lodOpacityCompensation.
+   */
+  get volumeLodOpacityCompensation(): number {
+    return this.model.volume.lodOpacityCompensation
+  }
+  set volumeLodOpacityCompensation(v: number) {
+    this.model.volume.lodOpacityCompensation = Number.isFinite(v)
+      ? Math.min(Math.max(v, LOD_OPACITY_RANGE[0]), LOD_OPACITY_RANGE[1])
+      : VOLUME_DEFAULTS.lodOpacityCompensation
+    this.emit('change', {
+      property: 'volumeLodOpacityCompensation',
+      value: this.model.volume.lodOpacityCompensation,
     })
     this.drawScene()
   }

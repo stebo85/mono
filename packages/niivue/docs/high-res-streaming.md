@@ -99,6 +99,20 @@ where `k` is the brick's linear downsample factor relative to the finest grid �
 
 The size of the deficit depends on how much intensity varies inside one fine voxel, so no coefficient is exact for all data. `0.022` was fitted on dense structure, where it cuts the mean brightness error across levels 1-3 from about 16% to under 4%; it **undercorrects sparse thin material**, which can still read roughly 50% dark at level 3. That is why it is a tunable render-time setting rather than a baked constant. The range demo (`examples/range.html`) exposes it as a slider next to `gamma` for A/B comparison.
 
+### Per-level opacity compensation (off by default)
+
+Brightness is only half of what averaging destroys. The other half is opacity, and it has its own correction — `volumeLodOpacityCompensation` (default `0`, range `[0, 1]`, `0` disables) — which is **off by default for a measured reason**, recorded here so it is not switched on by assumption.
+
+The ray-march already corrects a coarse brick's sparser sampling: each sample's alpha is raised to the number of reference steps it stands for, `a' = 1 - (1-a)^k`. That is exact if the coarse voxel is homogeneous. It is not. The true transmittance through the `k` fine voxels the brick replaces is `prod(1-a_i)`, and because `log(1-a)` is concave that product is *smaller* than `(1-mean(a))^k`. A coarse brick is therefore systematically too see-through, by an amount set by the intensity variance inside the coarse voxel. The setting scales the exponent by `1 + coefficient * (k - 1)` to push it back (`lodOpacityScale` in `src/NVConstants.ts`, capped at 8x so a deep level cannot go fully opaque).
+
+Simulating the march over a real OME-Zarr pyramid says that variance term is effectively zero wherever structure is dense enough to saturate the ray. Those regions already integrate the correct alpha, so inflating it only front-loads accumulation onto the nearer — and therefore dimmer — samples, which makes the accumulated **colour** worse. Across four probe regions, raising the coefficient from 0 to 0.5 cut mean alpha error from 6.7% to 5.1% while driving mean colour error from 15.3% to 25.7%. Sweeping colour gamma and opacity jointly finds a shallow optimum (`brightness 0.05`, `opacity 0.10`) worth about 0.2 points of colour and 1.4 points of alpha over gamma alone — not enough to justify changing the default.
+
+Sparse thin material is the one place with a genuine alpha deficit (about -30% at level 3 on the probe used), and no global scale recovers much of it: at coefficient 0.5 it improves to -30.6%. That is expected, since the correction needs the per-voxel variance that mean-downsampling discarded. Fixing that case properly needs a pyramid built to preserve coverage (a max or conservative reduction) rather than a mean, which is a property of the published store, not of the renderer.
+
+It is exposed because the trade is data-dependent: a volume that is mostly thin structure gains more from the alpha than it loses on the colour. Reach for `volumeLodBrightnessCompensation` first, and turn this up only if coarse bricks read as too *transparent* rather than too *dark*. The range demo exposes it as a second slider beside `LOD comp`.
+
+This one is **ray-march only**. A 2D slice tile shows a single sample with no accumulation, so there is no aggregated alpha to correct; the slice renderers take the brightness exponent but not this one.
+
 ---
 
 ## 5. The GPU Upload Pipeline

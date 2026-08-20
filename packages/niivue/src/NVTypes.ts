@@ -740,6 +740,24 @@ export type VolumeRenderConfig = {
    * and single-level volumes are unaffected (k is 1 for every draw).
    */
   lodBrightnessCompensation: number
+
+  /**
+   * Per-level OPACITY compensation for coarse multi-LOD bricks, applied in the
+   * 3D ray-march. 0 disables it (the default); clamped to [0, 1].
+   *
+   * The march already raises a coarse sample's alpha to the number of reference
+   * steps it stands for, which is exact only if the coarse voxel is
+   * homogeneous. Where it is not, the brick is systematically too see-through.
+   * This scales that exponent by `1 + coefficient * (k - 1)` (see
+   * `lodOpacityScale`).
+   *
+   * Off by default because it measures WORSE than `lodBrightnessCompensation`
+   * on dense structure: the alpha there is already right, and inflating it
+   * front-loads the march onto nearer, dimmer samples. Turn it up only when
+   * coarse bricks look too transparent rather than too dark. Ray-march only --
+   * a 2D slice tile shows one sample with no accumulation.
+   */
+  lodOpacityCompensation: number
 }
 
 /** Mesh rendering config: global settings for mesh display */
@@ -1020,6 +1038,8 @@ export type NiiVueOptions = {
   volumeIsCubicInterpolation?: boolean
   /** Per-level brightness compensation for coarse multi-LOD bricks, [0, 0.2]; 0 disables. See VolumeRenderConfig.lodBrightnessCompensation. */
   volumeLodBrightnessCompensation?: number
+  /** Per-level opacity compensation for coarse multi-LOD bricks in the 3D ray-march, [0, 1]; 0 disables (default). See VolumeRenderConfig.lodOpacityCompensation. */
+  volumeLodOpacityCompensation?: number
 
   // Mesh (prefixed)
   meshXRay?: number

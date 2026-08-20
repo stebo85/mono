@@ -42,6 +42,12 @@ uniform float cubicFilter;
 // pow(rgb, invGamma), where invGamma = 1 / scene.gamma, so gamma > 1 brightens.
 // 1.0 is a strict no-op. Mirrors invGamma in wgpu/volumeShaderLib.ts.
 uniform float invGamma;
+// Multiplier on this brick's step-size opacity exponent, compensating the fact
+// that a coarse voxel is not homogeneous (so its true transmittance is lower
+// than the homogeneous approximation the step correction assumes). 1.0 is a
+// strict no-op and is the default. Mirrors lodOpacityScale in
+// wgpu/volumeShaderLib.ts.
+uniform float lodOpacityScale;
 uniform vec4 clipPlaneColor;
 uniform vec4 paqdUniforms;
 uniform sampler2D matcap;
@@ -583,7 +589,7 @@ void main() {
           // in an OVER accumulation. A max projection reads each sample
           // independently, so correcting it would brighten coarse bricks
           // instead of matching them.
-          float correctedA = mip ? colorSample.a : (1.0 - pow(1.0 - colorSample.a, max(slab * refPerLen, 1e-3)));
+          float correctedA = mip ? colorSample.a : (1.0 - pow(1.0 - colorSample.a, max(slab * refPerLen * lodOpacityScale, 1e-3)));
           vec4 premultiplied = vec4(finalRGB * correctedA, correctedA);
           if (mip) {
             colAcc = max(colAcc, premultiplied);

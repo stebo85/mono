@@ -495,7 +495,7 @@ fn fragment_main(in: VertexOutput) -> FragmentOutput {
 					// sampling in an OVER accumulation. A max projection reads
 					// each sample independently, so correcting it would brighten
 					// coarse bricks instead of matching them.
-					let correctedA = select(1.0 - pow(1.0 - colorSample.a, max(slab * refPerLen, 1e-3)), colorSample.a, mip);
+					let correctedA = select(1.0 - pow(1.0 - colorSample.a, max(slab * refPerLen * params.lodOpacityScale, 1e-3)), colorSample.a, mip);
 					let premultiplied = vec4f(finalRGB * correctedA, correctedA);
 					if (mip) {
 						colAcc = max(colAcc, premultiplied);

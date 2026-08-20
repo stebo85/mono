@@ -5,6 +5,7 @@ import {
   invGamma,
   isPaqd,
   lodGammaExponent,
+  lodOpacityScale,
   SCENE_DEFAULTS,
   VOLUME_DEFAULTS,
 } from '@/NVConstants'
@@ -373,6 +374,11 @@ export class VolumeRenderer extends NVRenderer {
   // md.volume.lodBrightnessCompensation). 0 disables it. Multiplies into the
   // same shader exponent as `gamma`, per chunk.
   lodBrightnessCompensation = VOLUME_DEFAULTS.lodBrightnessCompensation
+  // Coefficient for the per-level coarse-brick OPACITY compensation (from
+  // md.volume.lodOpacityCompensation). 0 disables it, which is the default:
+  // it measures worse than the brightness compensation on dense structure.
+  // Scales the step-size opacity exponent, per chunk.
+  lodOpacityCompensation = VOLUME_DEFAULTS.lodOpacityCompensation
   // Samples per voxel along the ray in the 3D fine march (from md.volume.sampleRate).
   // Converges the ray integral at a proportional fragment cost. It does NOT remove
   // concentric banding on smooth structures (measured ring contrast is flat from 1
@@ -2879,7 +2885,13 @@ export class VolumeRenderer extends NVRenderer {
             chunkUniforms.lodDownsample ?? 1,
             this.lodBrightnessCompensation,
           ),
-        0,
+        // lodOpacityScale (offset 392, was the first _pad0 lane): scales the
+        // step-size opacity exponent for a coarse brick. 1 for every
+        // single-level and non-chunked draw, and for the default coefficient 0.
+        lodOpacityScale(
+          chunkUniforms.lodDownsample ?? 1,
+          this.lodOpacityCompensation,
+        ),
         0,
         ...chunkUniforms.volumeTexDimsFull,
         1,

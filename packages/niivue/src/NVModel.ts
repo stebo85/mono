@@ -330,6 +330,9 @@ export default class NVModel {
       ...(options.volumeLodBrightnessCompensation !== undefined && {
         lodBrightnessCompensation: options.volumeLodBrightnessCompensation,
       }),
+      ...(options.volumeLodOpacityCompensation !== undefined && {
+        lodOpacityCompensation: options.volumeLodOpacityCompensation,
+      }),
     }
     // Mesh — flat options mapped to mesh group
     this.mesh = {

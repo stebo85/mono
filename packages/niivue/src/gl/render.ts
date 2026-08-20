@@ -38,6 +38,7 @@ import {
   type ChunkPlan,
   chunkLodDownsample,
   chunkVolume,
+  dimsDownsample,
   matchChunksByContent,
   needsChunking,
   planSupportsCubic,
@@ -2334,6 +2335,13 @@ export class VolumeRenderer extends NVRenderer {
         // texture drives the first in-tissue sample to alpha 1 and the cube
         // renders as a dark surface shell instead of an integrated backdrop.
         rayStepTexVox: this.coarseFloorDims ?? cu.volumeTexDimsFull,
+        // The floor is not a member of `plan.chunks`, so its downsample
+        // comes from its own dims. It is usually the coarsest data on
+        // screen: uncompensated, it puts the scene's largest brightness
+        // step right at the edge of the resident fine region.
+        lodDownsample: this.coarseFloorDims
+          ? dimsDownsample(entry.plan.volumeDims, this.coarseFloorDims)
+          : 1,
         // The floor is one whole-volume texture, so the cubic kernel is always
         // safely fed here. It still follows the fine bricks' verdict: when their
         // halo is too thin and cubic is refused, a cubic floor under trilinear

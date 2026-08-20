@@ -113,6 +113,7 @@ const PROPS_RW = [
   ["volumeIsCubicInterpolation", "volume_is_cubic_interpolation"],
   ["volumeIsNearestInterpolation", "volume_is_nearest_interpolation"],
   ["volumeIsV1SliceShader", "volume_is_v1_slice_shader"],
+  ["volumeLodBrightnessCompensation", "volume_lod_brightness_compensation"],
   ["volumeMatcap", "volume_matcap"],
   ["volumeOutlineWidth", "volume_outline_width"],
   ["volumePaqdUniforms", "volume_paqd_uniforms"],

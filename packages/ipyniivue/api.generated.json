@@ -1075,6 +1075,17 @@
       "doc": null
     },
     {
+      "jsName": "volumeLodBrightnessCompensation",
+      "pyName": "volume_lod_brightness_compensation",
+      "tsType": "number",
+      "pyTraitlet": {
+        "kind": "Float"
+      },
+      "hasGetter": true,
+      "hasSetter": true,
+      "doc": null
+    },
+    {
       "jsName": "volumeMatcap",
       "pyName": "volume_matcap",
       "tsType": "string",

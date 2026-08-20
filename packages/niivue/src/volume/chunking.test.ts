@@ -8,6 +8,7 @@ import {
   chunkVolume,
   chunkVolumeGrid,
   chunkVolumeMultiLOD,
+  dimsDownsample,
   identityChunkSampleTransform,
   matchChunksByContent,
   needsChunking,
@@ -576,6 +577,29 @@ describe('identityChunkSampleTransform', () => {
     const a = chunkSampleTransform(plan, 0)
     const b = identityChunkSampleTransform([100, 200, 300])
     expect(a).toEqual(b)
+  })
+})
+
+describe('dimsDownsample', () => {
+  test('is 1 when the data is already the full grid', () => {
+    expect(dimsDownsample([512, 512, 512], [512, 512, 512])).toBe(1)
+  })
+
+  test('is the isotropic ratio', () => {
+    expect(dimsDownsample([512, 512, 512], [64, 64, 64])).toBeCloseTo(8, 10)
+  })
+
+  test('is the geometric mean for an anisotropic floor', () => {
+    // The pawpawsaurus coarse floor: 958/119, 646/161, 1088/136.
+    expect(dimsDownsample([958, 646, 1088], [119, 161, 136])).toBeCloseTo(
+      Math.cbrt((958 / 119) * (646 / 161) * (1088 / 136)),
+      10,
+    )
+  })
+
+  test('is 1 for a degenerate or upsampled grid', () => {
+    expect(dimsDownsample([512, 512, 512], [0, 64, 64])).toBe(1)
+    expect(dimsDownsample([64, 64, 64], [512, 512, 512])).toBe(1)
   })
 })
 

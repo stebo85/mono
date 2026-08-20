@@ -329,9 +329,22 @@ export function chunkLodDownsample(
   if (level === 0 || !plan.levelDims) return 1
   const dims = plan.levelDims[level]
   if (!dims) return 1
+  return dimsDownsample(plan.volumeDims, dims)
+}
+
+/**
+ * `chunkLodDownsample` for data whose dims are known directly rather than via a
+ * plan level — the coarse floor, which is its own whole-volume texture and is
+ * not a member of `plan.chunks`.
+ *
+ * The floor is typically the COARSEST data on screen, so leaving it
+ * uncompensated puts the largest brightness step in the scene exactly at the
+ * boundary of the resident fine region, which is where it is most visible.
+ */
+export function dimsDownsample(volumeDims: Vec3i, dataDims: Vec3i): number {
   let product = 1
   for (let a = 0; a < 3; a++) {
-    const ratio = plan.volumeDims[a] / dims[a]
+    const ratio = volumeDims[a] / dataDims[a]
     if (!Number.isFinite(ratio) || ratio <= 0) return 1
     product *= ratio
   }

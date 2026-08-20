@@ -204,6 +204,7 @@ first such interaction warns). Turn one off before turning the other on.
     volume_is_cubic_interpolation = traitlets.Bool(None, allow_none=True).tag(sync=True)
     volume_is_nearest_interpolation = traitlets.Bool(None, allow_none=True).tag(sync=True)
     volume_is_v1_slice_shader = traitlets.Bool(None, allow_none=True).tag(sync=True)
+    volume_lod_brightness_compensation = traitlets.Float(None, allow_none=True).tag(sync=True)
     volume_matcap = traitlets.Unicode(None, allow_none=True).tag(sync=True)
     volume_outline_width = traitlets.Float(None, allow_none=True).tag(sync=True)
     volume_paqd_uniforms = traitlets.List(trait=traitlets.Float(None, allow_none=True), default_value=None, minlen=4, maxlen=4, allow_none=True).tag(sync=True)

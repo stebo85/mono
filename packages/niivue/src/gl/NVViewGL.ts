@@ -522,6 +522,16 @@ export default class NVGlview {
     // Display gamma for the classified RGB of every volume sample (alpha, and
     // therefore occlusion, is untouched).
     this.volumeRenderer.gamma = md.scene.gamma
+    // Per-level brightness compensation for coarse multi-LOD bricks. Folds into
+    // the same shader exponent as `gamma`, but per chunk, so it is a no-op for
+    // single-level and non-chunked volumes whatever the coefficient.
+    this.volumeRenderer.lodBrightnessCompensation =
+      md.volume.lodBrightnessCompensation
+    // 2D slice tiles read the same two exponents so a slice and the 3D render
+    // panel agree on brightness.
+    this.sliceRenderer.gamma = md.scene.gamma
+    this.sliceRenderer.lodBrightnessCompensation =
+      md.volume.lodBrightnessCompensation
     // Off-screen after viewport transform: skip the entire render pass — scissor would
     // clip everything and the work is wasted. preserveDrawingBuffer keeps prior pixels.
     if (this._isSubCanvasBounds && this._isBoundsOffscreen) return

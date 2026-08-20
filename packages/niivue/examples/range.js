@@ -449,6 +449,8 @@ const els = {
   samplesVal: el('samplesVal'),
   gamma: el('gamma'),
   gammaVal: el('gammaVal'),
+  lodComp: el('lodComp'),
+  lodCompVal: el('lodCompVal'),
   interp: el('interp'),
   blocks: el('blocks'),
   crosshair: el('crosshair'),
@@ -1286,6 +1288,26 @@ function applyGamma() {
   nv.gamma = g
 }
 
+// Per-level brightness compensation for coarse multi-LOD bricks. Downsampling
+// averages voxels, which destroys the correlation between a sample's colour and
+// its opacity; front-to-back compositing weights colour by opacity, so a coarse
+// brick integrates darker than the fine data it replaces. The shader lifts each
+// brick by exponent 1 - c*(k-1) for its linear downsample factor k, on top of
+// the display gamma. Slide to 0 to see the uncompensated LOD seam.
+//
+// The size of the deficit depends on how much intensity varies inside a fine
+// voxel, so no single coefficient is exact: 0.022 was fitted on dense structure
+// (residual under 4%, down from 16% at level 3) and undercorrects sparse thin
+// material, which is why this is a slider and not a constant.
+function applyLodCompensation() {
+  const c = Number(els.lodComp.value)
+  els.lodCompVal.textContent = c.toFixed(3)
+  if (!nv) return
+  // Render-time only: it changes one shader exponent per brick, so there is no
+  // re-stream and the setter already redraws.
+  nv.volumeLodBrightnessCompensation = c
+}
+
 // Texture reconstruction in the 3D fine march: hardware trilinear (default) or
 // tricubic B-spline. Trilinear is only C0, so band edges carry a blocky texel
 // staircase; the cubic filter is C2 and removes it (it does NOT remove the
@@ -1754,6 +1776,7 @@ async function main() {
   // current position into the fresh instance rather than assuming the default.
   applySampleRate()
   applyGamma()
+  applyLodCompensation()
   applyInterp()
 
   els.source.addEventListener('change', async () => {
@@ -1781,6 +1804,7 @@ async function main() {
   els.zoom.addEventListener('input', applyZoom)
   els.samples.addEventListener('input', applySampleRate)
   els.gamma.addEventListener('input', applyGamma)
+  els.lodComp.addEventListener('input', applyLodCompensation)
   els.interp.addEventListener('change', applyInterp)
   els.blocks.addEventListener('change', applyBlocks)
   els.crosshair.addEventListener('change', applyCrosshair)

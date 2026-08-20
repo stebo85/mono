@@ -794,6 +794,16 @@ export default class NVView {
     // Display gamma for the classified RGB of every volume sample (alpha, and
     // therefore occlusion, is untouched).
     this.volumeRenderer.gamma = md.scene.gamma
+    // Per-level brightness compensation for coarse multi-LOD bricks. Folds into
+    // the same shader exponent as `gamma`, but per chunk, so it is a no-op for
+    // single-level and non-chunked volumes whatever the coefficient.
+    this.volumeRenderer.lodBrightnessCompensation =
+      md.volume.lodBrightnessCompensation
+    // 2D slice tiles read the same two exponents so a slice and the 3D render
+    // panel agree on brightness.
+    this.sliceRenderer.gamma = md.scene.gamma
+    this.sliceRenderer.lodBrightnessCompensation =
+      md.volume.lodBrightnessCompensation
     markCpuStart()
     // Phase 3d: advance the chunk-residency LRU clock before the tile loop
     // requests this frame's working set, so eviction protects visible chunks.

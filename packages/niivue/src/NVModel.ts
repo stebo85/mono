@@ -327,6 +327,9 @@ export default class NVModel {
       ...(options.volumeIsCubicInterpolation !== undefined && {
         isCubicInterpolation: options.volumeIsCubicInterpolation,
       }),
+      ...(options.volumeLodBrightnessCompensation !== undefined && {
+        lodBrightnessCompensation: options.volumeLodBrightnessCompensation,
+      }),
     }
     // Mesh — flat options mapped to mesh group
     this.mesh = {

@@ -310,6 +310,36 @@ export const LINEAR_MIN_HALO = 1
 export const CUBIC_MIN_HALO = 2
 
 /**
+ * Linear downsample factor of a brick's source pyramid level relative to the
+ * common (finest) grid — the geometric mean of the three per-axis ratios, so a
+ * pyramid that decimates anisotropically still yields one scalar.
+ *
+ * 1 for the finest level, for single-level plans (no `levelDims`), and for
+ * non-chunked draws. Consumers use it to compensate the brightness a coarse
+ * brick loses in the ray-march: averaging voxels destroys the correlation
+ * between a sample's colour and its opacity, and front-to-back compositing
+ * weights colour by opacity, so a downsampled brick integrates darker than the
+ * fine data it stands in for. See `lodGammaExponent`.
+ */
+export function chunkLodDownsample(
+  plan: ChunkPlan,
+  desc: VolumeChunkDesc,
+): number {
+  const level = desc.sourceLevel ?? 0
+  if (level === 0 || !plan.levelDims) return 1
+  const dims = plan.levelDims[level]
+  if (!dims) return 1
+  let product = 1
+  for (let a = 0; a < 3; a++) {
+    const ratio = plan.volumeDims[a] / dims[a]
+    if (!Number.isFinite(ratio) || ratio <= 0) return 1
+    product *= ratio
+  }
+  const k = Math.cbrt(product)
+  return Number.isFinite(k) && k > 1 ? k : 1
+}
+
+/**
  * True when every brick in `plan` carries enough halo for a reconstruction
  * kernel that reaches `minHalo` voxels past a face, so no sample inside a
  * brick's owned region reads fabricated (clamp-to-edge) data at an INTERNAL
@@ -433,6 +463,13 @@ export interface ChunkSampleTransform {
   dataSize: Vec3f
   /** Full volume voxel dims (texture-size-independent sub-voxel math). */
   volumeDims: Vec3f
+  /**
+   * Linear downsample factor of this chunk's source pyramid level relative to
+   * the finest grid (see `chunkLodDownsample`). 1 for the identity transform
+   * and for every single-level plan; consumers use it to compensate the
+   * brightness a coarse brick loses.
+   */
+  lodDownsample: number
 }
 
 /** Build the sampling transform for a single chunk of a plan. */
@@ -469,6 +506,7 @@ export function chunkSampleTransform(
       (tz - desc.haloLow[2] - desc.haloHigh[2]) / tz,
     ],
     volumeDims: [vx, vy, vz],
+    lodDownsample: chunkLodDownsample(plan, desc),
   }
 }
 
@@ -482,6 +520,7 @@ export function identityChunkSampleTransform(
     dataOrigin: [0, 0, 0],
     dataSize: [1, 1, 1],
     volumeDims,
+    lodDownsample: 1,
   }
 }
 

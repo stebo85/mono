@@ -103,9 +103,9 @@ vec3 layerShade(sampler3D tex, vec3 p, float amount) {
 // sample occludes what is behind it (the ray would saturate sooner and the image
 // would get flatter, not brighter). Mirrors applyGamma in wgpu/volumeShaderLib.ts
 // -- keep the two in step.
-vec3 applyGamma(vec3 rgb) {
-  if (invGamma == 1.0) { return rgb; }
-  return pow(max(rgb, vec3(0.0)), vec3(invGamma));
+vec3 applyGamma(vec3 rgb, float e) {
+  if (e == 1.0) { return rgb; }
+  return pow(max(rgb, vec3(0.0)), vec3(e));
 }
 
 // Tricubic B-spline reconstruction in 8 hardware-trilinear fetches
@@ -185,7 +185,11 @@ RayResult rayMarchPass(
     vec4 deltaDir, vec4 deltaDirFast,
     float ran, float earlyTermination,
     float clipLo, float clipHi, float clipMode,
-    float shadeAmount, bool mip
+    float shadeAmount,
+    // Display-gamma exponent for this layer's classified colour. Intensity-
+    // derived layers pass invGamma; the drawing layer passes 1.0, because its
+    // colours are categorical label swatches, not brightness.
+    float gammaExp, bool mip
 ) {
     RayResult result;
     result.color = vec4(0.0);
@@ -227,7 +231,7 @@ RayResult rayMarchPass(
                 result.firstHit = samplePos;
             }
             result.farthest = samplePos.a;
-            vec3 rgb = applyGamma(colorSample.rgb);
+            vec3 rgb = applyGamma(colorSample.rgb, gammaExp);
             if (shadeAmount > 0.0) {
                 // colorSample.rgb is straight (non-premultiplied) here, so
                 // clamping the lit colour to 1.0 keeps the premultiplied
@@ -574,7 +578,7 @@ void main() {
           float lightingAmount = localGradientAmount;
           vec3 mc_rgb = texture(matcap, uv).rgb * (1.0 + (lightingAmount / 3.0));
           vec3 blendedRGB = mix(vec3(1.0), mc_rgb, lightingAmount);
-          vec3 finalRGB = blendedRGB * applyGamma(colorSample.rgb);
+          vec3 finalRGB = blendedRGB * applyGamma(colorSample.rgb, invGamma);
           // Step-size correction compensates a coarse brick's sparser sampling
           // in an OVER accumulation. A max projection reads each sample
           // independently, so correcting it would brighten coarse bricks
@@ -646,7 +650,7 @@ void main() {
   // drag, so a cached gradient would thrash), so lighting comes from the
   // in-shader stencil — per sample, since an overlay stack is translucent.
   if (textureSize(overlay, 0).x > 2) {
-    RayResult result = rayMarchPass(overlay, origStart, dir, origLen, deltaDir, deltaDirFast, origRan, localEarlyTermination, ovClipLo, ovClipHi, ovClipMode, gradientAmount, mip);
+    RayResult result = rayMarchPass(overlay, origStart, dir, origLen, deltaDir, deltaDirFast, origRan, localEarlyTermination, ovClipLo, ovClipHi, ovClipMode, gradientAmount, invGamma, mip);
     depthAwareMix(colAcc, result, backNearest, fragDepth, depthFactor, mip);
   }
   // PAQD pass (raw data with GPU-side LUT lookup + easing)
@@ -656,7 +660,7 @@ void main() {
   }
   // Drawing pass (nearest-neighbor sampling — NEAREST filter set by CPU)
   if (textureSize(drawing, 0).x > 2) {
-    RayResult result = rayMarchPass(drawing, origStart, dir, origLen, deltaDir, deltaDirFast, origRan, localEarlyTermination, ovClipLo, ovClipHi, ovClipMode, 0.0, mip);
+    RayResult result = rayMarchPass(drawing, origStart, dir, origLen, deltaDir, deltaDirFast, origRan, localEarlyTermination, ovClipLo, ovClipHi, ovClipMode, 0.0, 1.0, mip);
     // Matcap lighting at FIRST HIT only (unlike the overlay, which shades every
     // sample): a drawing is a label mask read as an opaque surface, so one
     // shade for the whole ray is both correct and far cheaper. The gradient is

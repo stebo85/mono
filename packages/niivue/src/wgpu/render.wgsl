@@ -85,7 +85,12 @@ fn rayMarchPass(
     deltaDir: vec4f, deltaDirFast: vec4f,
     ran: f32, earlyTermination: f32,
     clipLo: f32, clipHi: f32, clipMode: f32,
-    shadeAmount: f32, mip: bool
+    shadeAmount: f32,
+    // Display-gamma exponent for this layer's classified colour. Intensity-
+    // derived layers pass params.invGamma; the drawing layer passes 1.0,
+    // because its colours are categorical label swatches, not brightness.
+    gammaExp: f32,
+    mip: bool
 ) -> RayMarchResult {
     var result: RayMarchResult;
     result.color = vec4f(0.0);
@@ -127,7 +132,7 @@ fn rayMarchPass(
                 result.firstHit = samplePos;
             }
             result.farthest = samplePos.a;
-            var rgb = applyGamma(colorSample.rgb, params.invGamma);
+            var rgb = applyGamma(colorSample.rgb, gammaExp);
             if (shadeAmount > 0.0) {
                 // colorSample.rgb is straight (non-premultiplied) here, so
                 // clamping the lit colour to 1.0 keeps the premultiplied
@@ -561,7 +566,7 @@ fn fragment_main(in: VertexOutput) -> FragmentOutput {
 	// drag, so a cached gradient would thrash), so lighting comes from the
 	// in-shader stencil — per sample, since an overlay stack is translucent.
 	if (textureDimensions(overlay, 0).x > 2) {
-		let result = rayMarchPass(overlay, tex_sampler, origStart, dir, origLen, deltaDir, deltaDirFast, origRan, earlyTermination, ovClipLo, ovClipHi, ovClipMode, params.gradientAmount, mip);
+		let result = rayMarchPass(overlay, tex_sampler, origStart, dir, origLen, deltaDir, deltaDirFast, origRan, earlyTermination, ovClipLo, ovClipHi, ovClipMode, params.gradientAmount, params.invGamma, mip);
 		depthAwareMix(&colAcc, result, backNearest, &fragDepth, depthFactor, mip);
 	}
 	// PAQD pass (raw data with GPU-side LUT lookup + easing)
@@ -571,7 +576,7 @@ fn fragment_main(in: VertexOutput) -> FragmentOutput {
 	}
 	// Drawing pass (nearest-neighbor sampling for ray-march, linear for gradient)
 	if (textureDimensions(drawing, 0).x > 2) {
-		var result = rayMarchPass(drawing, nearest_sampler, origStart, dir, origLen, deltaDir, deltaDirFast, origRan, earlyTermination, ovClipLo, ovClipHi, ovClipMode, 0.0, mip);
+		var result = rayMarchPass(drawing, nearest_sampler, origStart, dir, origLen, deltaDir, deltaDirFast, origRan, earlyTermination, ovClipLo, ovClipHi, ovClipMode, 0.0, 1.0, mip);
 		// Matcap lighting at FIRST HIT only (unlike the overlay, which shades
 		// every sample): a drawing is a label mask read as an opaque surface,
 		// so one shade for the whole ray is both correct and far cheaper.

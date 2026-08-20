@@ -85,6 +85,20 @@ A brick with no resident texture draws **nothing**, so without a floor the scene
 
 The floor is what the cross-fade dissolves into, so with no floor installed there is no fade either: `fadeFraction` returns 1 immediately and chunks pop in at full strength.
 
+### Per-level brightness compensation
+
+A coarse brick does not merely look softer than the fine data it stands in for: it looks **darker**. Downsampling averages voxels, which destroys the correlation between a sample's colour and its opacity, and front-to-back compositing weights each sample's colour by its opacity. The averaged brick therefore integrates to less light than the fine data over the same span, and the boundary between a level-0 brick and its level-3 neighbour reads as a brightness step, not just a sharpness one.
+
+`volumeLodBrightnessCompensation` (default `0.022`, range `[0, 0.2]`, `0` disables) lifts each brick by an exponent derived from its own pyramid level:
+
+```
+e = 1 - coefficient * (k - 1)
+```
+
+where `k` is the brick's linear downsample factor relative to the finest grid — the geometric mean of the three per-axis ratios, so an anisotropically decimated pyramid still yields one scalar (`chunkLodDownsample` in `src/volume/chunking.ts`). The shaders multiply `e` into the same exponent that carries `scene.gamma` and raise only the classified RGB to it, so alpha, occlusion and thresholding are untouched. `k` is 1 for the finest level, for single-level plans, and for non-chunked volumes, which makes the whole feature an exact no-op outside multi-LOD plans whatever the coefficient is.
+
+The size of the deficit depends on how much intensity varies inside one fine voxel, so no coefficient is exact for all data. `0.022` was fitted on dense structure, where it cuts the mean brightness error across levels 1-3 from about 16% to under 4%; it **undercorrects sparse thin material**, which can still read roughly 50% dark at level 3. That is why it is a tunable render-time setting rather than a baked constant. The range demo (`examples/range.html`) exposes it as a slider next to `gamma` for A/B comparison.
+
 ---
 
 ## 5. The GPU Upload Pipeline
@@ -153,6 +167,8 @@ Per-frame draw flow on the chunked path:
 | 4. Stream misses | `uploadChunk(index)` for any not yet resident | `wgpu/orientChunked.ts` / `gl/orientChunked.ts` |
 | 5. Evict under budget | LRU drop of chunks not touched this frame | `ChunkResidencyManager._evictToFit` |
 | 6. Draw | One cube draw per chunk, OVER blended | `wgpu/render.ts:_drawChunked` / `gl/render.ts:_drawChunkedVolume` |
+
+Both the 3D ray-march and the 2D slice shaders raise their classified RGB to one exponent per draw: the reciprocal of `scene.gamma` times the brick's per-level compensation (above). It is a draw-time uniform, deliberately not baked into the stage 1 colour texture — baking would force a re-upload of every resident chunk on each slider tick, add a second 8-bit quantization, and freeze the coefficient at upload time. The exponent reaches intensity-derived layers only; the drawing layer passes `1.0`, since its colours are categorical label swatches rather than brightness.
 
 Frame-order contract: `beginFrame()` must run **before** the working-set request, so working-set chunks carry the current frame stamp and a same-frame `admit` cannot evict the chunks the renderer is about to draw.
 

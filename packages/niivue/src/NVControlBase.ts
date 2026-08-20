@@ -45,9 +45,11 @@ import type { WriteOptions } from '@/mesh/writers'
 import {
   DRAG_MODE,
   GAMMA_RANGE,
+  LOD_BRIGHTNESS_RANGE,
   NUM_CLIP_PLANE,
   SLICE_TYPE,
   sliceTypeDim,
+  VOLUME_DEFAULTS,
 } from '@/NVConstants'
 import * as NVDocument from '@/NVDocument'
 import type {
@@ -1345,6 +1347,29 @@ export default class NiiVue extends EventTarget {
     this.emit('change', {
       property: 'volumeIsCubicInterpolation',
       value: v,
+    })
+    this.drawScene()
+  }
+
+  /**
+   * Coefficient for the per-level brightness compensation applied to coarse
+   * multi-LOD bricks; 0 disables it, clamped to [0, 0.2]. A coarse brick
+   * integrates darker than the fine data it stands in for (averaging voxels
+   * destroys the colour/opacity correlation that front-to-back compositing
+   * weights by), which reads as a brightness step at a LOD boundary. Empirical:
+   * it holds for dense structure and undercorrects sparse material. See
+   * VolumeRenderConfig.lodBrightnessCompensation.
+   */
+  get volumeLodBrightnessCompensation(): number {
+    return this.model.volume.lodBrightnessCompensation
+  }
+  set volumeLodBrightnessCompensation(v: number) {
+    this.model.volume.lodBrightnessCompensation = Number.isFinite(v)
+      ? Math.min(Math.max(v, LOD_BRIGHTNESS_RANGE[0]), LOD_BRIGHTNESS_RANGE[1])
+      : VOLUME_DEFAULTS.lodBrightnessCompensation
+    this.emit('change', {
+      property: 'volumeLodBrightnessCompensation',
+      value: this.model.volume.lodBrightnessCompensation,
     })
     this.drawScene()
   }

@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test'
 import {
   type ChunkPlan,
   chunkAtVoxel,
+  chunkLodDownsample,
   chunkSampleTransform,
   chunksCrossingSlice,
   chunkVolume,
@@ -567,6 +568,7 @@ describe('identityChunkSampleTransform', () => {
     expect(t.dataOrigin).toEqual([0, 0, 0])
     expect(t.dataSize).toEqual([1, 1, 1])
     expect(t.volumeDims).toEqual([64, 128, 256])
+    expect(t.lodDownsample).toBe(1)
   })
 
   test('matches chunkSampleTransform for a single-chunk plan', () => {
@@ -574,6 +576,94 @@ describe('identityChunkSampleTransform', () => {
     const a = chunkSampleTransform(plan, 0)
     const b = identityChunkSampleTransform([100, 200, 300])
     expect(a).toEqual(b)
+  })
+})
+
+describe('chunkLodDownsample', () => {
+  const desc = (sourceLevel?: number): VolumeChunkDesc => ({
+    voxelOrigin: [0, 0, 0],
+    voxelDims: [64, 64, 64],
+    haloLow: [0, 0, 0],
+    haloHigh: [0, 0, 0],
+    texDims: [64, 64, 64],
+    texOrigin: [0, 0, 0],
+    gridIndex: [0, 0, 0],
+    ...(sourceLevel === undefined ? {} : { sourceLevel }),
+  })
+
+  const planWith = (levelDims: Vec3i[]): ChunkPlan => ({
+    gridDims: [8, 8, 8],
+    stride: [64, 64, 64],
+    chunks: [],
+    volumeDims: [512, 512, 512],
+    deviceLimit: 2048,
+    haloSize: [0, 0, 0],
+    levelDims,
+  })
+
+  test('is 1 for a single-level plan (no levelDims)', () => {
+    const plan = chunkVolume([100, 200, 300], 2048)
+    expect(chunkLodDownsample(plan, plan.chunks[0])).toBe(1)
+  })
+
+  test('is 1 for a finest-level brick', () => {
+    const plan = planWith([
+      [512, 512, 512],
+      [256, 256, 256],
+    ])
+    expect(chunkLodDownsample(plan, desc(0))).toBe(1)
+  })
+
+  test('returns the linear ratio for an isotropic pyramid', () => {
+    const plan = planWith([
+      [512, 512, 512],
+      [256, 256, 256],
+      [128, 128, 128],
+      [64, 64, 64],
+    ])
+    expect(chunkLodDownsample(plan, desc(1))).toBeCloseTo(2, 10)
+    expect(chunkLodDownsample(plan, desc(2))).toBeCloseTo(4, 10)
+    expect(chunkLodDownsample(plan, desc(3))).toBeCloseTo(8, 10)
+  })
+
+  test('takes the geometric mean when a pyramid decimates anisotropically', () => {
+    // 4x in x, 2x in y, 1x in z -> cbrt(8) = 2.
+    const plan = planWith([
+      [512, 512, 512],
+      [128, 256, 512],
+    ])
+    expect(chunkLodDownsample(plan, desc(1))).toBeCloseTo(2, 10)
+  })
+
+  test('is 1 for a missing or degenerate level entry', () => {
+    const plan = planWith([
+      [512, 512, 512],
+      [0, 256, 256],
+    ])
+    // Out of range.
+    expect(chunkLodDownsample(plan, desc(5))).toBe(1)
+    // A zero dim would divide by zero.
+    expect(chunkLodDownsample(plan, desc(1))).toBe(1)
+  })
+
+  test('a real multi-LOD plan reports each brick its level ratio', () => {
+    const plan = chunkVolumeMultiLOD(
+      [
+        [512, 512, 512],
+        [256, 256, 256],
+        [128, 128, 128],
+        [64, 64, 64],
+      ],
+      { center: [256, 256, 256], radius: 8 },
+      2048,
+      { cellEdge: 64 },
+    )
+    plan.chunks.forEach((c, i) => {
+      const k = chunkLodDownsample(plan, c)
+      expect(k).toBeCloseTo(2 ** (c.sourceLevel ?? 0), 10)
+      // The sampling transform carries the same factor to the slice shaders.
+      expect(chunkSampleTransform(plan, i).lodDownsample).toBeCloseTo(k, 10)
+    })
   })
 })
 

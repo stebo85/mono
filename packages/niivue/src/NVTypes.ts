@@ -720,6 +720,26 @@ export type VolumeRenderConfig = {
    * defaults to a halo of 1; pass `halo: [2, 2, 2]` (or wider) when enabling this.
    */
   isCubicInterpolation: boolean
+  /**
+   * Coefficient for the per-level brightness compensation applied to bricks
+   * fetched from a coarse pyramid level of a multi-LOD chunked volume. 0
+   * disables it; clamped to [0, 0.2].
+   *
+   * A coarse brick renders DARKER than the fine data it stands in for:
+   * downsampling averages voxels, destroying the correlation between a sample's
+   * colour and its opacity, and front-to-back compositing weights colour by
+   * opacity. Measured on a real OME-Zarr pyramid the deficit reaches 16% by
+   * level 3, which reads as a visible brightness step at a LOD boundary. Each
+   * brick's classified RGB is therefore raised to `1 - coefficient * (k - 1)`,
+   * where k is its linear downsample factor (see `lodGammaExponent`); this
+   * multiplies with the display `scene.gamma` exponent and, like it, leaves
+   * alpha untouched, so it changes brightness without changing occlusion.
+   *
+   * The default is an empirical fit and is honest only for dense structure;
+   * sparse thin material loses far more and stays undercorrected. Non-chunked
+   * and single-level volumes are unaffected (k is 1 for every draw).
+   */
+  lodBrightnessCompensation: number
 }
 
 /** Mesh rendering config: global settings for mesh display */
@@ -998,6 +1018,8 @@ export type NiiVueOptions = {
   volumeSampleRate?: number
   /** Tricubic B-spline reconstruction in the 3D ray-march. See VolumeRenderConfig.isCubicInterpolation. */
   volumeIsCubicInterpolation?: boolean
+  /** Per-level brightness compensation for coarse multi-LOD bricks, [0, 0.2]; 0 disables. See VolumeRenderConfig.lodBrightnessCompensation. */
+  volumeLodBrightnessCompensation?: number
 
   // Mesh (prefixed)
   meshXRay?: number

@@ -125,6 +125,39 @@ export function invGamma(gamma: number): number {
   return 1 / Math.min(Math.max(gamma, GAMMA_RANGE[0]), GAMMA_RANGE[1])
 }
 
+/** Accepted range for volume.lodBrightnessCompensation. 0 disables it. */
+export const LOD_BRIGHTNESS_RANGE: [number, number] = [0, 0.2]
+
+/**
+ * Shader exponent that compensates the brightness a coarse pyramid brick loses
+ * relative to the finest level, for a brick whose linear downsample factor is
+ * `downsample` (see `chunkLodDownsample`).
+ *
+ * Downsampling averages voxels, which destroys the correlation between a
+ * sample's colour and its opacity; since front-to-back compositing weights
+ * colour by opacity, the coarse brick integrates darker than the fine data it
+ * stands in for. The deficit grows with the downsample factor, so the exponent
+ * falls below 1 (which brightens) in proportion to `downsample - 1`.
+ *
+ * This is an EMPIRICAL heuristic, not a derivation: the true deficit depends on
+ * the intensity variance inside each coarse voxel, which is data-dependent. The
+ * default coefficient was fitted by simulating the ray-march over a real
+ * OME-Zarr pyramid, and it holds well for dense structure (residual error under
+ * 4% across levels 1-3, down from 16%) while UNDERCORRECTING sparse, thin
+ * material, where the correlation loss is far larger than any single global
+ * exponent can absorb. Set the coefficient to 0 to disable it.
+ */
+export function lodGammaExponent(
+  downsample: number,
+  coefficient: number,
+): number {
+  if (!Number.isFinite(downsample) || !Number.isFinite(coefficient)) return 1
+  if (downsample <= 1 || coefficient <= 0) return 1
+  const beta = Math.min(coefficient, LOD_BRIGHTNESS_RANGE[1])
+  // Floored so a brick from a very deep pyramid level cannot be blown out.
+  return Math.max(0.25, 1 - beta * (downsample - 1))
+}
+
 /** Maps AXIAL→2, CORONAL→1, SAGITTAL→0 (the RAS dimension perpendicular to the slice). */
 export function sliceTypeDim(sliceType: number): number {
   if (sliceType === SLICE_TYPE.CORONAL) return 1
@@ -229,6 +262,7 @@ export const VOLUME_DEFAULTS: VolumeRenderConfig = {
   renderMode: VOLUME_RENDER_MODE.COMPOSITE,
   sampleRate: 2,
   isCubicInterpolation: false,
+  lodBrightnessCompensation: 0.022,
 }
 
 export const MESH_DEFAULTS: MeshRenderConfig = {

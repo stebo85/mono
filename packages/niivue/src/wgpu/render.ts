@@ -4,6 +4,7 @@ import * as NVShapes from '@/mesh/NVShapes'
 import {
   invGamma,
   isPaqd,
+  lodGammaExponent,
   SCENE_DEFAULTS,
   VOLUME_DEFAULTS,
 } from '@/NVConstants'
@@ -33,6 +34,7 @@ import {
 } from '@/volume/chunkBudget'
 import {
   type ChunkPlan,
+  chunkLodDownsample,
   chunkVolume,
   matchChunksByContent,
   needsChunking,
@@ -160,6 +162,12 @@ interface ChunkUniforms {
    * coarse floor, which is one whole-volume texture).
    */
   cubicSafe?: boolean
+  /**
+   * Linear downsample factor of this brick's source pyramid level relative to
+   * the finest grid (see chunkLodDownsample). 1 for single-level plans and
+   * non-chunked draws; drives the per-level brightness compensation.
+   */
+  lodDownsample?: number
 }
 
 /** Single-texture volume: fits within maxTextureDimension3D on all axes. */
@@ -276,6 +284,7 @@ function chunkUniformsFor(plan: ChunkPlan, chunkIndex: number): ChunkUniforms {
       (tz - desc.haloLow[2] - desc.haloHigh[2]) / tz,
     ],
     rayStepTexVox: [rayStep[0], rayStep[1], rayStep[2]],
+    lodDownsample: chunkLodDownsample(plan, desc),
   }
 }
 
@@ -359,6 +368,10 @@ export class VolumeRenderer extends NVRenderer {
   // classified RGB of every volume sample, never to alpha, so brightening does
   // not change how much a ray occludes. 1.0 is a strict no-op.
   gamma = SCENE_DEFAULTS.gamma
+  // Coefficient for the per-level coarse-brick brightness compensation (from
+  // md.volume.lodBrightnessCompensation). 0 disables it. Multiplies into the
+  // same shader exponent as `gamma`, per chunk.
+  lodBrightnessCompensation = VOLUME_DEFAULTS.lodBrightnessCompensation
   // Samples per voxel along the ray in the 3D fine march (from md.volume.sampleRate).
   // Converges the ray integral at a proportional fragment cost. It does NOT remove
   // concentric banding on smooth structures (measured ring contrast is flat from 1
@@ -2848,8 +2861,16 @@ export class VolumeRenderer extends NVRenderer {
           ? 1
           : 0,
         // invGamma (offset 388, was _pad0.y): the shader raises the classified
-        // RGB to this power, so pass the reciprocal of the user-facing gamma.
-        invGamma(this.gamma),
+        // RGB to this power. Two exponents compose here (pow is associative in
+        // the exponent): the reciprocal of the user-facing display gamma, and
+        // this brick's per-level compensation for the brightness a coarse
+        // pyramid level loses in the march. The latter is 1 for every
+        // single-level and non-chunked draw.
+        invGamma(this.gamma) *
+          lodGammaExponent(
+            chunkUniforms.lodDownsample ?? 1,
+            this.lodBrightnessCompensation,
+          ),
         0,
         0,
         ...chunkUniforms.volumeTexDimsFull,

@@ -3,6 +3,8 @@ import {
   GAMMA_RANGE,
   invGamma,
   isPaqd,
+  LOD_BRIGHTNESS_RANGE,
+  lodGammaExponent,
   NiiDataType,
   NiiIntentCode,
   SLICE_TYPE,
@@ -95,5 +97,50 @@ describe('invGamma', () => {
     // no-op rather than reach the shader.
     expect(invGamma(Number.NaN)).toBe(1)
     expect(invGamma(Number.POSITIVE_INFINITY)).toBe(1)
+  })
+})
+
+describe('lodGammaExponent', () => {
+  const beta = 0.022
+
+  test('is an exact no-op at the finest level', () => {
+    expect(lodGammaExponent(1, beta)).toBe(1)
+    // Below 1 is not a coarser level; treat it as no compensation.
+    expect(lodGammaExponent(0.5, beta)).toBe(1)
+  })
+
+  test('a zero coefficient disables it at every level', () => {
+    expect(lodGammaExponent(2, 0)).toBe(1)
+    expect(lodGammaExponent(8, 0)).toBe(1)
+  })
+
+  test('brightens more as the brick gets coarser', () => {
+    // Exponent < 1 raises a [0,1] colour, so a coarser brick is lifted further.
+    const a = lodGammaExponent(2, beta)
+    const b = lodGammaExponent(4, beta)
+    const c = lodGammaExponent(8, beta)
+    expect(a).toBeLessThan(1)
+    expect(b).toBeLessThan(a)
+    expect(c).toBeLessThan(b)
+  })
+
+  test('follows 1 - coefficient * (downsample - 1)', () => {
+    expect(lodGammaExponent(2, beta)).toBeCloseTo(1 - beta, 10)
+    expect(lodGammaExponent(4, beta)).toBeCloseTo(1 - 3 * beta, 10)
+  })
+
+  test('clamps the coefficient to the accepted range', () => {
+    const capped = lodGammaExponent(2, 10)
+    expect(capped).toBeCloseTo(1 - LOD_BRIGHTNESS_RANGE[1], 10)
+  })
+
+  test('floors the exponent so a deep pyramid cannot blow out', () => {
+    expect(lodGammaExponent(1e6, LOD_BRIGHTNESS_RANGE[1])).toBe(0.25)
+  })
+
+  test('non-finite inputs are a no-op rather than reaching the shader', () => {
+    expect(lodGammaExponent(Number.NaN, beta)).toBe(1)
+    expect(lodGammaExponent(Number.POSITIVE_INFINITY, beta)).toBe(1)
+    expect(lodGammaExponent(4, Number.NaN)).toBe(1)
   })
 })

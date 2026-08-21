@@ -6,6 +6,10 @@ Open follow-ups for the multi-LOD chunked volume path
 `docs/tiled-volumes.md`. Anything that changes rendering must land in BOTH
 backends in the same change.
 
+Order of work (Chris, 2026-08-21): fix the VISUAL artifacts first, then the
+performance items. The two visual items are at the bottom of this file; decode
+and budget plans wait behind them.
+
 ## Move chunk decode off the main thread
 
 - [ ] Decode OME-Zarr chunks in a worker instead of on the main thread.
@@ -34,59 +38,16 @@ backends in the same change.
 ## Budget plans
 
 - [ ] Give the planner named **budget plans** rather than one crosshair-focused
-  policy with a byte budget.
+      policy with a byte budget.
 
-  Today `loadChunkedVolume` always plans the same way: an octree focused on the
-  crosshair (or a pinned point), refined by `detail`, then coarsened until it
-  fits `budgetBytes` and `maxBricks`. That is the right policy for exploring a
-  volume interactively, and the wrong one for at least two other real uses:
+  Full design and staging: **`docs/budget-plans.md`**. In short: today's single
+  policy is right for interactive exploration, wrong for a static whole-volume
+  figure (which wants the finest UNIFORM level that fits) and wrong for smooth
+  rotation (which wants a frame-time budget, since bytes do not predict draw
+  cost). Presets `'focus'` / `'uniform'` / `'interactive'`, staged so the first
+  two are near-free and only `'interactive'` needs a new cost model.
 
-  | Use case | What the user wants | What they get today |
-  | --- | --- | --- |
-  | Static image of the whole volume | The finest UNIFORM level that fits VRAM, no focus falloff, quality everywhere | A sharp core around the crosshair and a coarse periphery, which is wrong for a figure |
-  | Smooth rotate/zoom | The finest detail that still holds a frame-rate target | A byte budget, which does not predict frame time: brick count and total sampled voxels do |
-  | Interactive exploration (current) | Detail where you are looking | Correct |
-
-  Proposed API: a `budgetPlan` option on `loadChunkedVolume` taking either a
-  preset name or an explicit object, so the presets stay readable and the
-  escape hatch stays open.
-
-  ```ts
-  nv.loadChunkedVolume(url, { budgetPlan: 'uniform' })
-  nv.loadChunkedVolume(url, { budgetPlan: { ...BUDGET_PLANS.interactive, budgetBytes: 2e9 } })
-  ```
-
-  Presets to start with:
-
-  - `'focus'` (default, current behaviour): crosshair-follow, `radius: 'auto'`,
-    `detail: 1`, byte-budgeted.
-  - `'uniform'`: no falloff. Every brick at the finest level that fits the
-    budget. Mechanically this already works today by planning with a radius
-    that covers the whole volume: the `detail` shrink pass then has nothing to
-    do and the budget pass raises the global level floor, which converges
-    exactly to "finest uniform level that fits". What is missing is the name,
-    the default of not subscribing `locationChange`, and the docs.
-  - `'interactive'`: budgeted by draw cost, not VRAM. Caps `maxBricks` and
-    total sampled voxels against a frame-time target.
-
-  Two things need real work beyond naming:
-
-  1. **A cost model.** `'interactive'` needs frame time as a budget currency.
-     A static estimate (bricks x sampled voxels per brick x step count) is a
-     starting point; a closed loop that measures actual frame time and steps
-     `detail`/`minLevel` until it holds the target is the honest version, and
-     needs a damping rule so it does not oscillate between two levels.
-  2. **Switching plans mid-session.** A budget plan is not load-time-only. The
-     natural flow is explore with `'focus'`, then switch to `'uniform'` to take
-     a figure. `swapChunkedVolumePlan` already swaps a plan in place keeping
-     unchanged bricks resident, so the plumbing exists; it needs a public
-     `setBudgetPlan()` and a decision about what happens to a crosshair
-     subscription when the plan no longer uses one.
-
-  Naming note: "budget plan" is the user's term and reads well against the
-  existing `ChunkPlan` (the output). Keep the distinction sharp in the docs:
-  a **budget plan** is the POLICY, a **chunk plan** is the RESULT of applying
-  it.
+  Sequenced AFTER the visual-artifact work below.
 
 ## Carried over from the LOD compensation work
 

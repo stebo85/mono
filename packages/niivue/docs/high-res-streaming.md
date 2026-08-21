@@ -327,5 +327,6 @@ each brick client-side.
 ## 11. Open follow-ups
 
 Tracked in `docs/streaming-todos.md`: moving chunk decode off the main thread,
-named **budget plans** (planning policies beyond the crosshair-focused default),
-the level-grid texture misregistration, and the residual LOD seams.
+the level-grid texture misregistration, and the residual LOD seams. Named
+**budget plans** (planning policies beyond the crosshair-focused default) have
+their own design doc, `docs/budget-plans.md`.

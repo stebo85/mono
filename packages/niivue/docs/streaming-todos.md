@@ -7,8 +7,8 @@ Open follow-ups for the multi-LOD chunked volume path
 backends in the same change.
 
 Order of work (Chris, 2026-08-21): fix the VISUAL artifacts first, then the
-performance items. The two visual items are at the bottom of this file; decode
-and budget plans wait behind them.
+performance items. The visual items are under "Carried over from the LOD
+compensation work"; decode and budget plans wait behind them.
 
 ## Move chunk decode off the main thread
 
@@ -51,11 +51,16 @@ and budget plans wait behind them.
 
 ## Carried over from the LOD compensation work
 
-- [ ] Level-grid texture misregistration in `chunkUniformsFor`
+- [x] Level-grid texture misregistration in `chunkUniformsFor`
       (`src/gl/render.ts`, `src/wgpu/render.ts`) and `chunkSampleTransform`
-      (`src/volume/chunking.ts`). Confirmed real, but NOT the cause of the block
-      seams (that was `lodGammaExponent`, fixed in `63e7df5d`). Must land in
-      both backends.
+      (`src/volume/chunking.ts`). FIXED: `chunkOwnedTexBox` in `chunking.ts` is
+      now the single source for the texture remap in all three call sites, and
+      it maps the brick's OWNED common-grid box rather than the fetched box
+      that `emitBrick` snaps out to whole level voxels. On the real hoa_heart
+      pyramid this moved brick content by up to 3.4 / 6.3 / 8.7 common voxels at
+      L2 / L3 / L4 and corrected a stretch of up to 5.9 / 12.4 / 23.7. A
+      single-level plan is bit-identical to before. This was NOT the cause of
+      the block seams (that was `lodGammaExponent`, fixed in `63e7df5d`).
 
 - [ ] Residual LOD seams. At the refitted default (`0.08`) the measured step
       across a level boundary is about -10% on `hoa_heart`, down from +36%. No
@@ -65,3 +70,30 @@ and budget plans wait behind them.
       `FEATURE_PARITY.md`) or publishing a coverage-preserving pyramid. The
       max/mean blend prototype (0.85 max) landed every measured region within
       4% at every level and is the stronger lead.
+
+## Two-panel block inspector demo
+
+- [ ] A demo with two side-by-side panels for looking INSIDE one LOD brick.
+
+  Left panel: `hoa_heart` at a coarse level (L3 or L4) with the explode factor
+  above 1, so the brick lattice is visible and individually pickable. The user
+  clicks a brick.
+
+  Right panel: that same brick re-rendered on its own, but built from the L0
+  chunks that tile it, loaded as a separate `NVImage`. So the left panel shows
+  where the brick sits in the whole heart at the level the streamer actually
+  chose, and the right shows the finest data underneath it.
+
+  What it is for: this is the direct visual test for exactly the class of bug
+  `chunkOwnedTexBox` just fixed. A registration or reconstruction error inside a
+  single brick is nearly invisible in the full render and obvious when the
+  coarse brick and its L0 constituents sit side by side. It also gives the
+  pyramid-coverage work (the max/mean blend) a way to compare a coarse brick
+  against its own fine data directly rather than through a whole-volume
+  difference.
+
+  Notes for whoever builds it: brick picking needs a ray test against the
+  exploded brick boxes (the plan already has every box in common-grid coords);
+  the right panel needs the set of L0 chunks covering one brick's common box,
+  which is a `chunkVolumeGrid` over that sub-box against level 0; both panels
+  must work on both backends.

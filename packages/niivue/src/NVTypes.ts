@@ -724,7 +724,7 @@ export type VolumeRenderConfig = {
    * Coefficient for the per-level brightness compensation applied to bricks
    * fetched from a coarse pyramid level of a multi-LOD chunked volume. 0
    * disables it; clamped to [0, 1] (useful magnitudes are small -- the default
-   * is 0.022 and 0.1 is already strong).
+   * is 0.08 per pyramid level and 0.2 is already strong).
    *
    * WHEN TO REACH FOR IT: coarse bricks look too DARK next to fine ones. If
    * they look too TRANSPARENT instead, use `lodOpacityCompensation`. Both are
@@ -736,14 +736,18 @@ export type VolumeRenderConfig = {
    * colour and its opacity, and front-to-back compositing weights colour by
    * opacity. Measured on a real OME-Zarr pyramid the deficit reaches 16% by
    * level 3, which reads as a visible brightness step at a LOD boundary. Each
-   * brick's classified RGB is therefore raised to `1 - coefficient * (k - 1)`,
-   * where k is its linear downsample factor (see `lodGammaExponent`); this
-   * multiplies with the display `scene.gamma` exponent and, like it, leaves
-   * alpha untouched, so it changes brightness without changing occlusion.
+   * brick's classified RGB is therefore raised to
+   * `1 - coefficient * log2(k)`, where k is its linear downsample factor (see
+   * `lodGammaExponent`) -- one fixed step per pyramid level, since each level
+   * averages the same 2x2x2 neighbourhood. This multiplies with the display
+   * `scene.gamma` exponent and, like it, leaves alpha untouched, so it changes
+   * brightness without changing occlusion.
    *
-   * The default is an empirical fit and is honest only for dense structure;
-   * sparse thin material loses far more and stays undercorrected. Non-chunked
-   * and single-level volumes are unaffected (k is 1 for every draw).
+   * The default is an empirical fit and no single value is exact for all data:
+   * sparse thin material loses more per level than dense structure does. It is
+   * safe to raise, because the per-level form stays gentle at depth rather than
+   * running away. Non-chunked and single-level volumes are unaffected (k is 1
+   * for every draw).
    */
   lodBrightnessCompensation: number
 

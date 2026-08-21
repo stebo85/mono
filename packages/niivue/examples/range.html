@@ -326,9 +326,9 @@
           title="Display gamma for the 3D render. Raises each sample's classified RGB to 1/gamma, so above 1 brightens. Alpha is untouched, so occlusion is unchanged. It also narrows the gap between a coarse LOD brick and a fine one, since mean-downsampled data classifies darker" />
       </span>
       <span class="control">
-        <label for="lodComp">LOD comp <span id="lodCompVal">0.022</span></label>
-        <input id="lodComp" type="range" min="0" max="0.08" step="0.002" value="0.022"
-          title="Per-level brightness compensation for coarse multi-LOD bricks. A brick from pyramid level L is lifted by exponent 1 - c*(k-1), where k is its linear downsample factor. Averaging voxels destroys the correlation between a sample's colour and its opacity, and front-to-back compositing weights colour by opacity, so a coarse brick integrates darker than the fine data it stands in for. 0 disables. Fine-level and non-chunked draws are unaffected at any setting" />
+        <label for="lodComp">LOD comp <span id="lodCompVal">0.080</span></label>
+        <input id="lodComp" type="range" min="0" max="0.2" step="0.005" value="0.08"
+          title="Per-level brightness compensation for coarse multi-LOD bricks. A brick from pyramid level L is lifted by exponent 1 - c*log2(k), where k is its linear downsample factor, so each pyramid level costs one fixed step. Averaging voxels destroys the correlation between a sample's colour and its opacity, and front-to-back compositing weights colour by opacity, so a coarse brick integrates darker than the fine data it stands in for. 0 disables. Fine-level and non-chunked draws are unaffected at any setting" />
       </span>
       <span class="control">
         <label for="lodOpacity">LOD opacity <span id="lodOpacityVal">0.00</span></label>

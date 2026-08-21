@@ -1389,12 +1389,13 @@ export default class NiiVue extends EventTarget {
    *
    * Coefficient for the per-level brightness compensation applied to coarse
    * multi-LOD bricks; 0 disables it, clamped to [0, 1]. Useful magnitudes are
-   * small: the default is 0.022 and 0.1 is already strong.
+   * small: the default is 0.08 per pyramid level and 0.2 is already strong.
    *
    * A coarse brick integrates darker than the fine data it stands in for
    * (averaging voxels destroys the colour/opacity correlation that front-to-back
    * compositing weights by), which reads as a brightness step at a LOD boundary.
-   * Empirical: it holds for dense structure and undercorrects sparse material.
+   * The correction is one fixed step per pyramid level (`1 - coefficient *
+   * log2(k)`). Empirical: sparse material loses more per level than dense.
    *
    * No-op on any volume that is not a multi-LOD chunked volume. Call
    * `lodCompensation()` to see whether it applies and what each level gets. See

@@ -91,15 +91,33 @@ The floor is what the cross-fade dissolves into, so with no floor installed ther
 
 A coarse brick does not merely look softer than the fine data it stands in for: it looks **darker**. Downsampling averages voxels, which destroys the correlation between a sample's colour and its opacity, and front-to-back compositing weights each sample's colour by its opacity. The averaged brick therefore integrates to less light than the fine data over the same span, and the boundary between a level-0 brick and its level-3 neighbour reads as a brightness step, not just a sharpness one.
 
-`volumeLodBrightnessCompensation` (default `0.022`, range `[0, 1]`, `0` disables) lifts each brick by an exponent derived from its own pyramid level:
+`volumeLodBrightnessCompensation` (default `0.08`, range `[0, 1]`, `0` disables) lifts each brick by an exponent derived from its own pyramid level:
 
 ```
-e = 1 - coefficient * (k - 1)
+e = 1 - coefficient * log2(k)
 ```
 
-where `k` is the brick's linear downsample factor relative to the finest grid — the geometric mean of the three per-axis ratios, so an anisotropically decimated pyramid still yields one scalar (`chunkLodDownsample` in `src/volume/chunking.ts`). The shaders multiply `e` into the same exponent that carries `scene.gamma` and raise only the classified RGB to it, so alpha, occlusion and thresholding are untouched. `k` is 1 for the finest level, for single-level plans, and for non-chunked volumes, which makes the whole feature an exact no-op outside multi-LOD plans whatever the coefficient is.
+where `k` is the brick's linear downsample factor relative to the finest grid — the geometric mean of the three per-axis ratios, so an anisotropically decimated pyramid still yields one scalar (`chunkLodDownsample` in `src/volume/chunking.ts`). Because every pyramid level averages the same 2x2x2 neighbourhood, the correction is **one fixed step per level**: `log2(k)` is just the level index. The shaders multiply `e` into the same exponent that carries `scene.gamma` and raise only the classified RGB to it, so alpha, occlusion and thresholding are untouched. `k` is 1 for the finest level, for single-level plans, and for non-chunked volumes, which makes the whole feature an exact no-op outside multi-LOD plans whatever the coefficient is.
 
-The size of the deficit depends on how much intensity varies inside one fine voxel, so no coefficient is exact for all data. `0.022` was fitted on dense structure, where it cuts the mean brightness error across levels 1-3 from about 16% to under 4%; it **undercorrects sparse thin material**, which can still read roughly 50% dark at level 3. That is why it is a tunable render-time setting rather than a baked constant. The range demo (`examples/range.html`) exposes it as a slider next to `gamma` for A/B comparison.
+#### Why per level and not per downsample factor
+
+This grew with `k - 1` until it was measured on a deep pyramid, and that form does not survive contact with one. It assumes a level-4 brick loses eight times what a level-1 brick loses; averaging does not work that way, and on the seven-level HiP-CT heart the correction ran away. At the old `0.022` default a level-4 brick asked for exponent `1 - 0.022 * 15 = 0.67` and a level-6 brick for `-0.386`, which the 0.25 clamp caught. Two visible symptoms followed:
+
+* A LOD boundary read as a hard brightness step with the **coarse side too bright**, not too dark. Measured across the strongest brick-face seam on `hoa_heart` (WebGL2, gamma 1, trend removed): `+35.7%` at the shipped default, against `-34.0%` with the compensation off. The correction had overshot the null by roughly 6x and was itself the artifact.
+* The **coarse floor** is built from the coarsest level, so it sat pinned at the 0.25 clamp. That floor is exactly what shows while a refocus streams fine bricks in, which is why zooming flashed pale before settling.
+
+Under `1 - coefficient * log2(k)` neither happens: the deepest level of that pyramid asks for `1 - 0.08 * 6 = 0.52`, well clear of the clamp, and the seam response stays monotonic and gentle across the whole slider range (`-33.0%` at 0, `-28.7%` at 0.02, `-23.4%` at 0.04, `-10.1%` at 0.08). That is the practical gain: the coefficient is now **safe to turn up** on data that needs more, where before it saturated.
+
+#### Picking the coefficient
+
+The size of the deficit depends on how much intensity varies inside one fine voxel, so no coefficient is exact for all data, and the spread is real rather than a rounding error:
+
+| data | character | coefficient that nulls its LOD seam |
+|------|-----------|-------------------------------------|
+| `hoa_heart` (HiP-CT) | sparse, thin, low contrast on a high pedestal | about `0.11` per level |
+| `pawpawsaurus` (CT) | dense, opaque, near-saturated | about `0.05` per level |
+
+`0.08` is the default because it splits them and because the dense case is nearly insensitive to the setting anyway: sweeping `pawpawsaurus` from 0 to 0.08 moves its mean brightness about 4% and changes its strongest edge step from `10.1%` to `9.3%`, while the same sweep on `hoa_heart` takes its seam from `-33%` to `-10%`. Spend the range where the artifact is visible. That is also why it stays a tunable render-time setting rather than a baked constant — the range demo (`examples/range.html`) exposes it as a slider next to `gamma` for A/B comparison.
 
 ### Per-level opacity compensation (off by default)
 

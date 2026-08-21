@@ -11,6 +11,7 @@ import {
   NiiIntentCode,
   SLICE_TYPE,
   sliceTypeDim,
+  VOLUME_DEFAULTS,
 } from './NVConstants'
 
 describe('isPaqd', () => {
@@ -103,7 +104,7 @@ describe('invGamma', () => {
 })
 
 describe('lodGammaExponent', () => {
-  const beta = 0.022
+  const beta = 0.08
 
   test('is an exact no-op at the finest level', () => {
     expect(lodGammaExponent(1, beta)).toBe(1)
@@ -126,17 +127,18 @@ describe('lodGammaExponent', () => {
     expect(c).toBeLessThan(b)
   })
 
-  test('follows 1 - coefficient * (downsample - 1)', () => {
+  test('follows 1 - coefficient * log2(downsample)', () => {
     expect(lodGammaExponent(2, beta)).toBeCloseTo(1 - beta, 10)
-    expect(lodGammaExponent(4, beta)).toBeCloseTo(1 - 3 * beta, 10)
+    expect(lodGammaExponent(4, beta)).toBeCloseTo(1 - 2 * beta, 10)
+    expect(lodGammaExponent(64, beta)).toBeCloseTo(1 - 6 * beta, 10)
   })
 
   test('clamps the coefficient to the accepted range', () => {
-    // Picked at a downsample where the 0.25 floor does not also bite, so this
+    // Half a pyramid level, picked so the 0.25 floor does not also bite: this
     // measures the coefficient clamp alone.
-    const capped = lodGammaExponent(1.5, 10)
+    const capped = lodGammaExponent(Math.SQRT2, 10)
     expect(capped).toBeCloseTo(
-      lodGammaExponent(1.5, LOD_BRIGHTNESS_RANGE[1]),
+      lodGammaExponent(Math.SQRT2, LOD_BRIGHTNESS_RANGE[1]),
       10,
     )
     expect(capped).toBeCloseTo(1 - 0.5 * LOD_BRIGHTNESS_RANGE[1], 10)
@@ -150,6 +152,20 @@ describe('lodGammaExponent', () => {
 
   test('floors the exponent so a deep pyramid cannot blow out', () => {
     expect(lodGammaExponent(1e6, LOD_BRIGHTNESS_RANGE[1])).toBe(0.25)
+  })
+
+  test('the default coefficient stays clear of the floor on a deep pyramid', () => {
+    // The regression this shape replaced: growing the correction with
+    // `downsample - 1` drove a seven-level pyramid (and the coarse floor built
+    // from its coarsest level) straight into the 0.25 clamp at the default,
+    // which read as a LOD boundary whose COARSE side was too bright. One step
+    // per level has to leave headroom at the bottom of a real pyramid.
+    const deepest = lodGammaExponent(
+      64,
+      VOLUME_DEFAULTS.lodBrightnessCompensation,
+    )
+    expect(deepest).toBeGreaterThan(0.4)
+    expect(deepest).toBeLessThan(1)
   })
 
   test('non-finite inputs are a no-op rather than reaching the shader', () => {

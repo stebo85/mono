@@ -142,20 +142,29 @@ export const LOD_BRIGHTNESS_RANGE: [number, number] = [0, 1]
  * Downsampling averages voxels, which destroys the correlation between a
  * sample's colour and its opacity; since front-to-back compositing weights
  * colour by opacity, the coarse brick integrates darker than the fine data it
- * stands in for. The deficit grows with the downsample factor, so the exponent
- * falls below 1 (which brightens) in proportion to `downsample - 1`.
+ * stands in for. Each pyramid level averages a fixed 2x2x2 neighbourhood, so
+ * the correlation is lost one comparable step PER LEVEL: the exponent falls
+ * below 1 (which brightens) in proportion to `log2(downsample)`.
  *
- * This is an EMPIRICAL heuristic, not a derivation: the true deficit depends on
- * the intensity variance inside each coarse voxel, which is data-dependent. The
- * default coefficient was fitted by simulating the ray-march over a real
- * OME-Zarr pyramid, and it holds well for dense structure (residual error under
- * 4% across levels 1-3, down from 16%) while UNDERCORRECTING sparse, thin
- * material, where the correlation loss is far larger than any single global
- * exponent can absorb. Set the coefficient to 0 to disable it.
+ * Growing it with `downsample - 1` instead - as this did until the deep-level
+ * measurements below - assumes level 4 loses eight times what level 1 does.
+ * Nothing about averaging works that way, and on a seven-level pyramid it ran
+ * away: the level-4 bricks and the whole-volume coarse floor both hit the 0.25
+ * clamp at the default coefficient, so a LOD boundary that should have been
+ * invisible read as a hard step with the COARSE side far too BRIGHT, and the
+ * floor flashed pale every time a refocus swapped the plan.
  *
- * Useful magnitudes are SMALL: the default is 0.022 and 0.1 is already strong.
- * The returned exponent is floored at 0.25 so a deep level cannot blow out,
- * which is why the accepted range runs to 1 without the top end being useful.
+ * This is still an EMPIRICAL heuristic, not a derivation: the true deficit
+ * depends on the intensity variance inside each coarse voxel, which is
+ * data-dependent, and no single global exponent nulls it everywhere. What the
+ * per-level form buys is that the correction stays monotonic and gentle over
+ * the whole useful range instead of saturating, so the coefficient is safe to
+ * turn up on data that needs more. Set it to 0 to disable it.
+ *
+ * Useful magnitudes are SMALL: the default is 0.08 per level and 0.2 is already
+ * strong. The returned exponent is floored at 0.25 so a deep level cannot blow
+ * out, which is why the accepted range runs to 1 without the top end being
+ * useful.
  * Applies only to a multi-LOD chunked volume; on anything else it is an exact
  * no-op (ask `nv.lodCompensation()` whether it is doing anything).
  */
@@ -167,7 +176,7 @@ export function lodGammaExponent(
   if (downsample <= 1 || coefficient <= 0) return 1
   const beta = Math.min(coefficient, LOD_BRIGHTNESS_RANGE[1])
   // Floored so a brick from a very deep pyramid level cannot be blown out.
-  return Math.max(0.25, 1 - beta * (downsample - 1))
+  return Math.max(0.25, 1 - beta * Math.log2(downsample))
 }
 
 /** Accepted range for volume.lodOpacityCompensation. 0 disables it. */
@@ -328,7 +337,7 @@ export const VOLUME_DEFAULTS: VolumeRenderConfig = {
   renderMode: VOLUME_RENDER_MODE.COMPOSITE,
   sampleRate: 2,
   isCubicInterpolation: false,
-  lodBrightnessCompensation: 0.022,
+  lodBrightnessCompensation: 0.08,
   lodOpacityCompensation: 0,
 }
 

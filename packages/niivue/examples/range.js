@@ -1294,13 +1294,15 @@ function applyGamma() {
 // averages voxels, which destroys the correlation between a sample's colour and
 // its opacity; front-to-back compositing weights colour by opacity, so a coarse
 // brick integrates darker than the fine data it replaces. The shader lifts each
-// brick by exponent 1 - c*(k-1) for its linear downsample factor k, on top of
-// the display gamma. Slide to 0 to see the uncompensated LOD seam.
+// brick by exponent 1 - c*log2(k) for its linear downsample factor k, on top of
+// the display gamma -- one fixed step per pyramid level, since every level
+// averages the same 2x2x2 neighbourhood. Slide to 0 to see the uncompensated
+// LOD seam.
 //
 // The size of the deficit depends on how much intensity varies inside a fine
-// voxel, so no single coefficient is exact: 0.022 was fitted on dense structure
-// (residual under 4%, down from 16% at level 3) and undercorrects sparse thin
-// material, which is why this is a slider and not a constant.
+// voxel, so no single coefficient is exact: sparse thin material (hoa_heart)
+// needs about 0.11 per level to null its LOD seam, dense structure
+// (pawpawsaurus) about 0.05, which is why this is a slider and not a constant.
 function applyLodCompensation() {
   const c = Number(els.lodComp.value)
   els.lodCompVal.textContent = c.toFixed(3)

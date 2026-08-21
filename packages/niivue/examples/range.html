@@ -202,6 +202,102 @@
         border-color: var(--green);
       }
 
+      /* Streaming progress badge. The octree replans as the crosshair moves or
+         the zoom changes, and at high zoom the newly relevant bricks can take
+         seconds to arrive over the wire -- during which the view is legitimately
+         busy rather than broken. Say so, opposite the HUD so neither covers the
+         other. */
+      .loading {
+        position: absolute;
+        right: 12px;
+        bottom: 12px;
+        display: flex;
+        align-items: center;
+        gap: 9px;
+        box-sizing: border-box;
+        min-width: 190px;
+        border: 1px solid rgba(122, 215, 209, 0.28);
+        background: rgba(5, 8, 8, 0.82);
+        border-radius: 6px;
+        padding: 8px 11px;
+        pointer-events: none;
+        font-family: ui-monospace, monospace;
+        font-size: 0.72rem;
+        line-height: 1.4;
+        box-shadow: 0 20px 60px rgba(0, 0, 0, 0.34);
+        opacity: 0;
+        visibility: hidden;
+        transition: opacity 180ms ease;
+      }
+
+      .loading.busy {
+        opacity: 1;
+        visibility: visible;
+      }
+
+      .loading-body {
+        display: flex;
+        flex-direction: column;
+        flex: 1;
+        min-width: 0;
+        gap: 2px;
+      }
+
+      .loading-label {
+        color: var(--text);
+      }
+
+      .loading-count {
+        color: var(--muted);
+        font-size: 0.66rem;
+      }
+
+      .loading-bar {
+        display: block;
+        height: 3px;
+        margin-top: 2px;
+        border-radius: 2px;
+        background: #1d2724;
+        overflow: hidden;
+      }
+
+      .loading-fill {
+        display: block;
+        height: 100%;
+        width: 0;
+        border-radius: 2px;
+        background: var(--cyan);
+        transition: width 160ms linear;
+      }
+
+      .spinner {
+        flex: none;
+        width: 13px;
+        height: 13px;
+        border-radius: 50%;
+        border: 2px solid rgba(122, 215, 209, 0.25);
+        border-top-color: var(--cyan);
+        animation: spin 720ms linear infinite;
+      }
+
+      @keyframes spin {
+        to {
+          transform: rotate(360deg);
+        }
+      }
+
+      /* The badge is the one piece of feedback a user with reduced-motion still
+         needs, so drop the rotation rather than the element. */
+      @media (prefers-reduced-motion: reduce) {
+        .spinner {
+          animation: none;
+        }
+        .loading,
+        .loading-fill {
+          transition: none;
+        }
+      }
+
       .fallback {
         position: absolute;
         inset: 0;
@@ -255,6 +351,15 @@
           right: 12px;
           width: auto;
           grid-template-columns: repeat(8, minmax(0, 1fr));
+        }
+
+        /* The HUD spans the full width at the top here and the chunk strip the
+           full width at the bottom, so the badge sits just above the strip. */
+        .loading {
+          right: 12px;
+          bottom: 30px;
+          min-width: 0;
+          font-size: 0.66rem;
         }
       }
     </style>
@@ -367,6 +472,16 @@
       <canvas id="nv-canvas" aria-label="Client-side HTTP Range volume"></canvas>
       <div class="hud" id="hud">Loading...</div>
       <div class="strip" id="chunkStrip" aria-hidden="true"></div>
+      <div class="loading" id="loading" role="status" aria-live="polite">
+        <span class="spinner" aria-hidden="true"></span>
+        <span class="loading-body">
+          <span class="loading-label" id="loadingLabel">Loading blocks</span>
+          <span class="loading-count" id="loadingCount" aria-hidden="true"></span>
+          <span class="loading-bar" aria-hidden="true"
+            ><span class="loading-fill" id="loadingFill"></span
+          ></span>
+        </span>
+      </div>
       <div class="fallback" id="fallback" aria-hidden="true"></div>
     </main>
     <script type="module" src="range.js"></script>

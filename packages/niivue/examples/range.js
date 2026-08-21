@@ -460,6 +460,10 @@ const els = {
   canvas: el('nv-canvas'),
   hud: el('hud'),
   chunkStrip: el('chunkStrip'),
+  loading: el('loading'),
+  loadingLabel: el('loadingLabel'),
+  loadingCount: el('loadingCount'),
+  loadingFill: el('loadingFill'),
   fallback: el('fallback'),
 }
 
@@ -468,6 +472,10 @@ let activeSource = null
 let chunkPlan = null
 let stats = freshStats()
 let pollHandle = 0
+// Streaming badge state (see renderLoading). `since` is when the stream last
+// went from settled to busy, `until` is how long a finished badge lingers, and
+// `label` is the last text pushed into the aria-live region.
+const loadingState = { since: 0, until: 0, label: '', planEpoch: 0 }
 
 function freshStats() {
   return {
@@ -1578,6 +1586,68 @@ function renderHud() {
   renderChunkStrip()
 }
 
+// How long the stream must stay busy before the badge appears, and how long it
+// lingers after settling. Dragging the crosshair replans continuously, and each
+// replan finishes some bricks in a frame or two; without both margins the badge
+// strobes on every twitch, which is worse than not having one.
+const LOADING_SHOW_AFTER_MS = 180
+const LOADING_LINGER_MS = 450
+// A plan swap counts as "refocusing" for this long after it lands. The swap
+// itself is instant; what follows is the fetch of whatever the new plan needs.
+const REFOCUS_WINDOW_MS = 600
+
+// Tell the user the view is BUSY, not broken. At high zoom a refocus can want
+// bricks that take seconds to arrive, and the honest signal for that is a
+// progress badge rather than a viewport that appears to have stalled. Driven
+// off chunkStreamStats (authoritative residency) at the HUD's ~8 Hz poll.
+function renderLoading() {
+  const stream = nv?.chunkStreamStats()
+  const total = stream?.total ?? 0
+  const outstanding = stream ? stream.inFlight + stream.pending : 0
+  const now = performance.now()
+
+  if (outstanding > 0 && total > 0) {
+    if (loadingState.since === 0) loadingState.since = now
+    loadingState.until = now + LOADING_LINGER_MS
+  } else {
+    loadingState.since = 0
+  }
+
+  // Debounced on the way in, lingering on the way out.
+  const settling = loadingState.until > now
+  const busy =
+    loadingState.since !== 0 &&
+    now - loadingState.since >= LOADING_SHOW_AFTER_MS
+  const show = busy || (settling && loadingState.label !== '')
+  els.loading.classList.toggle('busy', show)
+  if (!show) {
+    loadingState.label = ''
+    return
+  }
+
+  // A replan is the demo's own signal that the RELEVANT set just changed, which
+  // is the part a user reads as "why did my zoomed view go soft".
+  const label =
+    now - loadingState.planEpoch < REFOCUS_WINDOW_MS
+      ? 'Refocusing'
+      : 'Loading blocks'
+  // Only touch the live region when the wording actually changes: rewriting it
+  // at 8 Hz would make a screen reader unusable.
+  if (label !== loadingState.label) {
+    loadingState.label = label
+    els.loadingLabel.textContent = label
+  }
+  // Count against what the stream actually asked for, not plan.total: absent
+  // and empty chunks are never fetched and the LRU may evict, so a total-based
+  // bar stalls short of full even once everything relevant is in.
+  const resident = stream ? stream.resident : 0
+  const requested = resident + outstanding
+  els.loadingCount.textContent = `${resident} / ${requested} blocks`
+  els.loadingFill.style.width = `${
+    requested > 0 ? Math.round((resident / requested) * 100) : 0
+  }%`
+}
+
 // One line of nv.lodCompensation(). Both LOD compensation settings are exact
 // no-ops on anything that is not a multi-LOD chunked volume, so the report is
 // the only way to tell "the knob is doing nothing" from "the knob is doing
@@ -1629,7 +1699,12 @@ function startHudPolling() {
     // out-of-plan keys never inflate a displayed count.
     if (activeCv) {
       const p = activeCv.currentPlan
-      if (p !== chunkPlan) chunkPlan = p
+      if (p !== chunkPlan) {
+        chunkPlan = p
+        // Stamped for the badge: what follows a swap is the fetch of whatever
+        // the new plan asked for, which is the wait worth naming.
+        loadingState.planEpoch = performance.now()
+      }
     }
     // Reconcile the slider/label with the live zoom from any source (wheel moves
     // it with no 'change' event). syncZoomControl is UI-only and never nudges the
@@ -1637,6 +1712,7 @@ function startHudPolling() {
     // replan is issued by the canvas wheel listener in main.
     syncZoomControl()
     renderHud()
+    renderLoading()
     syncExplode()
   }, 120)
 }
@@ -1699,6 +1775,13 @@ async function runReload(token, options) {
   if (token !== reloadToken) return
   hideFallback()
   stats = freshStats()
+  // Hard-reset the badge: the outgoing source's linger must not carry a stale
+  // "N / M blocks" over the new one's first frames.
+  loadingState.since = 0
+  loadingState.until = 0
+  loadingState.label = ''
+  loadingState.planEpoch = 0
+  els.loading.classList.remove('busy')
   // The fresh volume starts un-exploded; syncExplode re-applies the slider's
   // explode once this load settles.
   appliedExplodeScale = 1

@@ -321,3 +321,11 @@ Scope / limitations (current):
 Demo: `apps/iiif-volumetric-demo` overlay page, "stream hi-res" toggle (3D
 render). The overlay streams a finer pyramid level than the base and z-scores
 each brick client-side.
+
+---
+
+## 11. Open follow-ups
+
+Tracked in `docs/streaming-todos.md`: moving chunk decode off the main thread,
+named **budget plans** (planning policies beyond the crosshair-focused default),
+the level-grid texture misregistration, and the residual LOD seams.

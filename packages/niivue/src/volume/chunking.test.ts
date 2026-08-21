@@ -3,6 +3,7 @@ import {
   type ChunkPlan,
   chunkAtVoxel,
   chunkLodDownsample,
+  chunkOwnedTexBox,
   chunkSampleTransform,
   chunksCrossingSlice,
   chunkVolume,
@@ -930,5 +931,102 @@ describe('matchChunksByContent', () => {
     const map = matchChunksByContent(a, a)
     expect(map.size).toBe(a.chunks.length)
     for (const [oi, ni] of map) expect(oi).toBe(ni)
+  })
+})
+
+describe('chunkOwnedTexBox', () => {
+  // The real hoa_heart pyramid: NOT exact halvings, which is what makes the
+  // level grid disagree with the common grid in the first place.
+  const heart: Vec3i[] = [
+    [5787, 5943, 7865],
+    [2894, 2972, 3933],
+    [1447, 1486, 1967],
+    [724, 743, 984],
+    [362, 372, 492],
+    [181, 186, 246],
+    [91, 93, 123],
+  ]
+
+  test('is the halo-inset data box for a single-level plan', () => {
+    const plan = chunkVolume([600, 300, 700], 256)
+    expect(plan.chunks.length).toBeGreaterThan(1)
+    for (const c of plan.chunks) {
+      const { origin, size } = chunkOwnedTexBox(plan, c)
+      for (let a = 0; a < 3; a++) {
+        // Exact equality, not toBeCloseTo: a single-level plan must be
+        // bit-identical to what the renderer computed before this helper.
+        expect(origin[a]).toBe(c.haloLow[a] / c.texDims[a])
+        expect(size[a]).toBe(
+          (c.texDims[a] - c.haloLow[a] - c.haloHigh[a]) / c.texDims[a],
+        )
+      }
+    }
+  })
+
+  test('maps a common-grid point to its true level coordinate', () => {
+    const plan = chunkVolumeMultiLOD(
+      heart,
+      { center: [2800, 3000, 4000], radius: 256 },
+      256,
+      { cellEdge: 128, budgetBytes: 1.5 * 1024 ** 3, maxBricks: 240 },
+    )
+    expect(plan.chunks.length).toBeGreaterThan(1)
+    // At least one brick must be off the finest level, or the case under test
+    // (level grid != common grid) never arises.
+    expect(plan.chunks.some((c) => (c.sourceLevel ?? 0) > 0)).toBe(true)
+
+    for (const c of plan.chunks) {
+      const dims = plan.levelDims?.[c.sourceLevel ?? 0] ?? plan.volumeDims
+      const { origin, size } = chunkOwnedTexBox(plan, c)
+      // Walk the brick's own [0,1] cube, the same parameter the vertex shader
+      // interpolates, and check the texture coordinate the fragment shader
+      // derives lands on the level voxel the common position actually names.
+      for (const f of [0, 0.25, 0.5, 0.75, 1]) {
+        for (let a = 0; a < 3; a++) {
+          const common = c.voxelOrigin[a] + f * c.voxelDims[a]
+          const scale = dims[a] / plan.volumeDims[a]
+          const texFrac = origin[a] + f * size[a]
+          const levelCoord = c.texOrigin[a] + texFrac * c.texDims[a]
+          expect(levelCoord).toBeCloseTo(common * scale, 6)
+          // And the sample stays inside the uploaded texture.
+          expect(texFrac).toBeGreaterThanOrEqual(0)
+          expect(texFrac).toBeLessThanOrEqual(1)
+        }
+      }
+    }
+  })
+
+  test('neighbours agree on the level coordinate at a shared face', () => {
+    const plan = chunkVolumeMultiLOD(
+      heart,
+      { center: [2800, 3000, 4000], radius: 256 },
+      256,
+      { cellEdge: 128, budgetBytes: 1.5 * 1024 ** 3, maxBricks: 240 },
+    )
+    // Level coordinate a brick assigns to a common-grid position, via the
+    // exact chain the shaders walk.
+    const levelAt = (
+      c: (typeof plan.chunks)[number],
+      a: number,
+      common: number,
+    ): number => {
+      const { origin, size } = chunkOwnedTexBox(plan, c)
+      const f = (common - c.voxelOrigin[a]) / c.voxelDims[a]
+      return c.texOrigin[a] + (origin[a] + f * size[a]) * c.texDims[a]
+    }
+    let shared = 0
+    for (const c of plan.chunks) {
+      for (const n of plan.chunks) {
+        if (n === c || (n.sourceLevel ?? 0) !== (c.sourceLevel ?? 0)) continue
+        for (let a = 0; a < 3; a++) {
+          // n sits immediately above c on axis a and overlaps it elsewhere.
+          if (n.voxelOrigin[a] !== c.voxelOrigin[a] + c.voxelDims[a]) continue
+          const face = n.voxelOrigin[a]
+          shared++
+          expect(levelAt(c, a, face)).toBeCloseTo(levelAt(n, a, face), 6)
+        }
+      }
+    }
+    expect(shared).toBeGreaterThan(0)
   })
 })

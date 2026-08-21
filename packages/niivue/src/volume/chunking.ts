@@ -455,6 +455,62 @@ export function chunksCrossingSlice(
 }
 
 /**
+ * Where a brick's OWNED region sits inside its own texture, as a fraction of
+ * that texture: `origin` is the low corner, `size` the extent, per axis.
+ *
+ * The owned region is the brick's COMMON-grid box (`voxelOrigin`/`voxelDims`,
+ * which fixes where the brick sits in the world) expressed in the brick's own
+ * LEVEL grid. For a single-level plan the two grids coincide, so this is just
+ * the halo-inset data box.
+ *
+ * For a multi-LOD brick they do NOT coincide. `emitBrick` snaps the fetch box
+ * out to whole LEVEL voxels, so the fetched data covers up to one level voxel
+ * more than the brick owns on each face; at level 4 of the hoa_heart pyramid
+ * one level voxel is 16 common voxels. Treating the fetched box as the owned
+ * box shifts and stretches the brick's content (measured up to 8.7 common
+ * voxels of offset and 23.7 of stretch on that pyramid), and because
+ * neighbouring bricks snap independently, their shared face carries a content
+ * discontinuity: a seam that no brightness compensation can remove, because it
+ * is geometric. Mapping the TRUE owned box makes two neighbours evaluate the
+ * same level coordinate at their shared face, so the content lines up.
+ *
+ * Shared by every consumer of the remap (both backends' `chunkUniformsFor` and
+ * `chunkSampleTransform`) so the two backends cannot drift apart.
+ */
+export function chunkOwnedTexBox(
+  plan: ChunkPlan,
+  desc: VolumeChunkDesc,
+): { origin: Vec3f; size: Vec3f } {
+  const level = desc.sourceLevel ?? 0
+  const levelDims = level === 0 ? undefined : plan.levelDims?.[level]
+  const origin: Vec3f = [0, 0, 0]
+  const size: Vec3f = [0, 0, 0]
+  for (let a = 0; a < 3; a++) {
+    const tex = desc.texDims[a]
+    if (!levelDims) {
+      // Grids coincide: the owned box IS the halo-inset data box. Derived from
+      // the halos rather than voxelDims so a texture truncated by the device
+      // limit keeps the exact value it had before this helper existed.
+      origin[a] = desc.haloLow[a] / tex
+      size[a] = (tex - desc.haloLow[a] - desc.haloHigh[a]) / tex
+      continue
+    }
+    const scale = levelDims[a] / plan.volumeDims[a]
+    // Common voxel coords -> level voxel coords -> texture-local voxel coords.
+    const lo = desc.voxelOrigin[a] * scale - desc.texOrigin[a]
+    const hi =
+      (desc.voxelOrigin[a] + desc.voxelDims[a]) * scale - desc.texOrigin[a]
+    // Clamp for a texture the device limit truncated: the tail of the owned box
+    // was never uploaded, so sampling it would read past the texture.
+    const loTex = Math.max(0, Math.min(tex, lo))
+    const hiTex = Math.max(loTex, Math.min(tex, hi))
+    origin[a] = loTex / tex
+    size[a] = (hiTex - loTex) / tex
+  }
+  return { origin, size }
+}
+
+/**
  * Sampling transform for one chunk: maps a position in the full-volume [0,1]
  * cube to a sample coordinate in the chunk's local texture (halo included).
  *
@@ -492,7 +548,9 @@ export function chunkSampleTransform(
 ): ChunkSampleTransform {
   const desc = plan.chunks[chunkIndex]
   const [vx, vy, vz] = plan.volumeDims
-  const [tx, ty, tz] = desc.texDims
+  // The chunk's OWNED box inside its own texture — not the fetched box, which
+  // a multi-LOD brick snaps out to whole level voxels. See `chunkOwnedTexBox`.
+  const owned = chunkOwnedTexBox(plan, desc)
   return {
     subOrigin: [
       desc.voxelOrigin[0] / vx,
@@ -504,20 +562,8 @@ export function chunkSampleTransform(
       desc.voxelDims[1] / vy,
       desc.voxelDims[2] / vz,
     ],
-    dataOrigin: [
-      desc.haloLow[0] / tx,
-      desc.haloLow[1] / ty,
-      desc.haloLow[2] / tz,
-    ],
-    // Data extent inside the chunk texture, halo-excluded, expressed in the
-    // chunk's OWN texture grid. For single-level plans this equals
-    // voxelDims/texDims; for multi-LOD bricks voxelDims is in the common grid,
-    // so derive the level-grid data extent from texDims minus its halos.
-    dataSize: [
-      (tx - desc.haloLow[0] - desc.haloHigh[0]) / tx,
-      (ty - desc.haloLow[1] - desc.haloHigh[1]) / ty,
-      (tz - desc.haloLow[2] - desc.haloHigh[2]) / tz,
-    ],
+    dataOrigin: owned.origin,
+    dataSize: owned.size,
     volumeDims: [vx, vy, vz],
     lodDownsample: chunkLodDownsample(plan, desc),
   }

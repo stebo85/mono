@@ -36,6 +36,7 @@ import {
 import {
   type ChunkPlan,
   chunkLodDownsample,
+  chunkOwnedTexBox,
   chunkVolume,
   dimsDownsample,
   matchChunksByContent,
@@ -256,10 +257,13 @@ function chunkResidentBytes(chunk: VolumeChunkGPU): number {
 function chunkUniformsFor(plan: ChunkPlan, chunkIndex: number): ChunkUniforms {
   const desc = plan.chunks[chunkIndex]
   const [vx, vy, vz] = plan.volumeDims
-  const [tx, ty, tz] = desc.texDims
   // Ray-step density comes from this brick's source level (full-volume dims);
   // for single-level plans levelDims is absent so it falls back to volumeDims.
   const rayStep = plan.levelDims?.[desc.sourceLevel ?? 0] ?? plan.volumeDims
+  // The brick's OWNED box inside its own texture. A multi-LOD brick fetches a
+  // box snapped out to whole level voxels, so the fetched box is NOT the owned
+  // box and using it here would misregister the brick. See `chunkOwnedTexBox`.
+  const owned = chunkOwnedTexBox(plan, desc)
   return {
     // World placement uses the COMMON grid (voxelOrigin/voxelDims are common-grid
     // for multi-LOD bricks; identical to the level grid for single-level plans).
@@ -274,17 +278,9 @@ function chunkUniformsFor(plan: ChunkPlan, chunkIndex: number): ChunkUniforms {
       desc.voxelDims[1] / vy,
       desc.voxelDims[2] / vz,
     ],
-    // Texture-space remap uses the brick's OWN level grid (texDims + level halo).
-    dataOriginTexFrac: [
-      desc.haloLow[0] / tx,
-      desc.haloLow[1] / ty,
-      desc.haloLow[2] / tz,
-    ],
-    dataSizeTexFrac: [
-      (tx - desc.haloLow[0] - desc.haloHigh[0]) / tx,
-      (ty - desc.haloLow[1] - desc.haloHigh[1]) / ty,
-      (tz - desc.haloLow[2] - desc.haloHigh[2]) / tz,
-    ],
+    // Texture-space remap uses the brick's OWN level grid.
+    dataOriginTexFrac: owned.origin,
+    dataSizeTexFrac: owned.size,
     rayStepTexVox: [rayStep[0], rayStep[1], rayStep[2]],
     lodDownsample: chunkLodDownsample(plan, desc),
   }

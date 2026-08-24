@@ -200,6 +200,11 @@ export type { SlidePlaneTile } from './slide/slidePlane'
 export { axialPlaneTransform, slidePlaneTiles } from './slide/slidePlane'
 export type { SlideVectorKind, SlideVectorShape } from './slide/slideVector'
 export { SlideVectorLayer } from './slide/slideVector'
+export type {
+  VolumeSliceAxis,
+  VolumeSliceSourceOptions,
+} from './slide/volumeSliceSource'
+export { VolumeSliceSource } from './slide/volumeSliceSource'
 export { buildDrawingLut, drawingBitmapToRGBA } from './view/NVDrawingTexture'
 // Allen "volume-viewer" JSON + PNG atlas datasets (multi-channel microscopy)
 export {

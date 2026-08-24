@@ -247,6 +247,15 @@ export type {
 export { chunkVolumeGrid, chunkVolumeMultiLOD } from './volume/chunking'
 // MRSI (spatial spectroscopic imaging) volume helpers
 export { buildDerivedScalarVolume, isMrsiVolume } from './volume/mrsi'
+// Budget plans: the policy that shapes a streamed volume's octree
+export {
+  type BudgetPlan,
+  type BudgetPlanName,
+  type BudgetPlanOptions,
+  type BudgetPlanSpec,
+  BUDGET_PLANS,
+  resolveBudgetPlan,
+} from './volume/budgetPlans'
 export {
   type ChunkedVolumeOptions,
   NVChunkedVolume,

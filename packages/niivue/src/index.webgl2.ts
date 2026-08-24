@@ -119,6 +119,15 @@ export {
   fetchAllenAtlasInfo,
   loadAllenAtlasVolumes,
 } from './volume/allenAtlasLoader'
+// Budget plans: the policy that shapes a streamed volume's octree
+export {
+  BUDGET_PLANS,
+  type BudgetPlan,
+  type BudgetPlanName,
+  type BudgetPlanOptions,
+  type BudgetPlanSpec,
+  resolveBudgetPlan,
+} from './volume/budgetPlans'
 // Crosshair-focused multi-resolution (multi-LOD) streamed volumes
 export type {
   ChunkedVolumeFetch,

@@ -387,6 +387,15 @@
         </select>
       </span>
       <span class="control">
+        <label for="plan">Plan</label>
+        <select id="plan"
+          title="Budget plan: the policy that shapes the octree. focus = finest at the crosshair; uniform = finest level that fits the whole volume, ignores the crosshair; interactive = a smaller brick budget for smooth rotate/zoom.">
+          <option value="focus" selected>focus (crosshair)</option>
+          <option value="uniform">uniform (whole volume)</option>
+          <option value="interactive">interactive (fewer bricks)</option>
+        </select>
+      </span>
+      <span class="control">
         <label for="layout">Layout</label>
         <select id="layout">
           <option value="3" selected>multiplanar</option>

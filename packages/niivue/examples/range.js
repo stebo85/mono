@@ -235,13 +235,27 @@ const ZARR_BYTE_CACHE_BYTES = 512 * 1024 * 1024
 // retry all in core.
 // The Level control becomes a max-detail cap (`minLevel`).
 //
-// Cap on brick count (< core MAX_CHUNKS_PER_TILE=1024); the budget pass coarsens
-// until the plan fits. Budget keeps resident VRAM ~this regardless of the level
-// the user picks. On WebGPU it stays below DEFAULT_RESIDENCY_BYTES so no planned
-// brick evicts; on WebGL2 the GPU budget is deliberately lower than this, so the
-// LRU keeps the visible bricks and evicts the rest.
-const MULTILOD_MAX_BRICKS = 240
+// WHERE the detail goes is the BUDGET PLAN — the policy half of the API, chosen
+// with the Plan control (`budgetPlan`, core `BUDGET_PLANS`). Do not confuse it
+// with the chunk plan, which is the brick list the octree pass produces FROM it:
+//
+//   focus       finest bricks at the crosshair, coarsening outward (the default)
+//   uniform     ignores the crosshair; the finest level that fits the WHOLE
+//               volume, for a static whole-volume picture
+//   interactive same crosshair focus on a smaller brick budget, for smooth
+//               rotate/zoom
+//
+// The plan supplies the brick cap (< core MAX_CHUNKS_PER_TILE=1024); the budget
+// pass coarsens until the plan fits. This demo overrides only the VRAM budget,
+// which is a property of the machine rather than of the use case: it keeps
+// resident VRAM ~this regardless of the level the user picks. On WebGPU it stays
+// below DEFAULT_RESIDENCY_BYTES so no planned brick evicts; on WebGL2 the GPU
+// budget is deliberately lower than this, so the LRU keeps the visible bricks
+// and evicts the rest.
 const MULTILOD_BUDGET_BYTES = 2048 * 1024 * 1024
+// Start-up budget plan; ?plan=uniform|interactive|focus preselects one.
+const INITIAL_BUDGET_PLAN =
+  new URLSearchParams(location.search).get('plan') ?? 'focus'
 // The core NVChunkedVolume handle for the active OME-Zarr source (null for
 // synthetic). Owns the focus-follow plan swaps; the demo drives its max-detail
 // cap from the Level control and nudges it to re-plan on zoom/layout changes.
@@ -438,6 +452,7 @@ function el(id) {
 const els = {
   source: el('source'),
   level: el('level'),
+  plan: el('plan'),
   layout: el('layout'),
   colormap: el('colormap'),
   window: el('window'),
@@ -595,6 +610,9 @@ async function presentLevels(storeDef) {
 // the coarsest by default. Returns the selected level (or null for synthetic).
 async function refreshLevelControl() {
   const store = currentStore()
+  // The synthetic shard is a single-level grid on the legacy streaming path, so
+  // it has no octree for a budget plan to shape.
+  els.plan.disabled = !store
   if (!store) {
     els.level.replaceChildren(new Option('n/a', ''))
     els.level.disabled = true
@@ -1717,6 +1735,15 @@ function startHudPolling() {
   }, 120)
 }
 
+// Switch budget plan in place. The pyramid is already open and the plan is pure
+// policy, so core re-folds it (the demo's pinned VRAM budget still wins), swaps
+// the crosshair subscription if the focus changed, and re-plans -- no reload.
+// 'uniform' stops following the crosshair, so the Zoom control no longer
+// retargets the detail; that is the point of the plan, not a bug.
+function applyBudgetPlan() {
+  activeCv?.setBudgetPlan(els.plan.value)
+}
+
 function applyLayout() {
   if (!nv) return
   nv.sliceType = Number(els.layout.value)
@@ -1826,8 +1853,11 @@ async function runReload(token, options) {
           calMin: win.min,
           calMax: win.max,
           colormap: els.colormap.value,
+          // Policy (where the detail goes, how many bricks it may cost) comes
+          // from the named plan; only the VRAM ceiling is pinned by the demo,
+          // and an individual option wins over the plan by design.
+          budgetPlan: els.plan.value,
           budgetBytes: MULTILOD_BUDGET_BYTES,
-          maxBricks: MULTILOD_MAX_BRICKS,
           // deviceLimit is omitted: core now defaults it from the host's
           // maxTextureDimension3D, which this demo sets to 256 (see the NiiVue
           // construction) -- the same value the explicit option used to pass.
@@ -1892,6 +1922,10 @@ async function runReload(token, options) {
 
 async function main() {
   makeDraggable(els.hud)
+  // A ?plan= naming something the control does not offer leaves the markup's
+  // default selected, which matches how core degrades an unknown plan name.
+  els.plan.value = INITIAL_BUDGET_PLAN
+  if (!els.plan.value) els.plan.value = 'focus'
   setDefaultWindowForSelectedSource()
   await refreshLevelControl()
 
@@ -1924,6 +1958,7 @@ async function main() {
       activeCv.setMaxDetail(selectedLevelIndex(activeSource))
     }
   })
+  els.plan.addEventListener('change', applyBudgetPlan)
   els.layout.addEventListener('change', applyLayout)
   els.colormap.addEventListener('change', () => {
     void reloadVolume()

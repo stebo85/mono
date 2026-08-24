@@ -3,6 +3,15 @@ import { log } from '@/logger'
 import { SLICE_TYPE } from '@/NVConstants'
 import type NiiVue from '@/NVControlBase'
 import type { NVImage, TypedVoxelArray, VolumeChunkSource } from '@/NVTypes'
+import type {
+  BudgetPlan,
+  BudgetPlanContext,
+  BudgetPlanOptions,
+  BudgetPlanSpec,
+  PlanShapeOptions,
+  ResolvedOptions,
+} from './budgetPlans'
+import { resolveBudgetPlan } from './budgetPlans'
 import type { ChunkedVolumeSource } from './ChunkedVolumeSource'
 import {
   type ChunkPlan,
@@ -14,8 +23,12 @@ import {
 import { createStreamingNVImage } from './streamingVolume'
 import { getBitsPerVoxel, getTypedArrayConstructor } from './utils'
 
-/** Options for {@link NiiVue.loadChunkedVolume}. */
-export interface ChunkedVolumeOptions {
+/**
+ * Options for {@link NiiVue.loadChunkedVolume}. The plan-shaping half lives in
+ * {@link BudgetPlanOptions} (`budgetPlan` plus the individual knobs it layers
+ * under); everything here is display state for the streamed volume itself.
+ */
+export interface ChunkedVolumeOptions extends BudgetPlanOptions {
   /** Display window minimum (default 0). */
   calMin?: number
   /** Display window maximum (default 1). */
@@ -29,76 +42,11 @@ export interface ChunkedVolumeOptions {
   /** Display name / id for the volume (default 'chunked volume'). */
   name?: string
   id?: string
-  /**
-   * Focus that drives the octree. `'crosshair'` (default) makes the finest
-   * bricks follow the crosshair (auto-subscribes `locationChange`); a `[x,y,z]`
-   * fraction pins a static focus.
-   */
-  focus?: 'crosshair' | Vec3f
-  /**
-   * Finest-LOD radius in common-grid voxels. `'auto'` (default) derives it from
-   * the view: tight in the 3D render view, the visible-slice box in multiplanar
-   * (shrinking with 2D zoom). A number pins it.
-   */
-  radius?: 'auto' | number
-  /** GPU byte budget for the planned brick set (default 1.5 GB). */
-  budgetBytes?: number
-  /** Max bricks in the plan (default 240; must stay < the renderer's per-tile cap). */
-  maxBricks?: number
-  /** Brick texture edge in level voxels (default 128). */
-  cellEdge?: number
-  /**
-   * Per-axis halo in level voxels (default [1,1,1], which is what hardware
-   * trilinear sampling needs). Raised to at least {@link CUBIC_MIN_HALO} on
-   * every axis while the host has `volumeIsCubicInterpolation` on, because the
-   * cubic kernel reaches two voxels past a brick face; see {@link setHalo}.
-   */
-  halo?: Vec3i
-  /** LOD falloff factor (default 1 = 2:1-balanced octree). */
-  detail?: number
-  /** Finest level index (max-detail cap; 0 = finest, default 0). */
-  minLevel?: number
-  /**
-   * Max brick texture edge the renderer will upload. Defaults to the host's
-   * configured `maxTextureDimension3D` option (256 when the host does not set
-   * one), so planned bricks never exceed the renderer's tile limit.
-   */
-  deviceLimit?: number
   /** Max concurrent source fetches (default 6; bounds the request flood). */
   maxConcurrentLoads?: number
   /** Retry attempts for a transient fetch failure (default 3, exp backoff). */
   retryAttempts?: number
-  /** Center the 3D render on the crosshair: 'pivot' (orbit about it) or 'none' (default). */
-  renderCentering?: 'pivot' | 'none'
-  /** Debounce for focus-follow rebuilds, ms (default 150). */
-  debounceMs?: number
-  /**
-   * Back the streamed bricks with a whole-volume coarse "floor", built from the
-   * coarsest pyramid level and installed via {@link NiiVue.setBaseCoarseFloor}
-   * (default true). A brick with no resident texture draws nothing, so without a
-   * floor the scene background shows through — briefly for EVERY region after a
-   * refocus swaps the plan, which is what reads as a flash while zooming. The
-   * floor also gives the streaming cross-fade something to dissolve in over.
-   * Skipped (with a warning) when the coarsest level is too large to upload as
-   * one texture, or carries a datatype with no per-voxel intensity.
-   */
-  coarseFloor?: boolean
 }
-
-interface ResolvedOptions {
-  budgetBytes: number
-  maxBricks: number
-  cellEdge: number
-  halo: Vec3i
-  detail: number
-  minLevel: number
-  deviceLimit: number
-  renderCentering: 'pivot' | 'none'
-  debounceMs: number
-  coarseFloor: boolean
-}
-
-const DEFAULT_BUDGET_BYTES = 1_500_000_000
 
 /**
  * Size guards for the auto-built coarse floor. It is oriented into ONE RGBA
@@ -162,7 +110,7 @@ export function planForFocus(
   source: ChunkedVolumeSource,
   focusFrac: Vec3f,
   radius: number,
-  o: Omit<ResolvedOptions, 'coarseFloor'>,
+  o: PlanShapeOptions,
 ): ChunkPlan {
   const levelDims = source.levels.map((l) => l.shape)
   const center = focusCenterBiased(levelDims[0], focusFrac, o.cellEdge)
@@ -293,8 +241,10 @@ export class NVChunkedVolume {
   private readonly host: NiiVue
   private readonly source: ChunkedVolumeSource
   private readonly o: ResolvedOptions
-  private readonly followCrosshair: boolean
-  private readonly radiusOpt: 'auto' | number
+  /** The options this volume was loaded with; re-folded by {@link setBudgetPlan}. */
+  private readonly loadOptions: ChunkedVolumeOptions
+  private followCrosshair: boolean
+  private subscribedToCrosshair = false
   private readonly onLocationChange: () => void
   private readonly onViewDestroyed: () => void
 
@@ -319,29 +269,15 @@ export class NVChunkedVolume {
     }
     this.host = host
     this.source = source
-    this.o = {
-      budgetBytes: options.budgetBytes ?? DEFAULT_BUDGET_BYTES,
-      maxBricks: options.maxBricks ?? 240,
-      cellEdge: options.cellEdge ?? 128,
-      // Public default stays [1,1,1] (trilinear's requirement, and the cheapest
-      // brick). Cubic reads two voxels past a face, so an already-cubic host
-      // gets the larger halo from the first plan rather than a re-stream.
-      halo: raiseHalo(
-        options.halo ?? [1, 1, 1],
-        host.volumeIsCubicInterpolation ? CUBIC_MIN_HALO : 0,
-      ),
-      detail: options.detail ?? 1,
-      minLevel: clampLevel(options.minLevel ?? 0, source),
-      deviceLimit: options.deviceLimit ?? hostDeviceLimit(host) ?? 256,
-      renderCentering: options.renderCentering ?? 'none',
-      debounceMs: options.debounceMs ?? 150,
-      coarseFloor: options.coarseFloor ?? true,
-    }
-    this.radiusOpt = options.radius ?? 'auto'
-    const focus = options.focus ?? 'crosshair'
-    this.followCrosshair = focus === 'crosshair'
-    this.focusFrac = Array.isArray(focus)
-      ? [focus[0], focus[1], focus[2]]
+    this.loadOptions = options
+    // The plan-shaping options are folded by resolveBudgetPlan, so a preset, an
+    // explicit plan, and the individual knobs all land in one place with one
+    // precedence rule (knobs win). Passing no plan reproduces the pre-plan
+    // defaults exactly.
+    this.o = resolveBudgetPlan(options, this.planContext())
+    this.followCrosshair = this.o.focus === 'crosshair'
+    this.focusFrac = Array.isArray(this.o.focus)
+      ? [this.o.focus[0], this.o.focus[1], this.o.focus[2]]
       : [0.5, 0.5, 0.5]
     host._registerChunkedVolume(this)
     this.onLocationChange = () => this.handleLocationChange()
@@ -391,9 +327,7 @@ export class NVChunkedVolume {
    */
   async init(): Promise<void> {
     await this.host.addVolume(this.volume)
-    if (this.followCrosshair) {
-      this.host.addEventListener('locationChange', this.onLocationChange)
-    }
+    this.syncCrosshairSubscription()
     // Self-dispose if the controller is destroyed without the caller disposing
     // this handle, so the locationChange listener + host reference don't leak
     // (and can't fire against a torn-down view).
@@ -517,6 +451,55 @@ export class NVChunkedVolume {
     this.refocus()
   }
 
+  /** The budget plan currently in force, as resolved values. */
+  get budgetPlan(): BudgetPlan {
+    return {
+      focus: Array.isArray(this.o.focus)
+        ? [this.o.focus[0], this.o.focus[1], this.o.focus[2]]
+        : this.o.focus,
+      radius: this.o.radius,
+      detail: this.o.detail,
+      budgetBytes: this.o.budgetBytes,
+      maxBricks: this.o.maxBricks,
+      targetFrameMs: this.o.targetFrameMs,
+      debounceMs: this.o.debounceMs,
+    }
+  }
+
+  /**
+   * Switch budget plan at runtime, and re-plan (debounced). The plan is folded
+   * back over the options this volume was LOADED with, so any knob the caller
+   * pinned then (a demo's VRAM ceiling, a pinned `radius`) still wins -- the
+   * same precedence `loadChunkedVolume` applied. Switching to or away from a
+   * crosshair focus subscribes/unsubscribes `locationChange` accordingly.
+   *
+   * `minLevel` is deliberately carried over from the CURRENT state rather than
+   * re-read from the load options, so a plan switch does not silently undo a
+   * {@link setMaxDetail} the app made in between.
+   */
+  setBudgetPlan(plan: BudgetPlanSpec): void {
+    if (this.disposed) return
+    const next = resolveBudgetPlan(
+      { ...this.loadOptions, budgetPlan: plan, minLevel: this.o.minLevel },
+      this.planContext(),
+    )
+    // The halo is raise-only (see raiseHaloTo): a plan switch must not undercut
+    // a wider reconstruction kernel that was already streamed for.
+    next.halo = raiseHalo(next.halo, Math.max(...this.o.halo))
+    Object.assign(this.o, next)
+    this.followCrosshair = this.o.focus === 'crosshair'
+    if (Array.isArray(this.o.focus)) {
+      this.focusFrac = [this.o.focus[0], this.o.focus[1], this.o.focus[2]]
+    } else if (!this.followCrosshair) {
+      this.focusFrac = [0.5, 0.5, 0.5]
+    }
+    this.syncCrosshairSubscription()
+    // Adopt the crosshair NOW rather than waiting for the next locationChange,
+    // so switching back to a crosshair plan does not plan around a stale focus.
+    if (this.followCrosshair) this.handleLocationChange()
+    this.refocus()
+  }
+
   /** The halo the current plan is being built with. */
   get halo(): Vec3i {
     return [this.o.halo[0], this.o.halo[1], this.o.halo[2]]
@@ -569,10 +552,26 @@ export class NVChunkedVolume {
       clearTimeout(this.refocusHandle)
       this.refocusHandle = null
     }
-    if (this.followCrosshair) {
+    this.followCrosshair = false
+    this.syncCrosshairSubscription()
+    this.host.removeEventListener('viewDestroyed', this.onViewDestroyed)
+  }
+
+  /**
+   * Add or drop the `locationChange` listener so it is subscribed exactly when
+   * the focus follows the crosshair. Idempotent: `subscribedToCrosshair` tracks
+   * the real state, so repeated calls (init, a plan switch, dispose) can never
+   * double-subscribe or leak a listener.
+   */
+  private syncCrosshairSubscription(): void {
+    const want = this.followCrosshair && !this.disposed
+    if (want === this.subscribedToCrosshair) return
+    this.subscribedToCrosshair = want
+    if (want) {
+      this.host.addEventListener('locationChange', this.onLocationChange)
+    } else {
       this.host.removeEventListener('locationChange', this.onLocationChange)
     }
-    this.host.removeEventListener('viewDestroyed', this.onViewDestroyed)
   }
 
   private handleLocationChange(): void {
@@ -593,6 +592,20 @@ export class NVChunkedVolume {
     this.refocus()
   }
 
+  /**
+   * Host/source facts the budget plan cannot know on its own. The public halo
+   * default stays [1,1,1] (trilinear's requirement, and the cheapest brick);
+   * cubic reads two voxels past a face, so an already-cubic host gets the larger
+   * halo from the FIRST plan rather than a re-stream.
+   */
+  private planContext(): BudgetPlanContext {
+    return {
+      levelCount: this.source.levels.length,
+      minHalo: this.host.volumeIsCubicInterpolation ? CUBIC_MIN_HALO : 0,
+      deviceLimit: hostDeviceLimit(this.host) ?? 256,
+    }
+  }
+
   private buildPlan(): ChunkPlan {
     return planForFocus(
       this.source,
@@ -603,8 +616,15 @@ export class NVChunkedVolume {
   }
 
   private currentRadius(): number {
-    if (typeof this.radiusOpt === 'number') return this.radiusOpt
+    const radius = this.o.radius
+    if (typeof radius === 'number') return radius
     const common = this.source.levels[0].shape
+    // 'volume': a ball that swallows every brick, so nothing is outside the
+    // finest shell and the plan comes back uniform -- the budget/maxBricks pass
+    // then coarsens it as a whole to the finest level that fits.
+    if (radius === 'volume') {
+      return Math.hypot(common[0], common[1], common[2]) / 2
+    }
     // Render view: a finest CORE around the crosshair, roughly one cell in
     // radius. A too-tight radius leaves coarse (mean-downsampled, so thin
     // structure washes out) bricks right at the focus; a full-cell radius keeps

@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 import { mat4 } from 'gl-matrix'
+import { SLICE_TYPE } from '@/NVConstants'
 import type NiiVue from '@/NVControlBase'
 import type { NVImage, VolumeChunkSourceRequest } from '@/NVTypes'
 import type {
@@ -616,5 +617,121 @@ describe('NVChunkedVolume coarse floor', () => {
 
     expect(await mgr.applyCoarseFloor()).toBe(false)
     expect(installs).toEqual([null])
+  })
+})
+
+describe('budget plans', () => {
+  // A pyramid deep enough that the budget pass has somewhere to coarsen TO.
+  const pyramid: ChunkedVolumeSource = {
+    datatypeCode: 4,
+    levels: [512, 256, 128, 64, 32].map((n, i) => ({
+      level: i,
+      shape: [n, n, n] as Vec3i,
+      spacing: [2 ** i, 2 ** i, 2 ** i] as Vec3f,
+    })),
+    fetchChunk: async () => new Uint8Array(),
+  }
+
+  /** Records locationChange subscribe/unsubscribe so leaks are assertable. */
+  function makePlanHost(): { host: NiiVue; listeners: () => number } {
+    let n = 0
+    const host = {
+      swapVolumeChunkPlan: async () => {},
+      _registerChunkedVolume: () => {},
+      _unregisterChunkedVolume: () => {},
+      addVolume: async () => {},
+      sliceType: SLICE_TYPE.MULTIPLANAR,
+      pan2Dxyzmm: [0, 0, 0, 1],
+      getCrosshairPos: () => [0, 0, 0],
+      addEventListener: (t: string) => {
+        if (t === 'locationChange') n++
+      },
+      removeEventListener: (t: string) => {
+        if (t === 'locationChange') n--
+      },
+    } as unknown as NiiVue
+    return { host, listeners: () => n }
+  }
+
+  const levelsOf = (mgr: NVChunkedVolume): number[] => [
+    ...new Set(mgr.currentPlan.chunks.map((c) => c.sourceLevel ?? 0)),
+  ]
+
+  test("'uniform' plans one level everywhere; an 8x smaller budget steps it by 1", () => {
+    const at = (budgetBytes: number): number[] => {
+      const mgr = new NVChunkedVolume(makePlanHost().host, pyramid, {
+        budgetPlan: 'uniform',
+        coarseFloor: false,
+        cellEdge: 64,
+        // High enough that BYTES are the only lever under test.
+        maxBricks: 100000,
+        budgetBytes,
+      })
+      return levelsOf(mgr)
+    }
+    const wide = at(160 * 1024 * 1024)
+    expect(wide).toHaveLength(1)
+    const tight = at(20 * 1024 * 1024)
+    expect(tight).toHaveLength(1)
+    // One eighth the bytes is one octree step: each level is 8x fewer voxels.
+    expect(tight[0]).toBe(wide[0] + 1)
+  })
+
+  test("'focus' on the same source is genuinely mixed-resolution", () => {
+    const mgr = new NVChunkedVolume(makePlanHost().host, pyramid, {
+      budgetPlan: 'focus',
+      coarseFloor: false,
+      cellEdge: 64,
+      radius: 64,
+      budgetBytes: 512 * 1024 * 1024,
+    })
+    expect(levelsOf(mgr).length).toBeGreaterThan(1)
+  })
+
+  test('an individual option still wins over the named plan', () => {
+    const mgr = new NVChunkedVolume(makePlanHost().host, pyramid, {
+      budgetPlan: 'uniform',
+      coarseFloor: false,
+      focus: 'crosshair',
+    })
+    expect(mgr.budgetPlan.focus).toBe('crosshair')
+    // Untouched by the override, so still the preset's.
+    expect(mgr.budgetPlan.radius).toBe('volume')
+  })
+
+  test('focus -> uniform -> focus leaks no crosshair subscription', async () => {
+    const { host, listeners } = makePlanHost()
+    const mgr = new NVChunkedVolume(host, pyramid, {
+      budgetPlan: 'focus',
+      coarseFloor: false,
+    })
+    await mgr.init()
+    expect(listeners()).toBe(1)
+
+    mgr.setBudgetPlan('uniform')
+    expect(mgr.budgetPlan.focus).toBe('none')
+    expect(listeners()).toBe(0)
+    // Idempotent: re-selecting the same plan must not unsubscribe twice.
+    mgr.setBudgetPlan('uniform')
+    expect(listeners()).toBe(0)
+
+    mgr.setBudgetPlan('focus')
+    expect(listeners()).toBe(1)
+    mgr.dispose()
+    expect(listeners()).toBe(0)
+    // A switch after teardown must not resubscribe a disposed manager.
+    mgr.setBudgetPlan('focus')
+    expect(listeners()).toBe(0)
+  })
+
+  test('a plan switch keeps a max-detail cap set in between', () => {
+    const mgr = new NVChunkedVolume(makePlanHost().host, pyramid, {
+      budgetPlan: 'focus',
+      coarseFloor: false,
+      cellEdge: 64,
+    })
+    mgr.setMaxDetail(2)
+    mgr.setBudgetPlan('uniform')
+    expect(Math.min(...levelsOf(mgr))).toBeGreaterThanOrEqual(2)
   })
 })

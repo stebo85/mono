@@ -2,8 +2,11 @@
 
 A plan for giving the chunked-volume planner more than one policy.
 
-Status: **design, not implemented.** Tracked from `docs/streaming-todos.md`.
-Background on the machinery this builds on: `docs/high-res-streaming.md`.
+Status: **Stages 1-3 implemented** (`src/volume/budgetPlans.ts`, exposed by the
+Plan control in `examples/range.html`). Stage 4, the closed-loop frame-time
+controller behind `targetFrameMs`, is still design. Tracked from
+`docs/streaming-todos.md`; background on the machinery this builds on:
+`docs/high-res-streaming.md`.
 
 ## Terms
 
@@ -56,7 +59,7 @@ export interface BudgetPlan {
   debounceMs: number
 }
 
-export type BudgetPlanName = keyof typeof BUDGET_PLANS
+export type BudgetPlanName = 'focus' | 'uniform' | 'interactive'
 ```
 
 Presets:
@@ -65,7 +68,22 @@ Presets:
 | --- | --- | --- | --- | --- | --- |
 | `focus` | `'crosshair'` | `'auto'` | 240 | - | Exactly today's defaults |
 | `uniform` | `'none'` | `'volume'` | 240 | - | Finest uniform level that fits |
-| `interactive` | `'crosshair'` | `'auto'` | 96 | 16.7 | Budgeted by draw cost |
+| `interactive` | `'crosshair'` | `'auto'` | 128 | 16.7 | Budgeted by draw cost |
+
+**Every preset carries the same `budgetBytes`.** How much VRAM a machine can
+spare is a property of the DEVICE; how to spend it is the use case. So an app
+pins the ceiling once as an individual option (which wins over the plan) and
+still switches plans freely. `examples/range.js` does exactly that with its
+2 GB ceiling.
+
+**Why 128 and not 96.** Measured on the HOA heart pyramid at `cellEdge` 128:
+the octree coarsens a whole shell at a time, so plans come in steps -- a 4x4x4
+core is 64 bricks and each further shell adds ~56. `focus` lands on 176 bricks
+(L2/L3/L4, 1582 MB); a cap of 128 lands on 120 (L3/L4, 1071 MB), one shell
+less; a cap of 96 collapses all the way to the 64-brick uniform coarse plan,
+which is `uniform`, not a cheaper focused plan. Where the BYTE budget binds
+first (a 2048^3 cube at 2 GB pins both presets to the same 64 bricks) the two
+plans agree, which is correct: the draw count was already at its floor.
 
 **Compatibility.** The existing per-knob options (`focus`, `radius`, `detail`,
 `budgetBytes`, `maxBricks`, `debounceMs`) stay and win over the plan, so no
@@ -77,7 +95,7 @@ existing call changes behavior. Precedence, lowest first:
 
 ## Stages
 
-### Stage 1 - name what already exists (no behavior change)
+### Stage 1 - name what already exists (no behavior change) - DONE
 
 - New `src/volume/budgetPlans.ts`: the `BudgetPlan` type, `BUDGET_PLANS`, and
   `resolveBudgetPlan(options): ResolvedOptions`.
@@ -86,7 +104,7 @@ existing call changes behavior. Precedence, lowest first:
 - Test: `resolveBudgetPlan({})` deep-equals the current resolved defaults, and
   each individual option still overrides its preset field.
 
-### Stage 2 - `'uniform'`
+### Stage 2 - `'uniform'` - DONE
 
 The claim to verify first, because if it holds this stage is nearly free: with
 a radius that covers the whole volume, the budget pass in `chunkVolumeMultiLOD`
@@ -98,11 +116,13 @@ pass falls through to raising the global level floor, which coarsens uniformly.
 - `focus: 'none'` pins the centre and skips the `locationChange` subscription.
 - Check `focusCenterBiased` with a whole-volume radius: the bias is irrelevant
   there but must not push the centre outside the volume.
-- Test (`chunking.test.ts`): every brick reports the same `sourceLevel`, and
-  cutting the budget 8x steps that level by exactly 1.
+- Test (`NVChunkedVolume.test.ts`, so the plan name is exercised end to end):
+  every brick reports the same `sourceLevel`, and cutting the budget 8x steps
+  that level by exactly 1. It lifts `maxBricks` for the measurement, since with
+  the preset's cap the brick count binds first and the bytes never bite.
 - Keep the coarse floor on. It is what shows while the uniform set streams.
 
-### Stage 3 - switching plans mid-session
+### Stage 3 - switching plans mid-session - DONE
 
 The natural flow is explore with `'focus'`, then switch to `'uniform'` to take
 a figure. `swapChunkedVolumePlan` already swaps in place keeping unchanged
@@ -112,9 +132,23 @@ bricks resident, so the plumbing exists.
 - Subscription handling: switching to `'none'` unsubscribes `locationChange`;
   switching back resubscribes. Guard against double-subscribe.
 - Test: `focus -> uniform -> focus` leaves the manager consistent and leaks no
-  subscriptions.
+  subscriptions, and a switch after `dispose()` does not resubscribe.
 
-### Stage 4 - `'interactive'` and the cost model
+As implemented, the switch re-folds the new plan over the options the volume was
+LOADED with, so a knob the app pinned then (the demo's VRAM ceiling, a pinned
+`radius`) still wins -- the same precedence `loadChunkedVolume` applied. Two
+things are deliberately carried over from the CURRENT state instead: `minLevel`,
+so a plan switch cannot silently undo a `setMaxDetail` made in between, and the
+halo, which stays raise-only so a switch cannot undercut a wider reconstruction
+kernel that was already streamed for. Subscription state is tracked by a
+`subscribedToCrosshair` flag, so init / switch / dispose are all idempotent.
+
+### Stage 4 - `'interactive'` and the cost model - NOT DONE
+
+`targetFrameMs` is resolved and readable but nothing acts on it yet. What
+shipped is the static half: `interactive` buys its headroom with a lower
+`maxBricks`, the direct proxy for draw count (one brick = one ray-marched cube
+draw). The closed loop below is what remains.
 
 This is the only stage that needs genuinely new machinery, because bytes do not
 predict frame time.

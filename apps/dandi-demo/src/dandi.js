@@ -145,6 +145,21 @@ const AXIS_INDEX = { x: 0, y: 1, z: 2 }
 const PLANE_AXES = { x: [1, 2], y: [0, 2], z: [0, 1] }
 const AXIS_NAME = ['x', 'y', 'z']
 
+// The volumetric pane opens on the 3D render: it is the view that shows a
+// streamed brick set arriving as a whole, and the one the zoom slider drives.
+// The slice views stay one dropdown away for anyone who wants to read a plane.
+// Render-only hands the whole pane to the volume, where 1.00x leaves a rotated
+// cube's corners hanging off the edges. 0.80x frames the extent with a margin.
+const DEFAULT_3D_ZOOM = 0.8
+
+const VIEWS = {
+  render: SLICE_TYPE.RENDER,
+  multiplanar: SLICE_TYPE.MULTIPLANAR,
+  axial: SLICE_TYPE.AXIAL,
+  coronal: SLICE_TYPE.CORONAL,
+  sagittal: SLICE_TYPE.SAGITTAL,
+}
+
 function el(id) {
   const node = document.getElementById(id)
   if (!node) throw new Error(`Missing #${id}`)
@@ -157,6 +172,7 @@ const els = {
   plane: el('plane'),
   planeVal: el('planeVal'),
   follow: el('follow'),
+  view: el('view'),
   detail: el('detail'),
   colormap: el('colormap'),
   window: el('window'),
@@ -979,6 +995,9 @@ els.axis.addEventListener('change', () => {
 els.plane.addEventListener('input', () => {
   setPlane(Number(els.plane.value))
 })
+els.view.addEventListener('change', () => {
+  if (nv) nv.sliceType = VIEWS[els.view.value] ?? SLICE_TYPE.RENDER
+})
 els.detail.addEventListener('change', () => {
   activeCv?.setMaxDetail(Number(els.detail.value) || 0)
 })
@@ -1002,13 +1021,14 @@ async function main() {
     backend,
     backgroundColor: [0.02, 0.03, 0.03, 1],
     isColorbarVisible: true,
-    sliceType: SLICE_TYPE.MULTIPLANAR,
+    sliceType: VIEWS[els.view.value] ?? SLICE_TYPE.RENDER,
     maxTextureDimension3D: 256,
     maxChunkResidencyBytes: DEFAULT_RESIDENCY_BYTES,
   })
   await nv.attachToCanvas(els.canvas)
   nv.addEventListener('locationChange', onLocationChange)
   nv.addEventListener('change', onNiivueChange)
+  nv.scaleMultiplier = DEFAULT_3D_ZOOM
   syncZoomControl(nv.scaleMultiplier)
   slideView = await createSlideView()
   // One font fetch for the pane. The widget owns its GPU resources on whichever

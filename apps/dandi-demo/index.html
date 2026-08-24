@@ -358,6 +358,16 @@
         </label>
       </span>
       <span class="control">
+        <label for="view" title="What the volumetric pane draws">View</label>
+        <select id="view">
+          <option value="render" selected>render (3D)</option>
+          <option value="multiplanar">multiplanar</option>
+          <option value="axial">axial</option>
+          <option value="coronal">coronal</option>
+          <option value="sagittal">sagittal</option>
+        </select>
+      </span>
+      <span class="control">
         <label for="detail" title="Finest pyramid level the volumetric view may stream">
           Detail
         </label>
@@ -366,8 +376,8 @@
         </select>
       </span>
       <span class="control">
-        <label for="zoom">3D zoom <span id="zoomVal">1.00x</span></label>
-        <input id="zoom" type="range" min="0.5" max="2" step="0.01" value="1"
+        <label for="zoom">3D zoom <span id="zoomVal">0.80x</span></label>
+        <input id="zoom" type="range" min="0.5" max="2" step="0.01" value="0.8"
           title="Volumetric zoom (scaleMultiplier); the wheel over the 3D tile moves the same slider" />
       </span>
       <span class="control">

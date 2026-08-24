@@ -23,6 +23,9 @@ is the default).
   100 MB one. The HUDs report what that costs in practice: resident bricks,
   visible and pending tiles, decoded voxels, and cache hits. Deep-zooming the
   larger stores puts tiles visibly in flight.
+- **Views.** The volumetric pane opens on the 3D render, which is where a
+  streamed brick set is legible as a whole; the `View` dropdown switches it to
+  multiplanar or to a single axial, coronal, or sagittal slice.
 - **The UIKit ruler.** Tick `measure`, then click two points on the deep-zoom
   pane. Endpoints are held in slide base pixels, so a measurement stays pinned
   to the tissue through pan, zoom and a level swap.

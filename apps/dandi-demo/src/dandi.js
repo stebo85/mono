@@ -21,6 +21,7 @@
 // 64^3 or 128^3 chunks and throws most of it away. Coarse levels are cheap; the
 // finest level of a gigavoxel store is not. The tile size is aligned to the
 // store's own chunk grid so neighbouring tiles at least share decodes.
+
 import NiiVue, {
   fetchOmeZarrChunkedSource,
   lookupColorMap,
@@ -29,7 +30,12 @@ import NiiVue, {
   SlideRenderer,
   SlideRendererGPU,
   VolumeSliceSource,
-} from '../src/index.ts'
+} from '@niivue/niivue'
+// The measuring ruler is a UIKit widget, not demo code: @niivue/uikit owns
+// everything that draws in the overlay. The slide renderers expose the same
+// `overlayDraw` hook the controller does, so the widget composes onto the
+// standalone deep-zoom pane exactly as it does onto a NiiVue canvas.
+import { loadDefaultFont, UIKitRulerOverlay } from '@niivue/uikit'
 
 const backend =
   new URLSearchParams(location.search).get('backend') === 'webgpu'
@@ -68,6 +74,43 @@ const DATASETS = {
       'Chollet, Etienne; Yael Balbastre; Mauri, Chiara; Magnain, Caroline; ' +
       'Fischl, Bruce; Wang, Hui (2024). sOCT of the Human Somatosensory ' +
       'Cortex and Vessel Segmentation. DANDI archive, CC-BY-4.0.',
+  },
+  neun: {
+    label: '000026 SPIM NeuN slab',
+    zarrId: 'c3418ed4-de7e-4c37-9bab-f7da215f90e7',
+    dandiset: '000026',
+    asset:
+      'sub-I45/ses-SPIM/micr/' +
+      'sub-I45_ses-SPIM_sample-BrocaAreaS35_stain-NeuN_SPIM.ome.zarr',
+    size: '30.5 GB',
+    // 207 x 10693 x 10915 uint16 at 3.6 um: a thick SECTION rather than a block,
+    // so one z plane is a 117 megapixel image -- the largest tile set here, and
+    // the closest thing in DANDI to a classic whole-slide scan. The pyramid is
+    // anisotropic (z is never downsampled, xy halves five times), which both the
+    // slide manifest and the multi-LOD planner map per axis.
+    axis: 'z',
+    credit:
+      'Mazzamuto, Giacomo; Costantini, Irene; Pavone, Francesco Saverio; ' +
+      'Hof, Patrick R.; Boas, David A.; Fischl, Bruce; et al. (2025). Human ' +
+      'brain cell census for BA 44/45. DANDI archive, CC-BY-4.0.',
+  },
+  hipct: {
+    label: '000026 HiP-CT block',
+    zarrId: '5c37c233-222f-4e60-96e7-a7536e08ef61',
+    dandiset: '000026',
+    asset: 'sub-I58/ses-Hip-CT/micr/sub-I58_sample-01_chunk-01_hipCT.ome.zarr',
+    size: '1.0 TB',
+    // Hierarchical phase-contrast tomography, 10656 x 9413 x 9413 uint16 at
+    // 15.13 um isotropic. A terabyte that opens in a second: nearly cubic, so
+    // it is the one store here that is large in BOTH panes at once. Its coarsest
+    // level (666 x 588 x 588) is past the core's coarse-floor cap, so the
+    // volumetric pane starts empty and fills as bricks arrive instead of
+    // fading up from a whole-volume fallback.
+    axis: 'z',
+    credit:
+      'Mazzamuto, Giacomo; Costantini, Irene; Pavone, Francesco Saverio; ' +
+      'Hof, Patrick R.; Boas, David A.; Fischl, Bruce; et al. (2025). Human ' +
+      'brain cell census for BA 44/45. DANDI archive, CC-BY-4.0.',
   },
   spim: {
     label: '000108 light-sheet SPIM',
@@ -117,7 +160,10 @@ const els = {
   detail: el('detail'),
   colormap: el('colormap'),
   window: el('window'),
+  zoom: el('zoom'),
+  zoomVal: el('zoomVal'),
   fit: el('fit'),
+  measure: el('measure'),
   canvas: el('nv-canvas'),
   slideCanvas: el('slide-canvas'),
   volBusy: el('volBusy'),
@@ -145,6 +191,13 @@ let planeTimer = 0
 let windowRange = [0, 1]
 let drag = null
 let dragMoved = false
+let ruler = null
+// Ruler endpoints are held in SLIDE base-pixel coordinates, not screen pixels,
+// so a measurement stays pinned to the tissue through pan, zoom and a level
+// swap. `hoverCss` previews the second leg while it is still being placed.
+let ruleA = null
+let ruleB = null
+let hoverCss = null
 
 // ---------------------------------------------------------------- utilities
 
@@ -229,15 +282,32 @@ function displayChunkShape() {
   return [at(order.x), at(order.y), at(order.z)]
 }
 
-// A tile edge that is a multiple of the in-plane chunk edge and lands near 256:
-// small enough that a pan does not stall on one huge decode, large enough that
-// the per-tile overhead stays amortised.
+// For a CHUNK-ALIGNED tile the decoded bytes work out to `edge^2 * chunkDepth *
+// bytesPerVoxel` -- the tile area times the chunk extent along the plane normal.
+// So pick the largest aligned edge that stays inside a per-tile decode budget.
+// The bytes fetched for a given screen area are the same whichever edge wins
+// (the chunk is the atom either way); a smaller tile just splits them into more,
+// smaller pieces, so the pane fills progressively instead of stalling on one
+// 17 MB decode. That is what makes the 128^3-chunked terabyte stores usable.
+const TILE_DECODE_BUDGET_BYTES = 8 * 1024 * 1024
+const MAX_TILE_EDGE = 512
+
 function tileSizeForAxis(axis) {
   const [u, v] = PLANE_AXES[axis]
   const chunks = displayChunkShape()
   const edge = Math.max(chunks[u], chunks[v])
   if (!Number.isInteger(edge) || edge < 1) return 256
-  return edge >= 256 ? edge : edge * Math.max(1, Math.round(256 / edge))
+  const bytesPerVoxel =
+    TYPED_ARRAYS[chunkSource.datatypeCode]?.BYTES_PER_ELEMENT ?? 1
+  const slab = Math.max(1, chunks[AXIS_INDEX[axis]]) * bytesPerVoxel
+  let tile = edge
+  while (
+    tile * 2 <= MAX_TILE_EDGE &&
+    4 * tile * tile * slab <= TILE_DECODE_BUDGET_BYTES
+  ) {
+    tile *= 2
+  }
+  return tile
 }
 
 // ------------------------------------------------------------ source loading
@@ -255,15 +325,25 @@ const TYPED_ARRAYS = {
   768: Uint32Array,
 }
 
+// The probe reads a CENTRED BOX, not the whole coarsest level: a terabyte store's
+// coarsest level is still 666 x 588 x 588 (460 MB), which is not a window probe,
+// it is a download. A centred box is where the sample is in every one of these
+// stores, and the percentiles are taken over a subsample so the sort stays cheap
+// whatever the box holds.
+const WINDOW_PROBE_EDGE = 128
+const WINDOW_PROBE_SAMPLES = 200000
+
 async function autoWindow(source) {
   const index = source.levels.length - 1
   const level = source.levels[index]
   const Ctor = TYPED_ARRAYS[source.datatypeCode]
   if (!Ctor) return [0, 255]
+  const texDims = level.shape.map((n) => Math.min(n, WINDOW_PROBE_EDGE))
+  const texOrigin = level.shape.map((n, a) => Math.floor((n - texDims[a]) / 2))
   const bytes = await source.fetchChunk({
     levelIndex: index,
-    texOrigin: [0, 0, 0],
-    texDims: level.shape,
+    texOrigin,
+    texDims,
     bytesPerVoxel: Ctor.BYTES_PER_ELEMENT,
   })
   const aligned =
@@ -273,8 +353,16 @@ async function autoWindow(source) {
     aligned.byteOffset,
     aligned.byteLength / Ctor.BYTES_PER_ELEMENT,
   )
-  const sorted = Float64Array.from(values).sort()
-  if (sorted.length === 0) return [0, 255]
+  const stride = Math.max(1, Math.floor(values.length / WINDOW_PROBE_SAMPLES))
+  const kept = []
+  for (let i = 0; i < values.length; i += stride) {
+    // Float stores (the OCT ones) carry NaN outside the imaged cylinder, and a
+    // NaN sorts to the end of a typed array, which would drag the high
+    // percentile with it.
+    if (Number.isFinite(values[i])) kept.push(values[i])
+  }
+  if (kept.length === 0) return [0, 255]
+  const sorted = Float64Array.from(kept).sort()
   const at = (p) =>
     sorted[Math.min(sorted.length - 1, Math.floor(p * sorted.length))]
   const low = at(0.02)
@@ -364,6 +452,9 @@ function rebuildSlide({ keepViewport = true } = {}) {
   previous?.removeEventListener('change', requestSlideRender)
   previous?.dispose?.()
   slideView?.renderer?.clearTextures?.()
+  // Slide coordinates only mean something within one plane orientation, so a
+  // measurement survives a plane step (same axes) but not an axis swap.
+  if (!keepViewport) clearRuler()
   const [u, v] = PLANE_AXES[axis]
   const spacing = chunkSource.levels[0].spacing
   const source = new VolumeSliceSource(chunkSource, {
@@ -440,6 +531,7 @@ function renderSlide() {
       slideFitted = true
     }
     slide.clampViewport(screen)
+    updateRuler(screen)
     if (slideView.kind === 'gpu') {
       slideView.renderer.render([slide], screen)
     } else {
@@ -561,6 +653,89 @@ function updateVolumeHud() {
   `
 }
 
+// The ruler is the UIKit measurement widget (`UIKitRulerOverlay`), drawn into the
+// slide pane's OWN frame through the renderer's `overlayDraw` hook -- the same
+// seam `nv.registerOverlayRenderer` uses on a NiiVue canvas, so the widget is
+// unchanged between the two. These panes span a 15 um synchrotron voxel up to a
+// 142 mm block in a few wheel turns, and a graduated bar held against a vessel
+// says more at every one of those zooms than "18.28 um/px" does.
+const RULER_COLOR = [1, 0.85, 0, 1]
+const RULER_LABEL_PX = 22
+
+function formatLength(um) {
+  if (um >= 1000) return `${um / 1000} mm`
+  if (um >= 1) return `${Number(um.toPrecision(3))} um`
+  return `${Number(um.toPrecision(2))} um`
+}
+
+// Slide base pixels -> device pixels, the space the overlay draws in.
+function slideToDevice(point, screen) {
+  const { xCss, yCss } = slide.slideToScreen(point.x, point.y, screen)
+  const dpr = screen.devicePixelRatio ?? 1
+  return [xCss * dpr, yCss * dpr]
+}
+
+// `pixelSpacingMM` is per axis, so each leg is scaled on its own axis before the
+// hypotenuse: these planes can be anisotropic (the NeuN slab never downsamples
+// z), and a single mean spacing would read long on one axis and short on the
+// other. Sub-millimetre spans report in micrometres, the scale most of these
+// stores actually live at.
+function measureSpan(a, b) {
+  const spacing = slide.manifest.pixelSpacingMM
+  const dx = b.x - a.x
+  const dy = b.y - a.y
+  if (!spacing) {
+    return {
+      length: Math.hypot(dx, dy),
+      units: 'px',
+      decimals: 0,
+      ticks: false,
+    }
+  }
+  const mm = Math.hypot(dx * spacing[0], dy * spacing[1])
+  return mm < 1
+    ? { length: mm * 1000, units: 'um', decimals: 1, ticks: false }
+    : { length: mm, units: 'mm', decimals: 2, ticks: true }
+}
+
+// Set BEFORE the slide draws: the overlay renders inside that same frame, so
+// geometry written afterwards would trail the tiles by one frame during a pan.
+function updateRuler(screen) {
+  if (!ruler) return
+  if (!slide || !ruleA) {
+    ruler.clear()
+    return
+  }
+  const b =
+    ruleB ??
+    (hoverCss ? slide.screenToSlide(hoverCss[0], hoverCss[1], screen) : null)
+  if (!b) {
+    ruler.clear()
+    return
+  }
+  const span = measureSpan(ruleA, b)
+  ruler.setRuler({
+    a: slideToDevice(ruleA, screen),
+    b: slideToDevice(b, screen),
+    length: span.length,
+    units: span.units,
+    decimals: span.decimals,
+    sizePx: RULER_LABEL_PX * (screen.devicePixelRatio ?? 1),
+    thickness: 3,
+    showTicks: span.ticks,
+    showTickNumbers: span.ticks,
+    lineColor: RULER_COLOR,
+    textColor: RULER_COLOR,
+  })
+}
+
+function clearRuler() {
+  ruleA = null
+  ruleB = null
+  hoverCss = null
+  ruler?.clear()
+}
+
 function updateSlideHud(screen) {
   if (!slide) return
   const level = slide.selectLevel()
@@ -577,11 +752,13 @@ function updateSlideHud(screen) {
   const scale = slide.viewport.scale
   const zoom =
     scale >= 1 ? `${scale.toFixed(2)}x` : `1:${(1 / scale).toFixed(1)}`
-  // One screen pixel covers `downsample / scale` base pixels, so the physical
-  // size of a screen pixel is that times the base pixel spacing.
-  const umPerPixel = spacing
-    ? (spacing[0] * 1000 * level.downsample) / Math.max(scale, 1e-6)
-    : null
+  // `screenToSlide` maps one CSS pixel to `1 / scale` BASE pixels, so a screen
+  // pixel spans the base spacing over the zoom -- the level's downsample does
+  // not enter it. How coarse the SAMPLED data is at that zoom is a separate
+  // quantity, reported on the level row as um per source texel.
+  const baseUm = spacing ? spacing[0] * 1000 : null
+  const umPerPixel = baseUm === null ? null : baseUm / Math.max(scale, 1e-6)
+  const umPerTexel = baseUm === null ? null : baseUm * level.downsample
   const [u, v] = PLANE_AXES[els.axis.value]
   els.slideHud.innerHTML = `
     <div class="title">${AXIS_NAME[u]}${AXIS_NAME[v]} plane, ${
@@ -592,7 +769,9 @@ function updateSlideHud(screen) {
     } x ${slide.manifest.height} px</span></div>
     <div class="row"><span class="key">level</span><span>L${level.index} ${
       level.width
-    } x ${level.height}, tile ${level.tileWidth}</span></div>
+    } x ${level.height}, tile ${level.tileWidth}${
+      umPerTexel ? ` (${formatLength(umPerTexel)}/texel)` : ''
+    }</span></div>
     <div class="row"><span class="key">zoom</span><span>${zoom}${
       umPerPixel ? ` (${umPerPixel.toFixed(2)} um/px)` : ''
     }</span></div>
@@ -620,6 +799,7 @@ async function loadDataset() {
   slide?.dispose?.()
   slide = null
   slideView?.renderer?.clearTextures?.()
+  clearRuler()
   try {
     const source = await fetchOmeZarrChunkedSource(datasetUrl(def), {
       cacheBytes: ZARR_CACHE_BYTES,
@@ -681,6 +861,21 @@ function applyWindow() {
   rebuildSlide()
 }
 
+// The wheel over the 3D tile writes `scene.scaleMultiplier` directly and clamps
+// it to [0.5, 2] -- the slider's own range, so the two agree instead of the
+// slider offering a zoom the next wheel tick would snap away. Both the wheel and
+// the public setter emit `change`, so one listener keeps the slider honest
+// however the zoom moved.
+function syncZoomControl(value) {
+  els.zoom.value = String(value)
+  els.zoomVal.textContent = `${value.toFixed(2)}x`
+}
+
+function onNiivueChange(event) {
+  if (event.detail?.property !== 'scaleMultiplier') return
+  syncZoomControl(Number(event.detail.value))
+}
+
 function applyColormap() {
   const index = activeCv ? volumeIndexById(activeCv.volume.id) : -1
   if (index >= 0) {
@@ -691,13 +886,40 @@ function applyColormap() {
 
 // ---------------------------------------------------------------- slide input
 
+function slideCssPos(event) {
+  const rect = els.slideCanvas.getBoundingClientRect()
+  return [event.clientX - rect.left, event.clientY - rect.top]
+}
+
+// Two clicks make a measurement: the first anchors, the second fixes it, a third
+// starts over. Only a click that did not pan places a point.
+function slideClickToRuler(event) {
+  if (!slide) return
+  const [x, y] = slideCssPos(event)
+  const point = slide.screenToSlide(x, y, slideScreen())
+  if (!ruleA || ruleB) {
+    ruleA = point
+    ruleB = null
+    hoverCss = null
+  } else {
+    ruleB = point
+  }
+  requestSlideRender()
+}
+
 els.slideCanvas.addEventListener('pointerdown', (event) => {
   drag = { pointerId: event.pointerId, x: event.clientX, y: event.clientY }
   dragMoved = false
 })
 
 els.slideCanvas.addEventListener('pointermove', (event) => {
-  if (!drag || drag.pointerId !== event.pointerId || !slide) return
+  if (!slide) return
+  if (!drag || drag.pointerId !== event.pointerId) {
+    if (!els.measure.checked || !ruleA || ruleB) return
+    hoverCss = slideCssPos(event)
+    requestSlideRender()
+    return
+  }
   const dx = event.clientX - drag.x
   const dy = event.clientY - drag.y
   if (!dragMoved && Math.abs(dx) + Math.abs(dy) < 3) return
@@ -715,6 +937,8 @@ function endDrag(event) {
   if (!drag || drag.pointerId !== event.pointerId) return
   if (dragMoved) {
     els.slideCanvas.releasePointerCapture?.(event.pointerId)
+  } else if (els.measure.checked) {
+    slideClickToRuler(event)
   } else {
     slideClickToCrosshair(event)
   }
@@ -758,6 +982,13 @@ els.plane.addEventListener('input', () => {
 els.detail.addEventListener('change', () => {
   activeCv?.setMaxDetail(Number(els.detail.value) || 0)
 })
+els.zoom.addEventListener('input', () => {
+  if (nv) nv.scaleMultiplier = Number(els.zoom.value)
+})
+els.measure.addEventListener('change', () => {
+  if (!els.measure.checked) clearRuler()
+  requestSlideRender()
+})
 els.colormap.addEventListener('change', applyColormap)
 els.window.addEventListener('change', applyWindow)
 els.fit.addEventListener('click', () => {
@@ -777,7 +1008,13 @@ async function main() {
   })
   await nv.attachToCanvas(els.canvas)
   nv.addEventListener('locationChange', onLocationChange)
+  nv.addEventListener('change', onNiivueChange)
+  syncZoomControl(nv.scaleMultiplier)
   slideView = await createSlideView()
+  // One font fetch for the pane. The widget owns its GPU resources on whichever
+  // backend the slide renderer came up on, so this is identical for both.
+  ruler = new UIKitRulerOverlay(await loadDefaultFont())
+  slideView.renderer.overlayDraw = (frame) => ruler.drawOverlay(frame)
   await loadDataset()
   // Both panes stream asynchronously with no completion event, so the HUDs poll.
   // Cheap: two innerHTML writes a few times a second.

@@ -320,6 +320,12 @@
           <option value="spim">
             000108 light-sheet SPIM, 17.7 GB (uint16)
           </option>
+          <option value="neun">
+            000026 SPIM NeuN slab, 30 GB (uint16), 10693 x 10915 planes
+          </option>
+          <option value="hipct">
+            000026 HiP-CT, 1.0 TB (uint16), 9413 x 9413 planes
+          </option>
         </select>
       </span>
       <span class="control">
@@ -345,12 +351,24 @@
         </label>
       </span>
       <span class="control">
+        <label for="measure"
+          title="Click two points on the deep-zoom pane to measure them with the UIKit ruler">
+          <input id="measure" type="checkbox" />
+          measure
+        </label>
+      </span>
+      <span class="control">
         <label for="detail" title="Finest pyramid level the volumetric view may stream">
           Detail
         </label>
         <select id="detail">
           <option value="" selected>n/a</option>
         </select>
+      </span>
+      <span class="control">
+        <label for="zoom">3D zoom <span id="zoomVal">1.00x</span></label>
+        <input id="zoom" type="range" min="0.5" max="2" step="0.01" value="1"
+          title="Volumetric zoom (scaleMultiplier); the wheel over the 3D tile moves the same slider" />
       </span>
       <span class="control">
         <label for="colormap">Colormap</label>
@@ -397,6 +415,6 @@
       Data streamed directly from the
       <a href="https://dandiarchive.org" target="_blank" rel="noopener noreferrer">DANDI Archive</a>.
     </footer>
-    <script type="module" src="dandi.js"></script>
+    <script type="module" src="/src/dandi.js"></script>
   </body>
 </html>

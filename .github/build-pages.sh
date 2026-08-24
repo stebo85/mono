@@ -25,6 +25,7 @@ APPS=(
   demo-ext-dcm2niix
   demo-ext-niimath
   demo-nv-web-component
+  dandi-demo
 )
 
 # 1. Build the niivue library (required by all apps)

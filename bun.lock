@@ -12,6 +12,16 @@
         "nx": "latest",
       },
     },
+    "apps/dandi-demo": {
+      "name": "dandi-demo",
+      "dependencies": {
+        "@niivue/niivue": "workspace:*",
+        "@niivue/uikit": "workspace:*",
+      },
+      "devDependencies": {
+        "vite": "^6.3.2",
+      },
+    },
     "apps/demo-ext-dcm2niix": {
       "name": "demo-ext-dcm2niix",
       "dependencies": {
@@ -1052,6 +1062,8 @@
     "css.escape": ["css.escape@1.5.1", "", {}, "sha512-YUifsXXuknHlUsmlgyY0PKzgPOr7/FjCePfHNt0jxm83wHZi44VDMQ7/fGNkjY3/jV1MC+1CmZbaHzugyeRtpg=="],
 
     "csstype": ["csstype@3.2.3", "", {}, "sha512-z1HGKcYy2xA8AGQfwrn0PAy+PB7X/GSj3UVJW9qKyn43xWa+gl5nXmU4qqLMRzWVLFC8KusUX8T/0kCiOYpAIQ=="],
+
+    "dandi-demo": ["dandi-demo@workspace:apps/dandi-demo"],
 
     "dcmjs": ["dcmjs@0.49.4", "", { "dependencies": { "@babel/runtime-corejs3": "^7.22.5", "adm-zip": "^0.5.10", "gl-matrix": "^3.1.0", "lodash.clonedeep": "^4.5.0", "loglevel": "^1.8.1", "ndarray": "^1.0.19", "pako": "^2.0.4" } }, "sha512-w77Gde5JvLjg37FyGIAsTB+oWZIqkO/5NvBeheEVKy6k9XjBgeGsoAbVAByjuGAFLpGqRbf9iWI0edBq87yu/g=="],
 

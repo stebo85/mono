@@ -40,13 +40,19 @@ compensation work"; decode and budget plans wait behind them.
 Full comparison against Neuroglancer, with the staged plan: **`docs/caching.md`**
 (written for the 2026-08-26 discussion). The items it raises, shortest first:
 
-- [ ] Stale-drop and per-frame reprioritization in `ChunkResidencyManager`.
-      `_uploadQueue` is a plain FIFO that persists across frames and is pruned
-      only by `admit` and `remap`, so chunks requested for a viewport the user
-      has already left still upload ahead of what is on screen. `NVSlide` already
-      does this right (`_drainLoadQueue` pops LIFO and drops anything no longer
-      in `_wanted`); port that discipline down. Pure CPU, no GPU needed to test,
-      shared by both backends.
+- [x] Stale-drop and per-frame reprioritization in `ChunkResidencyManager`.
+      DONE (`1a9d525d`). `_uploadQueue` was a plain FIFO that persisted across
+      frames and was pruned only by `admit` and `remap`, so chunks requested for
+      a viewport the user had already left still uploaded ahead of what was on
+      screen. It is now a `Map` from chunk index to the frame the working set
+      last asked for it: `requestUpload` re-stamps and reorders in O(1), the
+      drain returns this frame's requests before older ones, and an entry
+      unrequested for more than one frame is dropped rather than uploaded late
+      (one frame of slack, because the pump is async). Same discipline `NVSlide`
+      has always applied to tiles. `chunkStreamStats` reports a cumulative
+      `staleDropped` on both backends so the win is measurable; the dandi-demo
+      HUD shows it. Still open, and folded into the worker work below: an
+      `AbortController` for fetches already in flight.
 
 - [ ] Instrument fetch / decode / upload separately, before the worker work
       below. Without the split, the decode-worker win is a guess.

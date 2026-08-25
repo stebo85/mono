@@ -12,6 +12,9 @@ Companion docs: `high-res-streaming.md` (how the chunked path works),
 already grades our scheduler and budgets as partial),
 `streaming-todos.md` (the open work list this doc feeds).
 
+**Status:** Stage A landed on 2026-08-25 (`1a9d525d`). Section 2.2 and the
+Stage A row below describe what changed; everything else is still open.
+
 ## 1. What we cache today
 
 Two independent stacks, because a streamed volume and a deep-zoom slide are
@@ -90,12 +93,34 @@ numeric priority, recomputes them as the view changes, and keeps sorted queues
 per tier with separate capacity limits for download, system memory, and GPU
 memory.
 
-Our `_uploadQueue` is a plain FIFO array. `orderByViewCenter` sorts the
-working set nicely WITHIN one frame, but the queue persists ACROSS frames and
-is only pruned by `admit` (one index) and `remap` (clears it). Nothing drops a
-queued chunk that is no longer wanted. So during a rotate or a pan the queue
-fills with chunks for viewports we have left, and they upload ahead of what is
-on screen now.
+This was our largest gap and it is now closed (Stage A). `_uploadQueue` used
+to be a plain FIFO array: `orderByViewCenter` sorted the working set nicely
+WITHIN one frame, but the queue persisted ACROSS frames and was pruned only by
+`admit` (one index) and `remap` (clears it). Nothing dropped a queued chunk
+that was no longer wanted, so a rotate or a pan filled the queue with chunks
+for viewports we had left and they uploaded ahead of what was on screen.
+
+It is now a `Map` from chunk index to the frame the working set last asked for
+that chunk. Each `requestUpload` re-stamps the entry and moves it to this
+frame's request position (delete-then-set reorders a `Map` in O(1), so a
+re-request costs nothing), the drain returns this frame's requests before any
+older ones, and an entry unrequested for longer than one frame is dropped
+instead of uploaded late. The slack is one frame rather than zero because the
+pump is async and a frame boundary can land between `beginFrame` and the draw
+that re-requests; a 60 fps pan outruns one frame anyway.
+
+Two things fall out of it for free. A drag already pauses the pump while draws
+keep stamping requests, so at pointerup the queue holds the final viewport's
+working set instead of the whole drag path. And `chunkStreamStats` now reports
+a cumulative `staleDropped`, which is a direct readout of upload work the old
+queue would have spent on viewports the user had already left: 84 retired
+requests over one slice scrub of DANDI 000722. The dandi-demo HUD shows it on
+a queue row.
+
+We still do not have Neuroglancer's explicit priority TIERS (visible vs
+prefetch, with separate download / system-memory / GPU-memory capacities).
+What we have is a single queue that is correctly ordered by the current view,
+which is most of what tiers buy at our scale.
 
 Related: a chunk fetch that is already in flight cannot be cancelled either.
 `parity-neuroglancer-napari.md` records stale-request cancellation as partial,
@@ -103,10 +128,9 @@ present for desktop thumbnails and absent on the volume chunk path. Dropping a
 queued request is most of the win, since the queue is where the backlog builds,
 but an `AbortController` on the in-flight fetches is the other half.
 
-This is the cheapest real win available, and we do not need to invent it: port
-NVSlide's `_wanted` discipline down into `ChunkResidencyManager`. It is pure
-CPU bookkeeping, unit-testable with no GPU, and it lands in both backends at
-once because the manager is shared.
+The shape of the fix was NVSlide's `_wanted` discipline ported down into
+`ChunkResidencyManager`: pure CPU bookkeeping, unit-tested with no GPU, and it
+landed in both backends at once because the manager is shared.
 
 ### 2.3 Eviction demotes; ours destroys
 
@@ -167,16 +191,18 @@ Two places we can be BETTER than Neuroglancer rather than catching up:
 
 | Stage | Work | Cost | Why here |
 |---|---|---|---|
-| A | Stale-drop + per-frame reprioritization in `ChunkResidencyManager` | small | Pure CPU, shared by both backends, testable without a GPU, fixes a felt problem |
+| A | DONE (`1a9d525d`) Stale-drop + per-frame reprioritization in `ChunkResidencyManager` | small | Pure CPU, shared by both backends, testable without a GPU, fixes a felt problem |
 | B | Instrument fetch / decode / upload separately | small | Stage C is a guess without it |
 | C | Worker pool for chunk fetch + decode | medium | The main-thread stall; `src/workers/` already exists |
 | D | Directional prefetch for slice scrolling and zoom | small | One-dimensional prediction, big felt win, no framework needed |
 | E | Decoded-chunk demotion tier under GPU eviction | medium | Makes eviction cheap to undo; sized off the GPU budget |
 | F | Persistent cache (Cache Storage / OPFS) | medium | The differentiator; warm starts across reloads |
 
-Stage A and B are a day. They are also the two that make every later stage
-measurable, so they should go first regardless of what the meeting decides
-about the rest.
+Stage A and B are a day between them, and they are the two that make every
+later stage measurable, so they go first regardless of what the meeting decides
+about the rest. A is done; B is next. The in-flight half of A, an
+`AbortController` on fetches already issued, is still open and is worth folding
+into C, where the worker pool owns the fetch.
 
 ## 5. Known gaps not covered above
 

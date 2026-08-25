@@ -1656,8 +1656,18 @@
       "isAsync": false,
       "returnsValue": true,
       "params": [],
-      "returns": "{ resident: number; pending: number; inFlight: number; total: number; } | null",
-      "doc": "Streaming stats across all chunked volumes (base + independent overlay) on\nthe active backend: `{ resident, pending, inFlight, total }` brick counts.\nReturns null before a view is attached. Useful for HUD / debug overlays:\n`resident < total` with `pending > 0` for many frames indicates the working\nset exceeds the residency budget (thrashing).",
+      "returns": "{ resident: number; pending: number; inFlight: number; total: number; staleDropped: number; } | null",
+      "doc": "Streaming stats across all chunked volumes (base + independent overlay) on\nthe active backend: `{ resident, pending, inFlight, total, staleDropped }`\nbrick counts. Returns null before a view is attached. Useful for HUD / debug\noverlays: `resident < total` with `pending > 0` for many frames indicates the\nworking set exceeds the residency budget (thrashing).\n\n`staleDropped` is cumulative, not per frame: queued uploads retired because\nthe view moved on before they ran. It climbing during a pan or rotate is the\nqueue working as intended, since that work would otherwise have uploaded\nbricks for viewports the user had already left.",
+      "returnsDoc": null
+    },
+    {
+      "jsName": "chunkTimingStats",
+      "pyName": "chunk_timing_stats",
+      "isAsync": false,
+      "returnsValue": true,
+      "params": [],
+      "returns": "ChunkTimingSnapshot",
+      "doc": "Where a streamed brick's time actually goes: bytes over the wire, the work\nof turning them into a texture, and how much of that blocked the render\nloop. Returns the process-wide totals since the last\n{@link resetChunkTiming} — the recorder is a module-level singleton, so\nthis aggregates every chunked volume on every instance in the page, not\njust this one.\n\n`mainThreadMs` (assemble + upload + gradient) is the figure that decides\nwhether a decode worker is worth building, and `netBusyMs` is network wall\nclock with overlapping reads counted once. Phase definitions and the\naccuracy of each number are in `src/volume/chunkTiming.ts`.",
       "returnsDoc": null
     },
     {
@@ -2698,6 +2708,16 @@
       ],
       "returns": "Promise<void>",
       "doc": "Remove a single volume by index, emitting `volumeRemoved`.",
+      "returnsDoc": null
+    },
+    {
+      "jsName": "resetChunkTiming",
+      "pyName": "reset_chunk_timing",
+      "isAsync": false,
+      "returnsValue": false,
+      "params": [],
+      "returns": "void",
+      "doc": "Clear {@link chunkTimingStats} to start a fresh measurement window.",
       "returnsDoc": null
     },
     {

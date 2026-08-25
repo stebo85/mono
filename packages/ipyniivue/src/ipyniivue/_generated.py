@@ -391,17 +391,41 @@ and its volumes alive."""
         return await self._request("centerRenderOnMM", _make_args(mm))
 
     async def chunk_stream_stats(self) -> Any:
-        """Streaming stats across all chunked volumes (base + independent overlay) on the active backend: `{ resident, pending, inFlight, total }` brick counts.
+        """Streaming stats across all chunked volumes (base + independent overlay) on the active backend: `{ resident, pending, inFlight, total, staleDropped }` brick counts.
 
-        Returns null before a view is attached. Useful for HUD / debug overlays:
-        `resident < total` with `pending > 0` for many frames indicates the working
-        set exceeds the residency budget (thrashing).
+        Returns null before a view is attached. Useful for HUD / debug
+        overlays: `resident < total` with `pending > 0` for many frames indicates the
+        working set exceeds the residency budget (thrashing).
+
+        `staleDropped` is cumulative, not per frame: queued uploads retired because
+        the view moved on before they ran. It climbing during a pan or rotate is the
+        queue working as intended, since that work would otherwise have uploaded
+        bricks for viewports the user had already left.
 
         Returns
         -------
-        { resident: number; pending: number; inFlight: number; total: number; } | null
+        { resident: number; pending: number; inFlight: number; total: number; staleDropped: number; } | null
         """
         return await self._request("chunkStreamStats", [])
+
+    async def chunk_timing_stats(self) -> Any:
+        """Where a streamed brick's time actually goes: bytes over the wire, the work of turning them into a texture, and how much of that blocked the render loop.
+
+        Returns the process-wide totals since the last
+        {@link resetChunkTiming} — the recorder is a module-level singleton, so
+        this aggregates every chunked volume on every instance in the page, not
+        just this one.
+
+        `mainThreadMs` (assemble + upload + gradient) is the figure that decides
+        whether a decode worker is worth building, and `netBusyMs` is network wall
+        clock with overlapping reads counted once. Phase definitions and the
+        accuracy of each number are in `src/volume/chunkTiming.ts`.
+
+        Returns
+        -------
+        ChunkTimingSnapshot
+        """
+        return await self._request("chunkTimingStats", [])
 
     def clear_angles(self) -> None:
         """Clear completed angles only, leaving distance measurements in place.
@@ -964,6 +988,11 @@ and its volumes alive."""
             Index of the volume to remove
         """
         self.send({"cmd": "removeVolume", "args": _make_args(volume_index)})
+
+    def reset_chunk_timing(self) -> None:
+        """Clear {@link chunkTimingStats} to start a fresh measurement window.
+        """
+        self.send({"cmd": "resetChunkTiming", "args": []})
 
     def reset_volume_affine(self, volume_index: Any) -> None:
         self.send({"cmd": "resetVolumeAffine", "args": _make_args(volume_index)})

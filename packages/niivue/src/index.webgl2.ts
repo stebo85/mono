@@ -159,6 +159,15 @@ export type {
   VolumeChunkDesc,
 } from './volume/chunking'
 export { chunkVolumeGrid, chunkVolumeMultiLOD } from './volume/chunking'
+// Chunk-streaming phase timing (docs/caching.md stage B)
+export {
+  type ChunkPhase,
+  type ChunkPhaseTiming,
+  type ChunkTimingSnapshot,
+  chunkTimingSnapshot,
+  recordChunkPhase,
+  resetChunkTiming,
+} from './volume/chunkTiming'
 // MRSI (spatial spectroscopic imaging) volume helpers
 export { buildDerivedScalarVolume, isMrsiVolume } from './volume/mrsi'
 export {
@@ -210,6 +219,7 @@ export {
   type OmeZarrChunkedSource,
   type OmeZarrChunkedSourceOptions,
   omeZarrChunkedSource,
+  withChunkTiming,
 } from './volume/omeZarrChunkedSource'
 export {
   defaultOmeZarrLevel,

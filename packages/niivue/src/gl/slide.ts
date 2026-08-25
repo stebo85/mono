@@ -11,6 +11,7 @@ import {
 } from '@/slide/tileTextureCache'
 import type { UIKitOverlayFrame } from '@/view/NVOverlayHook'
 import { NVRenderer } from '@/view/NVRenderer'
+import { timeChunkPhase } from '@/volume/chunkTiming'
 import { Shader } from './shader'
 import { slideFragShader, slideVertShader } from './slideShader'
 
@@ -265,7 +266,23 @@ export class SlideRenderer extends NVRenderer {
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE)
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE)
     gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false)
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, bitmap)
+    const bytes = bitmap.width * bitmap.height * 4
+    // Timed as `upload` alongside the volume path's brick uploads: a slide tile
+    // and a volume brick are two consumers of the same streamed source, and
+    // both pay their texture cost on this thread.
+    timeChunkPhase(
+      'upload',
+      () =>
+        gl.texImage2D(
+          gl.TEXTURE_2D,
+          0,
+          gl.RGBA,
+          gl.RGBA,
+          gl.UNSIGNED_BYTE,
+          bitmap,
+        ),
+      bytes,
+    )
     const entry = { texture, width: bitmap.width, height: bitmap.height }
     this._textures.set(key, entry, bitmap.width * bitmap.height * 4)
     return entry

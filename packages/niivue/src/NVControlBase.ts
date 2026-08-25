@@ -147,6 +147,11 @@ import {
   dimsDownsample,
 } from '@/volume/chunking'
 import {
+  type ChunkTimingSnapshot,
+  chunkTimingSnapshot,
+  resetChunkTiming as clearChunkTiming,
+} from '@/volume/chunkTiming'
+import {
   computeDescriptiveStats,
   type DescriptiveStats,
 } from '@/volume/descriptives'
@@ -3809,6 +3814,28 @@ export default class NiiVue extends EventTarget {
     staleDropped: number
   } | null {
     return this.view?.chunkStreamStats() ?? null
+  }
+
+  /**
+   * Where a streamed brick's time actually goes: bytes over the wire, the work
+   * of turning them into a texture, and how much of that blocked the render
+   * loop. Returns the process-wide totals since the last
+   * {@link resetChunkTiming} — the recorder is a module-level singleton, so
+   * this aggregates every chunked volume on every instance in the page, not
+   * just this one.
+   *
+   * `mainThreadMs` (assemble + upload + gradient) is the figure that decides
+   * whether a decode worker is worth building, and `netBusyMs` is network wall
+   * clock with overlapping reads counted once. Phase definitions and the
+   * accuracy of each number are in `src/volume/chunkTiming.ts`.
+   */
+  chunkTimingStats(): ChunkTimingSnapshot {
+    return chunkTimingSnapshot()
+  }
+
+  /** Clear {@link chunkTimingStats} to start a fresh measurement window. */
+  resetChunkTiming(): void {
+    clearChunkTiming()
   }
 
   /**

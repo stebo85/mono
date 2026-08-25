@@ -12,8 +12,10 @@ Companion docs: `high-res-streaming.md` (how the chunked path works),
 already grades our scheduler and budgets as partial),
 `streaming-todos.md` (the open work list this doc feeds).
 
-**Status:** Stage A landed on 2026-08-25 (`1a9d525d`). Section 2.2 and the
-Stage A row below describe what changed; everything else is still open.
+**Status:** Stage A landed on 2026-08-25 (`1a9d525d`), Stage B on 2026-08-25.
+Sections 2.2, 2.5 and the stage table below describe what changed; everything
+else is still open. Section 2.5 is the measured answer to the question this doc
+was written to ask, and it moved two items up the list.
 
 ## 1. What we cache today
 
@@ -81,10 +83,12 @@ of the fix: a small decode-worker pool, transfer the decoded `Uint8Array` back
 `createSourceChunkLoader` concurrency/retry/dedup wrapper unchanged so the
 residency manager still sees one `VolumeChunkSource` contract.
 
-Measure before plumbing: split the current per-brick cost into fetch, decode,
-and upload. If most of the stall is `texSubImage3D` rather than decode, the
-answer is a different one (smaller bricks, or a longer upload budget spread
-over more frames).
+We said we would measure before plumbing, in case most of the stall turned out
+to be `texSubImage3D` rather than decode. It is not. Section 2.5 has the
+numbers: on a 20 second streaming window the render loop lost 8.6 seconds, and
+125 ms of that was texture upload. Whatever is eating the rest runs between the
+store read and our assemble loop, which is the zarrita decode. Stage C is
+justified.
 
 ### 2.2 Priority tiers and a queue that is rebuilt every frame
 
@@ -167,6 +171,78 @@ a general framework:
 Both are cheap because they are one-dimensional. Camera-orbit prediction is
 the expensive case and I would not build it first.
 
+### 2.5 Measured: where the time actually goes
+
+Stage B added a per-phase recorder (`src/volume/chunkTiming.ts`, exposed as
+`nv.chunkTimingStats()`) that times five spans we own: `net` (one store `get`),
+`read` (one whole `fetchChunk`), `assemble` (our transpose and zero-pad loop),
+`upload` (building a texture, either a volume brick or an `NVSlide` tile), and
+`gradient`. Two figures sit beside them, both exact rather than inferred:
+`mainThreadMs` is `assemble + upload + gradient`, the streaming work that
+actually blocks the render loop, and `netBusyMs` is wall clock with at least one
+store read outstanding, counted as a union so overlapping reads do not
+multiply-count the same seconds.
+
+Decode is deliberately NOT reported. It happens inside zarrita, between the
+store read and our assemble loop, and we cannot time it from outside. An earlier
+draft reported `read - net - assemble` as a decode estimate; that is invalid,
+because one `zarr.get` fans out to every store chunk covering the region, so
+several `net` spans overlap inside a single `read` and the subtraction is not a
+bound in either direction. It read as zero or negative in practice. The
+replacement is to measure the effect instead: the demo accumulates rAF gaps over
+a 24 ms budget, which catches main-thread time no matter which library spends
+it.
+
+All figures below are WebGL2 in Chrome against the live DANDI stores.
+
+**HiP-CT (000026, roughly 1 TB, over S3), 20 second window, streaming only, no
+interaction:**
+
+| Figure | Value |
+|---|---|
+| Frames drawn | 1267 |
+| Main-thread time lost over a 24 ms budget | 8604 ms |
+| Worst single frame gap | 1052 ms |
+| Instrumented main-thread work (`mainThreadMs`) | 125 ms |
+| Brick reads / mean read | 187 / 822 ms |
+| Store gets / mean get | 1955 / 189 ms |
+| Store bytes delivered | 3340 MB |
+| Network busy (union) | 10083 ms of 20006 ms |
+
+The idle baseline over 400 frames with nothing streaming is 0 ms over budget, so
+the 8.6 seconds is the streaming path and not a noisy machine.
+
+Three things follow.
+
+**Decode dominates the main thread, and upload is a rounding error.** Of 8.6
+seconds of lost frame time, 125 ms is instrumented, and every instrumented
+millisecond is texture upload. The remainder is un-instrumented main-thread work
+inside the read path. This is the number Stage C has to beat, and the part a
+decode worker cannot move (upload plus gradient) is 1.5 percent of it.
+
+**We fetch and decode far more than we use.** On the smaller OCT store a 20
+second window delivered 493 MB of store bytes to produce 33.9 MB of brick
+voxels, and a slice scrub delivered 948 MB to produce 24.6 MB. That is 15x to
+39x amplification, and it is structural rather than a bug: a 2D plane through a
+3D-chunked store still requires whole 3D chunks, so the useful fraction is
+bounded by one over the chunk depth. It also explains the decode cost directly,
+since decode scales with bytes delivered rather than bytes displayed.
+
+**The byte cache does not survive a scan.** Scrubbing the same slice range twice
+on OCT did not get cheaper the second time. Pass one issued 1734 store gets for
+948 MB; pass two issued 3046 for 1745 MB. Pass two also did more reads (763
+versus 431), because more of the pyramid had resolved by then, so this bounds
+reuse rather than proving it is zero, but there is no sign of the second pass
+being served from memory. The cause is straightforward: a single pass touches
+roughly twice the 512 MB byte budget, and a scan is the access pattern LRU is
+worst at, so entries are evicted before they are asked for again. Sizing the
+budget to the working set, or making the policy scan-resistant, is a small
+change with a large effect, and it is now stage G below.
+
+For contrast, the small OCT store over the same 20 seconds lost 316 ms with a
+worst gap of 128 ms, against 493 MB delivered. Main-thread cost tracks bytes
+delivered, not bricks drawn.
+
 ## 3. What we should say tomorrow
 
 We are not starting from nothing: three tiers on the volume side, two on the
@@ -174,7 +250,13 @@ slide side, byte budgets everywhere, frame-accurate LRU protection, a coarse
 floor that means we never draw a hole, and a stale-request discipline on the
 slide side that Neuroglancer's design agrees with. The honest gaps are
 off-thread decode, a priority queue on the volume side, demotion instead of
-destruction, and real prediction.
+destruction, and real prediction. The priority queue is now closed (stage A),
+and we have measured the rest rather than guessing at it (stage B).
+
+The one number worth putting on a slide: streaming a HiP-CT volume from S3 for
+20 seconds costs the render loop 8.6 seconds, and 125 ms of that is GPU upload.
+The rest is decode on the main thread. That is the case for the worker, and it
+is measured rather than asserted.
 
 Two places we can be BETTER than Neuroglancer rather than catching up:
 
@@ -192,17 +274,23 @@ Two places we can be BETTER than Neuroglancer rather than catching up:
 | Stage | Work | Cost | Why here |
 |---|---|---|---|
 | A | DONE (`1a9d525d`) Stale-drop + per-frame reprioritization in `ChunkResidencyManager` | small | Pure CPU, shared by both backends, testable without a GPU, fixes a felt problem |
-| B | Instrument fetch / decode / upload separately | small | Stage C is a guess without it |
+| B | DONE Per-phase timing (`chunkTimingStats`) plus a main-thread stall monitor in the demo | small | Turned stage C from a guess into a measurement |
+| G | Size the byte cache to the working set, or make its policy scan-resistant | small | Measured: a repeat scrub showed no reuse; one pass is roughly 2x the budget |
 | C | Worker pool for chunk fetch + decode | medium | The main-thread stall; `src/workers/` already exists |
 | D | Directional prefetch for slice scrolling and zoom | small | One-dimensional prediction, big felt win, no framework needed |
 | E | Decoded-chunk demotion tier under GPU eviction | medium | Makes eviction cheap to undo; sized off the GPU budget |
 | F | Persistent cache (Cache Storage / OPFS) | medium | The differentiator; warm starts across reloads |
 
-Stage A and B are a day between them, and they are the two that make every
-later stage measurable, so they go first regardless of what the meeting decides
-about the rest. A is done; B is next. The in-flight half of A, an
-`AbortController` on fetches already issued, is still open and is worth folding
-into C, where the worker pool owns the fetch.
+Stage A and B are done, and they were the two that make every later stage
+measurable. B changed the order of what follows: G is new, it came straight out
+of the measurement, and it is cheap enough to go alongside D. C is confirmed as
+the big one. The in-flight half of A, an `AbortController` on fetches already
+issued, is still open and is worth folding into C, where the worker pool owns
+the fetch.
+
+The recommended order from here is G, C, D, E, F: take the cheap cache-sizing
+win first, then move decode off the render thread, then predict, then soften
+eviction, then persist.
 
 ## 5. Known gaps not covered above
 

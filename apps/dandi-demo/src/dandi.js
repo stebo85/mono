@@ -628,6 +628,66 @@ function setBusy(node, label, text, busy) {
   if (busy) label.textContent = text
 }
 
+// Where a streamed brick's time goes, averaged over the bricks pulled since the
+// last dataset switch. `decode` is an upper bound (read minus network minus
+// assemble), and only `upload` is work a decode worker could not move off the
+// render thread -- which is the whole question stage C turns on.
+// Main-thread stall monitor. The phase timings below can only see the spans
+// NiiVue owns, and chunk DECODE happens inside zarrita where they cannot reach.
+// This measures the gap the other way round: any frame the browser fails to
+// deliver on time is main-thread work, whoever did it. Compare its total to the
+// instrumented `upload` total and the difference is what a decode worker could
+// still be hiding.
+const FRAME_BUDGET_MS = 24
+let stallTotalMs = 0
+let stallWorstMs = 0
+let lastFrameMs = 0
+
+function watchFrames(now) {
+  if (lastFrameMs !== 0) {
+    const over = now - lastFrameMs - FRAME_BUDGET_MS
+    if (over > 0) {
+      stallTotalMs += over
+      if (over > stallWorstMs) stallWorstMs = over
+    }
+  }
+  lastFrameMs = now
+  requestAnimationFrame(watchFrames)
+}
+requestAnimationFrame(watchFrames)
+
+function resetStalls() {
+  stallTotalMs = 0
+  stallWorstMs = 0
+  lastFrameMs = 0
+}
+
+function stallCost() {
+  if (stallTotalMs === 0) return 'none over ' + FRAME_BUDGET_MS + ' ms'
+  return `${Math.round(stallTotalMs)} ms total, worst ${Math.round(stallWorstMs)} ms`
+}
+
+function brickCost() {
+  const t = nv?.chunkTimingStats?.()
+  const reads = t?.phases.read.count ?? 0
+  if (!t || reads === 0) return '-'
+  // Sub-millisecond means are the interesting result here (a texture upload
+  // that rounds to 0 ms is most of the answer to "is a decode worker worth
+  // it?"), so keep a decimal until the mean is big enough not to need one.
+  const ms = (total, n) => {
+    if (n <= 0) return '0'
+    const each = total / n
+    return each < 10 ? each.toFixed(1) : String(Math.round(each))
+  }
+  // Reads and uploads are different populations: the volume's bricks and the
+  // slide's tiles both read from this store, but only the volume's reads become
+  // brick textures. So each figure is divided by its own count, never mixed.
+  const uploads = t.phases.upload.count
+  const net = `net ${ms(t.netBusyMs, reads)} ms/read x${reads}`
+  const main = `main ${ms(t.mainThreadMs, uploads)} ms/upload x${uploads}`
+  return `${net}, ${main}, ${Math.round(t.mainThreadMs)} ms total`
+}
+
 function updateVolumeHud() {
   if (!chunkSource || !nv) return
   const def = DATASETS[els.dataset.value]
@@ -668,6 +728,8 @@ function updateVolumeHud() {
         ? `${stats.pending} queued, ${stats.inFlight} in flight, ${stats.staleDropped} stale`
         : '-'
     }</span></div>
+    <div class="row"><span class="key">stream cost</span><span>${brickCost()}</span></div>
+    <div class="row"><span class="key">stalls</span><span>${stallCost()}</span></div>
     <div class="row"><span class="key">window</span><span>${formatValue(
       windowRange[0],
     )} .. ${formatValue(windowRange[1])}</span></div>
@@ -821,6 +883,10 @@ async function loadDataset() {
   slide = null
   slideView?.renderer?.clearTextures?.()
   clearRuler()
+  // Per-brick phase timings are process-wide totals, so a dataset switch starts
+  // a fresh measurement window rather than averaging two stores together.
+  nv?.resetChunkTiming()
+  resetStalls()
   try {
     const source = await fetchOmeZarrChunkedSource(datasetUrl(def), {
       cacheBytes: ZARR_CACHE_BYTES,

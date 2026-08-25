@@ -9,6 +9,7 @@ import {
   TileTextureCache,
 } from '@/slide/tileTextureCache'
 import type { UIKitOverlayFrame } from '@/view/NVOverlayHook'
+import { timeChunkPhase } from '@/volume/chunkTiming'
 
 const shaderCode = /* wgsl */ `
 struct SlideUniforms {
@@ -408,10 +409,18 @@ export class SlideRendererGPU {
         GPUTextureUsage.COPY_DST |
         GPUTextureUsage.RENDER_ATTACHMENT,
     })
-    this._device.queue.copyExternalImageToTexture(
-      { source: bitmap },
-      { texture },
-      [bitmap.width, bitmap.height],
+    // Timed as `upload` alongside the volume path's brick uploads: a slide tile
+    // and a volume brick are two consumers of the same streamed source, and
+    // both pay their texture cost on this thread.
+    timeChunkPhase(
+      'upload',
+      () =>
+        this._device.queue.copyExternalImageToTexture(
+          { source: bitmap },
+          { texture },
+          [bitmap.width, bitmap.height],
+        ),
+      bitmap.width * bitmap.height * 4,
     )
     const entry: SlideTexture = {
       texture,

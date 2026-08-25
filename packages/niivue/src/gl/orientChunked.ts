@@ -17,6 +17,7 @@
 import type { NVImage } from '@/NVTypes'
 import { bytesPerSourceVoxel } from '@/volume/chunkBudget'
 import type { ChunkPlan, Vec3i, VolumeChunkDesc } from '@/volume/chunking'
+import { timeChunkPhase } from '@/volume/chunkTiming'
 import {
   chunkRGBA,
   extractChunkBytes,
@@ -268,9 +269,16 @@ export function createChunkUploaderGL(
     const chunkBytes = await fetchBytes(index)
     // Consumed — free the CPU buffer reference so prefetch headroom recovers.
     fetchCache.delete(index)
-    const volumeTexture = isRGBA
-      ? rgba2TextureChunk(gl, chunkRGBA(chunkBytes, dt), desc.texDims)
-      : orientChunkToTexture(gl, chunkBytes, dt, desc.texDims, nvimage)
+    // Timed as `upload`: this is the texImage3D submission, the part of a
+    // chunk's cost that a decode worker could never take off this thread.
+    const volumeTexture = timeChunkPhase(
+      'upload',
+      () =>
+        isRGBA
+          ? rgba2TextureChunk(gl, chunkRGBA(chunkBytes, dt), desc.texDims)
+          : orientChunkToTexture(gl, chunkBytes, dt, desc.texDims, nvimage),
+      chunkBytes.byteLength,
+    )
     const dims: [number, number, number] = [
       desc.texDims[0],
       desc.texDims[1],
@@ -279,9 +287,11 @@ export function createChunkUploaderGL(
     // Skip the (expensive, ~per-slice) gradient pass when the volume is unlit;
     // an empty gradient keeps the bind/destroy/budget path identical.
     const hasGradient = wantsGradient()
-    const volumeGradientTexture = hasGradient
-      ? gradient.volume2TextureGradientRGBA(gl, volumeTexture, dims)
-      : emptyGradientTexture(gl, dims)
+    const volumeGradientTexture = timeChunkPhase('gradient', () =>
+      hasGradient
+        ? gradient.volume2TextureGradientRGBA(gl, volumeTexture, dims)
+        : emptyGradientTexture(gl, dims),
+    )
     return { volumeTexture, volumeGradientTexture, desc, hasGradient }
   }
 

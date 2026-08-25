@@ -250,6 +250,15 @@ export type {
   VolumeChunkDesc,
 } from './volume/chunking'
 export { chunkVolumeGrid, chunkVolumeMultiLOD } from './volume/chunking'
+// Chunk-streaming phase timing (docs/caching.md stage B)
+export {
+  type ChunkPhase,
+  type ChunkPhaseTiming,
+  type ChunkTimingSnapshot,
+  chunkTimingSnapshot,
+  recordChunkPhase,
+  resetChunkTiming,
+} from './volume/chunkTiming'
 // Exploded-block picking: resolve a click on an exploded brick, then copy that
 // brick out as a standalone volume that keeps the parent's anatomical frame.
 export type { ExplodedBlockPick } from './control/interactions'
@@ -323,6 +332,7 @@ export {
   type OmeZarrChunkedSource,
   type OmeZarrChunkedSourceOptions,
   omeZarrChunkedSource,
+  withChunkTiming,
 } from './volume/omeZarrChunkedSource'
 export {
   defaultOmeZarrLevel,

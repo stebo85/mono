@@ -26,6 +26,11 @@ import type {
   ChunkedVolumeFetch,
   ChunkedVolumeSource,
 } from './ChunkedVolumeSource'
+import {
+  recordChunkPhase,
+  timeChunkNetAsync,
+  timeChunkPhaseAsync,
+} from './chunkTiming'
 import { allocTypedArrayLike } from './omeZarr'
 import {
   type OmeZarrLoadOptions,
@@ -224,6 +229,7 @@ async function readLevelRegion(
   }
 
   const out = allocTypedArrayLike(data, sx * sy * sz)
+  const assembleStart = performance.now()
   for (let z = 0; z < rz; z++) {
     for (let y = 0; y < ry; y++) {
       const src = z * strideZ + y * strideY
@@ -237,6 +243,7 @@ async function readLevelRegion(
       }
     }
   }
+  recordChunkPhase('assemble', performance.now() - assembleStart, expectedBytes)
   return new Uint8Array(out.buffer, out.byteOffset, expectedBytes)
 }
 
@@ -300,9 +307,43 @@ export function omeZarrChunkedSource(
             `the store holds ${bytesPerVoxel}`,
         )
       }
-      return readLevelRegion(source, channel, timepoint, req)
+      const expected =
+        req.texDims[0] * req.texDims[1] * req.texDims[2] * req.bytesPerVoxel
+      return timeChunkPhaseAsync(
+        'read',
+        () => readLevelRegion(source, channel, timepoint, req),
+        expected,
+      )
     },
   }
+}
+
+type StoreGet = zarr.AsyncReadable['get']
+type StoreGetRange = NonNullable<zarr.AsyncReadable['getRange']>
+
+/**
+ * Wrap a zarr store so every byte read is timed into the `net` phase of
+ * {@link chunkTimingSnapshot} — the network round trip, or the near-zero cost
+ * of a hit in the byte LRU when this wraps a cached store.
+ *
+ * It is a plain delegate rather than a subclass so it composes with
+ * `withByteCaching` in either order; put it OUTSIDE the cache to measure "time
+ * to get the bytes in hand" (cache hits then show up as the fast reads they
+ * are), and inside it to measure the origin alone. `getRange` is forwarded
+ * only when the wrapped store has it, so a sharded store keeps its range path.
+ *
+ * One `zarr.get` fans out to every store chunk covering the region, so these
+ * calls overlap; the timing they feed also maintains the `netBusyMs` union so
+ * that overlap does not multiply-count the same wall clock.
+ */
+export function withChunkTiming(store: zarr.AsyncReadable): zarr.AsyncReadable {
+  const get: StoreGet = (key, opts) =>
+    timeChunkNetAsync(() => store.get(key, opts))
+  const inner = store.getRange
+  if (!inner) return { get }
+  const getRange: StoreGetRange = (key, range, opts) =>
+    timeChunkNetAsync(() => inner.call(store, key, range, opts))
+  return { get, getRange }
 }
 
 /** Options for {@link fetchOmeZarrChunkedSource}. */
@@ -333,9 +374,12 @@ export async function fetchOmeZarrChunkedSource(
   const base = options.fetchImpl
     ? new zarr.FetchStore(url, { fetch: options.fetchImpl })
     : new zarr.FetchStore(url)
-  const store =
+  const cached =
     cacheBytes > 0
       ? zarr.withByteCaching(base, { cache: new ByteLruCache(cacheBytes) })
       : base
+  // Outermost, so a byte-cache hit is measured as the fast read it is and the
+  // `net` phase answers "how long did it take to get these bytes in hand".
+  const store = withChunkTiming(cached)
   return omeZarrChunkedSource(await openOmeZarr(store, options), options)
 }

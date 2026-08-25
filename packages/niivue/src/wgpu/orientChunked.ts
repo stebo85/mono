@@ -24,6 +24,7 @@ import * as NVCmaps from '@/cmap/NVCmaps'
 import type { NVImage } from '@/NVTypes'
 import { buildOrientUniforms } from '@/view/NVOrient'
 import type { ChunkPlan, Vec3i, VolumeChunkDesc } from '@/volume/chunking'
+import { recordChunkPhase } from '@/volume/chunkTiming'
 import {
   chunkRGBA,
   extractChunkBytes,
@@ -439,6 +440,10 @@ export async function createChunkUploaderGPU(
     const chunkBytes = await fetchBytes(index)
     // Consumed — free the CPU buffer reference so prefetch headroom recovers.
     fetchCache.delete(index)
+    // Timed as `upload`: the queue write plus the orient pass, awaited to
+    // completion, so this is the part of a chunk's cost that a decode worker
+    // could never take off this thread.
+    const uploadStart = performance.now()
     let rgbaTexture: GPUTexture
     if (isRGBA) {
       // Color: write the expanded RGBA8 bytes straight into the output texture.
@@ -510,10 +515,16 @@ export async function createChunkUploaderGPU(
       await device.queue.onSubmittedWorkDone()
       sourceTexture.destroy()
     }
+    recordChunkPhase(
+      'upload',
+      performance.now() - uploadStart,
+      chunkBytes.byteLength,
+    )
 
     // Skip the gradient compute pass when the volume is unlit; an empty gradient
     // keeps the bind/destroy/byte-budget path identical.
     const hasGradient = wantsGradient()
+    const gradientStart = performance.now()
     const gradientTexture = hasGradient
       ? await wgpu.volume2TextureGradientRGBA(device, rgbaTexture)
       : emptyGradientTextureGPU(device, [
@@ -521,6 +532,7 @@ export async function createChunkUploaderGPU(
           desc.texDims[1],
           desc.texDims[2],
         ])
+    recordChunkPhase('gradient', performance.now() - gradientStart)
     return {
       volumeTexture: rgbaTexture,
       volumeGradientTexture: gradientTexture,

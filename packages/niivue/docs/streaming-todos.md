@@ -30,10 +30,12 @@ compensation work"; decode and budget plans wait behind them.
   (default 6) becomes the pool's queue depth rather than a bound on
   main-thread work.
 
-  Worth measuring first: split the current per-brick cost into fetch, decode,
-  and upload so the win is quantified before the worker plumbing lands. If most
-  of the stall is `texSubImage3D` rather than decode, the answer is a different
-  one (smaller bricks, or a longer upload budget spread over more frames).
+  Measured (stage B, see below and `docs/caching.md` section 2.5): streaming
+  HiP-CT from S3 for 20 seconds with no interaction cost the render loop 8604 ms
+  over a 24 ms frame budget, worst single gap 1052 ms, against an idle baseline
+  of 0 ms. Instrumented main-thread work over the same window was 125 ms, all of
+  it texture upload. So the stall is not `texSubImage3D`, and the part a worker
+  cannot move is about 1.5 percent of the problem. The worker is justified.
 
 ## Caching and prefetch
 
@@ -54,8 +56,34 @@ Full comparison against Neuroglancer, with the staged plan: **`docs/caching.md`*
       HUD shows it. Still open, and folded into the worker work below: an
       `AbortController` for fetches already in flight.
 
-- [ ] Instrument fetch / decode / upload separately, before the worker work
-      below. Without the split, the decode-worker win is a guess.
+- [x] Instrument fetch / decode / upload separately, before the worker work
+      above. DONE (stage B). `src/volume/chunkTiming.ts` records five spans we
+      own (`net`, `read`, `assemble`, `upload`, `gradient`), exposed as
+      `nv.chunkTimingStats()` and shown in the dandi-demo HUD. Beside the phases
+      it reports `mainThreadMs` (assemble + upload + gradient, the work that
+      blocks the render loop) and `netBusyMs` (wall clock with a store read
+      outstanding, as a union so concurrent reads are not counted twice). Slide
+      tile uploads are timed too, in both `gl/slide.ts` and `wgpu/slide.ts`,
+      because `NVSlide` reads planes through the same `fetchChunk`; divide each
+      phase by its own `count`, never across phases.
+
+      Decode is NOT reported. It runs inside zarrita and cannot be timed from
+      outside, and `read - net - assemble` is not a bound in either direction
+      because one `zarr.get` fans out to several concurrent store gets. The
+      demo measures the effect instead, by accumulating rAF gaps over a 24 ms
+      budget.
+
+      Two findings beyond the decode result, both in `docs/caching.md` 2.5:
+      we deliver 15x to 39x more store bytes than the bricks we build consume
+      (a 2D plane still needs whole 3D chunks), and a repeat scrub over the same
+      slice range showed no reuse from the byte cache, because one pass touches
+      roughly twice its 512 MB budget and a scan is LRU's worst case.
+
+- [ ] Size the byte cache to the working set, or make its policy scan-resistant.
+      Came out of stage B. `OME_ZARR_CHUNK_CACHE_BYTES` is 256 MB by default
+      and the dandi-demo raises it to 512 MB, but a single slice scrub delivered
+      948 MB, so entries are evicted before they are asked for again. Cheapest
+      remaining win on the list.
 
 - [ ] Directional prefetch for slice scrolling and zoom. `CHUNK_PREFETCH_WINDOW`
       is pipeline lookahead over chunks we have already decided we need, not

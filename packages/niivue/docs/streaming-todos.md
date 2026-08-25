@@ -76,14 +76,30 @@ Full comparison against Neuroglancer, with the staged plan: **`docs/caching.md`*
       Two findings beyond the decode result, both in `docs/caching.md` 2.5:
       we deliver 15x to 39x more store bytes than the bricks we build consume
       (a 2D plane still needs whole 3D chunks), and a repeat scrub over the same
-      slice range showed no reuse from the byte cache, because one pass touches
-      roughly twice its 512 MB budget and a scan is LRU's worst case.
+      slice range appeared to get no reuse from the byte cache. The second one
+      was wrong; the byte-cache item below records what the counters found.
 
-- [ ] Size the byte cache to the working set, or make its policy scan-resistant.
-      Came out of stage B. `OME_ZARR_CHUNK_CACHE_BYTES` is 256 MB by default
-      and the dandi-demo raises it to 512 MB, but a single slice scrub delivered
-      948 MB, so entries are evicted before they are asked for again. Cheapest
-      remaining win on the list.
+- [x] Size the byte cache to the working set, or make its policy scan-resistant.
+      Came out of stage B, and the answer is that neither is needed.
+      `ByteLruCache` now counts hits, misses, admissions, oversize rejections
+      and evictions, exposed as `source.byteCache.stats` and shown as a
+      `byte cache` row in the dandi-demo HUD. Counting happens in `has`, the
+      one gate `withByteCaching` consults before a read.
+
+      Measured on live DANDI stores with a 512 MB budget: a full sweep of all
+      561 OCT planes and back settled at 265 MiB resident with ZERO evictions,
+      and the return leg was 168 lookups for 168 hits; a HiP-CT (1 TB) session
+      settled at 328 MiB, also with zero evictions, at a 51% hit rate. Nothing
+      was ever evicted or rejected in any pattern tried, because the
+      store-level working set is bounded by what is on screen times the levels
+      in play, not by the size of the dataset.
+
+      The stage-B claim came from reading `net` bytes as bytes downloaded.
+      `withChunkTiming` wraps the store OUTSIDE `withByteCaching`, so `net`
+      counts reads the cache answered too: HiP-CT delivered 1154 MB through a
+      cache holding 328 MiB precisely because half of those gets were hits. A
+      delivered total above the budget is evidence of reuse, not of thrash.
+      Details in `docs/caching.md` 2.6.
 
 - [ ] Directional prefetch for slice scrolling and zoom. `CHUNK_PREFETCH_WINDOW`
       is pipeline lookahead over chunks we have already decided we need, not

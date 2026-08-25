@@ -12,10 +12,12 @@ Companion docs: `high-res-streaming.md` (how the chunked path works),
 already grades our scheduler and budgets as partial),
 `streaming-todos.md` (the open work list this doc feeds).
 
-**Status:** Stage A landed on 2026-08-25 (`1a9d525d`), Stage B on 2026-08-25.
-Sections 2.2, 2.5 and the stage table below describe what changed; everything
-else is still open. Section 2.5 is the measured answer to the question this doc
-was written to ask, and it moved two items up the list.
+**Status:** Stages A, B and G landed on 2026-08-25 (`1a9d525d`, `1a76c7c5`).
+Sections 2.2, 2.5, 2.6 and the stage table below describe what changed;
+everything else is still open. Section 2.5 is the measured answer to the
+question this doc was written to ask, and it moved two items up the list.
+Section 2.6 retires stage G: the byte cache turned out to be sized correctly,
+and the finding that said otherwise was a misreading of section 2.5's numbers.
 
 ## 1. What we cache today
 
@@ -226,22 +228,80 @@ voxels, and a slice scrub delivered 948 MB to produce 24.6 MB. That is 15x to
 39x amplification, and it is structural rather than a bug: a 2D plane through a
 3D-chunked store still requires whole 3D chunks, so the useful fraction is
 bounded by one over the chunk depth. It also explains the decode cost directly,
-since decode scales with bytes delivered rather than bytes displayed.
+since decode scales with bytes delivered rather than bytes displayed. Read
+"delivered" strictly: `withChunkTiming` wraps the store outside the byte cache,
+so these totals count reads the cache answered as well as reads that went to the
+network. They are the right figure for decode cost, which is paid either way,
+and an overstatement of network traffic. Stage G below measures the split.
 
-**The byte cache does not survive a scan.** Scrubbing the same slice range twice
-on OCT did not get cheaper the second time. Pass one issued 1734 store gets for
-948 MB; pass two issued 3046 for 1745 MB. Pass two also did more reads (763
-versus 431), because more of the pyramid had resolved by then, so this bounds
-reuse rather than proving it is zero, but there is no sign of the second pass
-being served from memory. The cause is straightforward: a single pass touches
-roughly twice the 512 MB byte budget, and a scan is the access pattern LRU is
-worst at, so entries are evicted before they are asked for again. Sizing the
-budget to the working set, or making the policy scan-resistant, is a small
-change with a large effect, and it is now stage G below.
+**The byte cache looked like it was thrashing, and it is not.** An earlier
+reading of these numbers concluded that a scan evicts the byte cache before it
+can be reused, because one pass delivered roughly twice the 512 MB budget. That
+inference was wrong, and the error is the one flagged above: `net` counts every
+read the store serves, hits included, so a delivered total larger than the
+budget is evidence of reuse rather than of eviction. Section 2.6 has the direct
+measurement.
 
 For contrast, the small OCT store over the same 20 seconds lost 316 ms with a
 worst gap of 128 ms, against 493 MB delivered. Main-thread cost tracks bytes
 delivered, not bricks drawn.
+
+### 2.6 Measured: the byte cache is sized correctly
+
+Stage G set out to size the byte cache to the working set, or failing that to
+give it a scan-resistant policy. Before changing either, it needed to answer a
+question the previous numbers could not: is the cache missing because the budget
+is too small to hold the working set, or because this access pattern never
+revisits a chunk? Both look identical from outside, both read as a low hit rate,
+and they want opposite fixes.
+
+Evictions tell them apart, so `ByteLruCache` now counts them, along with hits,
+misses, admissions and oversize rejections. The counters are exposed as
+`source.byteCache.stats` and the demo prints them as a `byte cache` HUD row.
+Counting happens in `has`, which is the single gate `withByteCaching` consults
+before every read; `get` runs only after a hit, so a lookup cannot be counted
+twice.
+
+WebGL2 in Chrome, live DANDI stores, 512 MB budget:
+
+| | OCT, 4.5 GB | HiP-CT, 1 TB |
+|---|---|---|
+| Store gets | 733 | 737 |
+| Bytes delivered | 415 MB | 1154 MB |
+| Hits / misses | 183 / 550 | 376 / 361 |
+| Hit rate | 25% | 51% |
+| Resident at end | 265 MiB of 512 | 328 MiB of 512 |
+| Evicted | 0 entries, 0 bytes | 0 entries, 0 bytes |
+| Rejected as oversize | 0 | 0 |
+
+The OCT session was a full sweep of all 561 axial planes and back again; the
+HiP-CT session was a load plus a sweep across half of its 10656 planes. Neither
+evicted a single entry.
+
+Three conclusions.
+
+**The budget is not the binding constraint.** Nothing was ever evicted, on
+either store, in any pattern tried. The store-level working set is bounded by
+what is on screen times the number of resolution levels in play, not by the size
+of the dataset, which is why a 1 TB volume settles at 328 MiB just as a 4.5 GB
+one settles at 265 MiB. There is no scan to be resistant to, and raising
+`OME_ZARR_CHUNK_CACHE_BYTES` would buy nothing.
+
+**Reuse is real when it is asked for.** The return leg of the OCT sweep, back
+across planes the forward leg had already visited, was 168 lookups and 168 hits:
+zero misses, zero new bytes, the whole pass served from memory. That is the
+behaviour the earlier reading concluded was absent.
+
+**The headline hit rate understates the cache** because it averages a cold first
+pass into the total, and every miss in these sessions is a first touch. That
+also says where the remaining wins are. Stage D (prefetch) attacks the cold
+pass, which is where all the misses live. Stage F (a persistent tier) attacks
+the fact that this cache dies with the page, so every reload starts cold again.
+Neither is a byte-budget change.
+
+Stage G therefore lands as instrumentation and no policy change. The counters
+stay because they are what proved the point, and because they are the check to
+re-run before anyone proposes a bigger budget.
 
 ## 3. What we should say tomorrow
 
@@ -275,7 +335,7 @@ Two places we can be BETTER than Neuroglancer rather than catching up:
 |---|---|---|---|
 | A | DONE (`1a9d525d`) Stale-drop + per-frame reprioritization in `ChunkResidencyManager` | small | Pure CPU, shared by both backends, testable without a GPU, fixes a felt problem |
 | B | DONE Per-phase timing (`chunkTimingStats`) plus a main-thread stall monitor in the demo | small | Turned stage C from a guess into a measurement |
-| G | Size the byte cache to the working set, or make its policy scan-resistant | small | Measured: a repeat scrub showed no reuse; one pass is roughly 2x the budget |
+| G | DONE Hit / miss / eviction counters on `ByteLruCache`, exposed as `source.byteCache.stats` | small | Measured (2.6): zero evictions on a 1 TB store, so no budget or policy change was needed |
 | C | Worker pool for chunk fetch + decode | medium | The main-thread stall; `src/workers/` already exists |
 | D | Directional prefetch for slice scrolling and zoom | small | One-dimensional prediction, big felt win, no framework needed |
 | E | Decoded-chunk demotion tier under GPU eviction | medium | Makes eviction cheap to undo; sized off the GPU budget |

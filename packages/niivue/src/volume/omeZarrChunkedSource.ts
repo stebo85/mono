@@ -41,6 +41,28 @@ import {
 } from './omeZarrLoader'
 import { getBitsPerVoxel } from './utils'
 
+/** What a {@link ByteLruCache} has done since it was created or reset. */
+export interface ByteCacheStats {
+  /** Lookups that found a resident entry. */
+  hits: number
+  /** Lookups that did not, each of which became a store read. */
+  misses: number
+  /** Values admitted, absences included. */
+  admitted: number
+  /** Values refused because one alone exceeds the whole budget. */
+  rejected: number
+  /** Entries dropped to stay inside the budget. */
+  evicted: number
+  /** Bytes dropped by those evictions. */
+  evictedBytes: number
+  /** Entries resident now. */
+  entries: number
+  /** Bytes resident now (absences count 0). */
+  bytes: number
+  /** The budget those bytes are measured against. */
+  maxBytes: number
+}
+
 /**
  * A byte-bounded LRU cache for zarrita's `withByteCaching` store wrapper.
  *
@@ -55,10 +77,19 @@ import { getBitsPerVoxel } from './utils'
  * resident entries are evicted for it). A budget of 0 therefore caches only
  * zero-byte absence entries; `Infinity` never evicts.
  *
+ * {@link stats} answers the question a byte budget always raises: is the
+ * budget too small, or is there simply no reuse in this access pattern? The
+ * two look identical from outside (both are all misses) and want opposite
+ * fixes, so the counters distinguish them — a run with many evictions and few
+ * hits is thrash, a run with few evictions and few hits has nothing to reuse.
+ * `has` is the gate `withByteCaching` consults before every read, so it is the
+ * one place a lookup is counted; `get` only runs after a hit.
+ *
  * ```ts
- * const store = zarr.withByteCaching(new zarr.FetchStore(url), {
- *   cache: new ByteLruCache(256 * 2 ** 20),
- * })
+ * const cache = new ByteLruCache(256 * 2 ** 20)
+ * const store = zarr.withByteCaching(new zarr.FetchStore(url), { cache })
+ * // ... stream ...
+ * const { hits, misses, evicted } = cache.stats
  * ```
  */
 export class ByteLruCache {
@@ -67,6 +98,12 @@ export class ByteLruCache {
     { value: Uint8Array | undefined; bytes: number }
   >()
   private total = 0
+  private hits = 0
+  private misses = 0
+  private admitted = 0
+  private rejected = 0
+  private evicted = 0
+  private evictedBytes = 0
 
   constructor(readonly maxBytes: number) {
     // Rejects NaN and negatives in one comparison; 0 and Infinity are valid.
@@ -82,8 +119,39 @@ export class ByteLruCache {
     return this.total
   }
 
+  /** A snapshot of {@link ByteCacheStats}. Cheap; take it every frame. */
+  get stats(): ByteCacheStats {
+    return {
+      hits: this.hits,
+      misses: this.misses,
+      admitted: this.admitted,
+      rejected: this.rejected,
+      evicted: this.evicted,
+      evictedBytes: this.evictedBytes,
+      entries: this.entries.size,
+      bytes: this.total,
+      maxBytes: this.maxBytes,
+    }
+  }
+
+  /** Zero the counters, keeping the resident entries. Starts a window. */
+  resetStats(): void {
+    this.hits = 0
+    this.misses = 0
+    this.admitted = 0
+    this.rejected = 0
+    this.evicted = 0
+    this.evictedBytes = 0
+  }
+
   has(key: string): boolean {
-    return this.entries.has(key)
+    const hit = this.entries.has(key)
+    if (hit) {
+      this.hits++
+    } else {
+      this.misses++
+    }
+    return hit
   }
 
   get(key: string): Uint8Array | undefined {
@@ -108,10 +176,12 @@ export class ByteLruCache {
     // not admit it, and do not evict resident entries to make room that will
     // not suffice. (The stale same-key entry was already dropped above.)
     if (bytes > this.maxBytes) {
+      this.rejected++
       return
     }
     this.entries.set(key, { value, bytes })
     this.total += bytes
+    this.admitted++
     // Every admitted entry fits the budget on its own, so evicting oldest
     // first always reaches totalBytes <= maxBytes by the time one entry is
     // left.
@@ -122,6 +192,8 @@ export class ByteLruCache {
       }
       this.entries.delete(oldest[0])
       this.total -= oldest[1].bytes
+      this.evicted++
+      this.evictedBytes += oldest[1].bytes
     }
   }
 }
@@ -138,6 +210,13 @@ export interface OmeZarrChunkedSourceOptions {
 export interface OmeZarrChunkedSource extends ChunkedVolumeSource {
   /** The opened store behind the adapter (levels, omero channels, axes). */
   readonly zarr: OmeZarrSource
+  /**
+   * The store-level byte cache, when one was built for this source. Present
+   * on {@link fetchOmeZarrChunkedSource} results with a non-zero budget, so a
+   * host can read {@link ByteLruCache.stats} to see whether the budget is
+   * doing anything; absent when the caller brought its own store.
+   */
+  readonly byteCache?: ByteLruCache
 }
 
 /**
@@ -374,12 +453,16 @@ export async function fetchOmeZarrChunkedSource(
   const base = options.fetchImpl
     ? new zarr.FetchStore(url, { fetch: options.fetchImpl })
     : new zarr.FetchStore(url)
-  const cached =
-    cacheBytes > 0
-      ? zarr.withByteCaching(base, { cache: new ByteLruCache(cacheBytes) })
-      : base
+  const byteCache = cacheBytes > 0 ? new ByteLruCache(cacheBytes) : undefined
+  const cached = byteCache
+    ? zarr.withByteCaching(base, { cache: byteCache })
+    : base
   // Outermost, so a byte-cache hit is measured as the fast read it is and the
   // `net` phase answers "how long did it take to get these bytes in hand".
   const store = withChunkTiming(cached)
-  return omeZarrChunkedSource(await openOmeZarr(store, options), options)
+  const source = omeZarrChunkedSource(
+    await openOmeZarr(store, options),
+    options,
+  )
+  return byteCache ? { ...source, byteCache } : source
 }

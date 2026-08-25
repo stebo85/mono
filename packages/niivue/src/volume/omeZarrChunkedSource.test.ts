@@ -368,6 +368,70 @@ describe('ByteLruCache', () => {
     }
   })
 
+  test('stats separate a thrashing budget from an unused one', () => {
+    // Same lookups, same misses, opposite diagnoses: the small budget evicts
+    // to make room, the large one simply never sees a repeat.
+    const thrash = new ByteLruCache(8)
+    for (let i = 0; i < 6; i++) {
+      thrash.has(`k${i}`)
+      thrash.set(`k${i}`, new Uint8Array(4))
+    }
+    expect(thrash.stats.hits).toBe(0)
+    expect(thrash.stats.misses).toBe(6)
+    expect(thrash.stats.evicted).toBeGreaterThan(0)
+
+    const roomy = new ByteLruCache(1024)
+    for (let i = 0; i < 6; i++) {
+      roomy.has(`k${i}`)
+      roomy.set(`k${i}`, new Uint8Array(4))
+    }
+    expect(roomy.stats.hits).toBe(0)
+    expect(roomy.stats.misses).toBe(6)
+    expect(roomy.stats.evicted).toBe(0)
+  })
+
+  test('counts a lookup once, at the gate zarrita consults', () => {
+    const cache = new ByteLruCache(64)
+    cache.set('k', new Uint8Array(4))
+    // `withByteCaching` calls has() then get(); only has() counts, so a hit
+    // is one hit and not two.
+    expect(cache.has('k')).toBe(true)
+    cache.get('k')
+    expect(cache.stats.hits).toBe(1)
+    expect(cache.stats.misses).toBe(0)
+  })
+
+  test('stats report admissions, rejections and evicted bytes', () => {
+    const cache = new ByteLruCache(10)
+    cache.set('a', new Uint8Array(6))
+    cache.set('absent', undefined)
+    cache.set('huge', new Uint8Array(11))
+    cache.set('b', new Uint8Array(6)) // evicts 'a'
+    const stats = cache.stats
+    expect(stats.admitted).toBe(3)
+    expect(stats.rejected).toBe(1)
+    expect(stats.evicted).toBe(1)
+    expect(stats.evictedBytes).toBe(6)
+    expect(stats.bytes).toBe(cache.totalBytes)
+    expect(stats.entries).toBe(2)
+    expect(stats.maxBytes).toBe(10)
+  })
+
+  test('resetStats zeroes the counters and keeps the entries', () => {
+    const cache = new ByteLruCache(64)
+    cache.set('k', new Uint8Array(4))
+    cache.has('k')
+    cache.has('missing')
+    cache.resetStats()
+    const stats = cache.stats
+    expect(stats.hits).toBe(0)
+    expect(stats.misses).toBe(0)
+    expect(stats.admitted).toBe(0)
+    expect(stats.entries).toBe(1)
+    expect(stats.bytes).toBe(4)
+    expect(cache.get('k')).toBeDefined()
+  })
+
   test('with zarrita byte caching, an absent chunk is fetched once', async () => {
     const backing = makeChunkedZyxStore()
     backing.delete('/0/1.1.1') // the chunk holding the far corner

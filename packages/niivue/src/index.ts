@@ -325,6 +325,7 @@ export {
 } from './volume/omeZarr'
 // OME-Zarr chunk-streaming adapter for nv.loadChunkedVolume
 export {
+  type ByteCacheStats,
   ByteLruCache,
   type FetchOmeZarrChunkedSourceOptions,
   fetchOmeZarrChunkedSource,

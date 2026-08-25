@@ -628,10 +628,6 @@ function setBusy(node, label, text, busy) {
   if (busy) label.textContent = text
 }
 
-// Where a streamed brick's time goes, averaged over the bricks pulled since the
-// last dataset switch. `decode` is an upper bound (read minus network minus
-// assemble), and only `upload` is work a decode worker could not move off the
-// render thread -- which is the whole question stage C turns on.
 // Main-thread stall monitor. The phase timings below can only see the spans
 // NiiVue owns, and chunk DECODE happens inside zarrita where they cannot reach.
 // This measures the gap the other way round: any frame the browser fails to
@@ -688,6 +684,22 @@ function brickCost() {
   return `${net}, ${main}, ${Math.round(t.mainThreadMs)} ms total`
 }
 
+// Whether the store-level byte budget is earning its keep. A run of all
+// misses is ambiguous on its own -- the budget may be too small to hold the
+// working set, or the access pattern may simply never revisit a chunk -- and
+// the two want opposite fixes. Evictions tell them apart: many evictions with
+// no hits is thrash, no evictions with no hits means there was nothing to
+// reuse.
+function byteCacheCost() {
+  const c = chunkSource?.byteCache?.stats
+  if (!c) return 'off'
+  const looks = c.hits + c.misses
+  const rate = looks > 0 ? Math.round((100 * c.hits) / looks) : 0
+  return `${rate}% of ${looks} (${formatBytes(c.bytes)} of ${formatBytes(
+    c.maxBytes,
+  )}, ${c.evicted} evicted)`
+}
+
 function updateVolumeHud() {
   if (!chunkSource || !nv) return
   const def = DATASETS[els.dataset.value]
@@ -729,6 +741,7 @@ function updateVolumeHud() {
         : '-'
     }</span></div>
     <div class="row"><span class="key">stream cost</span><span>${brickCost()}</span></div>
+    <div class="row"><span class="key">byte cache</span><span>${byteCacheCost()}</span></div>
     <div class="row"><span class="key">stalls</span><span>${stallCost()}</span></div>
     <div class="row"><span class="key">window</span><span>${formatValue(
       windowRange[0],

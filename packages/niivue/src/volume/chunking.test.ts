@@ -887,6 +887,73 @@ describe('chunkVolumeMultiLOD', () => {
   })
 })
 
+describe('chunkVolumeMultiLOD — pinned gridDims lattice', () => {
+  // Deliberately NOT power-of-two per axis, so an exact lattice cannot fall out
+  // of a scalar cellEdge (which is the reason the option exists).
+  const pyramid: Vec3i[] = [
+    [512, 384, 640],
+    [256, 192, 320],
+    [128, 96, 160],
+  ]
+  const anyFocus = { center: [10, 10, 10] as Vec3i, radius: 4 }
+
+  test('builds exactly the asked-for brick count, all at minLevel', () => {
+    const plan = chunkVolumeMultiLOD(pyramid, anyFocus, 512, {
+      haloSize: [3, 3, 3],
+      minLevel: 1,
+      gridDims: [1, 2, 2],
+    })
+    expect(plan.gridDims).toEqual([1, 2, 2])
+    expect(plan.chunks.length).toBe(4)
+    for (const c of plan.chunks) expect(c.sourceLevel).toBe(1)
+  })
+
+  test('tiles the common grid exactly, with grid-ordered indices', () => {
+    const plan = chunkVolumeMultiLOD(pyramid, anyFocus, 512, {
+      minLevel: 0,
+      gridDims: [2, 3, 4],
+    })
+    expect(plan.chunks.length).toBe(24)
+    const sum = plan.chunks.reduce(
+      (t, c) => t + c.voxelDims[0] * c.voxelDims[1] * c.voxelDims[2],
+      0,
+    )
+    expect(sum).toBe(512 * 384 * 640)
+    // chunkAtVoxel indexes by gridDims/stride, so the emit order matters.
+    expect(chunkAtVoxel(plan, [0, 0, 0])?.gridIndex).toEqual([0, 0, 0])
+    expect(chunkAtVoxel(plan, [511, 383, 639])?.gridIndex).toEqual([1, 2, 3])
+  })
+
+  test('grows an axis whose brick would not fit the device limit', () => {
+    // One brick per axis at level 0 would need 512 voxels of texture.
+    const plan = chunkVolumeMultiLOD(pyramid, anyFocus, 128, {
+      haloSize: [2, 2, 2],
+      minLevel: 0,
+      gridDims: [1, 1, 1],
+    })
+    for (const c of plan.chunks) {
+      expect(Math.max(...c.texDims)).toBeLessThanOrEqual(128)
+    }
+    expect(plan.chunks.length).toBe(
+      plan.gridDims[0] * plan.gridDims[1] * plan.gridDims[2],
+    )
+    expect(plan.gridDims[0]).toBeGreaterThan(1)
+  })
+
+  test('ignores the focus, radius and brick cap it replaces', () => {
+    const opts = { minLevel: 1, gridDims: [2, 2, 2] as Vec3i }
+    const near = chunkVolumeMultiLOD(pyramid, anyFocus, 512, opts)
+    const far = chunkVolumeMultiLOD(
+      pyramid,
+      { center: [500, 380, 630], radius: 400 },
+      512,
+      { ...opts, maxBricks: 2, budgetBytes: 1 },
+    )
+    expect(far.chunks.length).toBe(8)
+    expect(far.chunks).toEqual(near.chunks)
+  })
+})
+
 describe('matchChunksByContent', () => {
   const pyramid: Vec3i[] = [
     [512, 512, 512],

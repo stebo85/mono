@@ -116,6 +116,7 @@ export function planForFocus(
   const center = focusCenterBiased(levelDims[0], focusFrac, o.cellEdge)
   return chunkVolumeMultiLOD(levelDims, { center, radius }, o.deviceLimit, {
     cellEdge: o.cellEdge,
+    gridDims: o.gridDims,
     haloSize: o.halo,
     detail: o.detail,
     minLevel: o.minLevel,

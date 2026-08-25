@@ -105,6 +105,13 @@
         <option value="4">L4</option>
       </select>
       &nbsp;
+      <label for="blocks" title="How many blocks the left pane's lattice is divided into. The grid is chosen to keep the blocks as close to cubic as the volume allows.">Blocks</label>
+      <select id="blocks" title="How many blocks the left pane's lattice is divided into.">
+        <option value="4">4</option>
+        <option value="9">9</option>
+        <option value="16" selected>16</option>
+      </select>
+      &nbsp;
       <label for="explode" title="Separate the bricks in the 3D render. This is a render-time offset only; the voxel data never moves.">Explode</label>
       <input type="range" min="100" value="170" max="280" class="slider" id="explode" title="Separate the bricks in the 3D render (render-time offset only)." />
       <span id="explodeVal">1.70x</span>

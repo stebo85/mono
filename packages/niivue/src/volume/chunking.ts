@@ -695,6 +695,17 @@ export interface MultiLodOptions {
    * limit is never exceeded. Omit/0 for no cap.
    */
   maxBricks?: number
+  /**
+   * EXACT uniform lattice: tile the volume into `gridDims[a]` bricks per axis,
+   * every one drawn from `minLevel`. Pins the brick COUNT (which otherwise falls
+   * out of `cellEdge` and the pyramid), so a caller can ask for "4 blocks" and
+   * get 4. Bypasses the octree entirely: `focus`, `radius`, `detail`,
+   * `budgetBytes` and `maxBricks` are all unused. An axis is silently GROWN when
+   * its brick would not fit `deviceLimit` (fewer bricks means bigger ones, and a
+   * brick over the texture limit would be clamped and sample squashed), so read
+   * the plan's own `gridDims` back for what was actually built.
+   */
+  gridDims?: Vec3i
 }
 
 /**
@@ -807,6 +818,90 @@ export function chunkVolumeMultiLOD(
       gridIndex: [0, 0, 0],
       sourceLevel: level,
     })
+  }
+
+  // An EXACT uniform lattice, when the caller pinned one. `gridDims` replaces
+  // the octree outright: every brick is drawn from `minLevel`, so the plan is
+  // one regular grid whose brick COUNT is the caller's rather than a value that
+  // falls out of `cellEdge` and the pyramid. That is what a lattice you pick
+  // bricks out of needs -- see `examples/vox.block.pick.zarr.html`, whose block
+  // control asks for 4 / 9 / 16 blocks directly. The budget/`maxBricks` passes
+  // are skipped (they coarsen by refining less, and there is nothing here to
+  // refine); the brick count is small and each brick is bounded by `deviceLimit`,
+  // so the plan's bytes are bounded by `count * deviceLimit^3 * 8`.
+  if (options.gridDims) {
+    // Largest texture extent any brick on this axis would need, computed the
+    // same way `emitBrick` does (common box -> level box, plus the halo faces).
+    const axisNeed = (a: number, count: number): number => {
+      const ld = levelDims[minLevel]
+      const scale = ld[a] / commonDims[a]
+      const stride = Math.ceil(commonDims[a] / count)
+      let need = 0
+      for (let i = 0; i < count; i++) {
+        const originC = i * stride
+        const sizeC = Math.min(stride, commonDims[a] - originC)
+        if (sizeC <= 0) break
+        const loL = Math.max(0, Math.floor(originC * scale))
+        const hiL = Math.min(ld[a], Math.ceil((originC + sizeC) * scale))
+        const dataL = Math.max(1, hiL - loL)
+        const hLow = loL > 0 ? halo[a] : 0
+        const hHigh = loL + dataL < ld[a] ? halo[a] : 0
+        need = Math.max(need, dataL + hLow + hHigh)
+      }
+      return need
+    }
+    const grid: Vec3i = [1, 1, 1]
+    const stride: Vec3i = [1, 1, 1]
+    for (let a = 0; a < 3; a++) {
+      const asked = Math.floor(options.gridDims[a])
+      // One brick per axis at least, and never more cells than the LEVEL has
+      // voxels (an empty brick has nothing to fetch).
+      let count = Math.min(
+        Math.max(1, Number.isFinite(asked) ? asked : 1),
+        levelDims[minLevel][a],
+      )
+      // A brick's texture is data + 2*halo and `emitBrick` CLAMPS texDims to the
+      // device limit, which would squash the sampling rather than fail loudly.
+      // When the asked-for lattice cannot fit, more cells is the only direction
+      // that keeps every brick correct, so grow this axis until it does.
+      while (
+        count < levelDims[minLevel][a] &&
+        axisNeed(a, count) > deviceLimit
+      ) {
+        count++
+      }
+      grid[a] = count
+      stride[a] = Math.ceil(commonDims[a] / grid[a])
+      // A ceil stride can leave the last cells empty (e.g. 10 voxels in 4 cells
+      // strides by 3 and fills only 4); drop them so `chunkAtVoxel`'s index math
+      // still lands on a real brick.
+      grid[a] = Math.ceil(commonDims[a] / stride[a])
+    }
+    const chunks: VolumeChunkDesc[] = []
+    for (let cz = 0; cz < grid[2]; cz++) {
+      for (let cy = 0; cy < grid[1]; cy++) {
+        for (let cx = 0; cx < grid[0]; cx++) {
+          const index: Vec3i = [cx, cy, cz]
+          const originC: Vec3i = [0, 0, 0]
+          const sizeC: Vec3i = [0, 0, 0]
+          for (let a = 0; a < 3; a++) {
+            originC[a] = index[a] * stride[a]
+            sizeC[a] = Math.min(stride[a], commonDims[a] - originC[a])
+          }
+          emitBrick(originC, sizeC, minLevel, chunks)
+          chunks[chunks.length - 1].gridIndex = index
+        }
+      }
+    }
+    return {
+      gridDims: grid,
+      stride,
+      chunks,
+      volumeDims: [commonDims[0], commonDims[1], commonDims[2]],
+      deviceLimit,
+      haloSize: [halo[0], halo[1], halo[2]],
+      levelDims: levelDims.map((d) => [d[0], d[1], d[2]] as Vec3i),
+    }
   }
 
   // Two bricks share a 2D FACE: their common-grid boxes are adjacent on exactly

@@ -136,6 +136,16 @@ export interface BudgetPlanOptions {
   /** Brick texture edge in level voxels (default 128). */
   cellEdge?: number
   /**
+   * EXACT uniform lattice: tile the volume into `gridDims[a]` bricks per axis,
+   * all drawn from `minLevel`. Pins the brick COUNT rather than letting it fall
+   * out of `cellEdge` and the pyramid, which is what a lattice the user picks
+   * bricks out of needs. Bypasses the octree, so `focus`, `radius`, `detail`,
+   * `budgetBytes` and `maxBricks` have no effect while it is set; an axis grows
+   * when its brick would not fit `deviceLimit`, so read the built plan's own
+   * `gridDims` back for what was actually planned.
+   */
+  gridDims?: Vec3i
+  /**
    * Per-axis halo in level voxels (default [1,1,1], which is what hardware
    * trilinear sampling needs). Raised to at least `CUBIC_MIN_HALO` on every axis
    * while the host has `volumeIsCubicInterpolation` on, because the cubic kernel
@@ -178,6 +188,7 @@ export interface ResolvedOptions {
   budgetBytes: number
   maxBricks: number
   cellEdge: number
+  gridDims?: Vec3i
   halo: Vec3i
   detail: number
   minLevel: number
@@ -194,6 +205,7 @@ export type PlanShapeOptions = Pick<
   | 'budgetBytes'
   | 'maxBricks'
   | 'cellEdge'
+  | 'gridDims'
   | 'halo'
   | 'detail'
   | 'minLevel'
@@ -244,6 +256,7 @@ export function resolveBudgetPlan(
     budgetBytes: options.budgetBytes ?? plan.budgetBytes,
     maxBricks: options.maxBricks ?? plan.maxBricks,
     cellEdge: options.cellEdge ?? 128,
+    gridDims: options.gridDims,
     halo: [
       Math.max(halo[0], ctx.minHalo),
       Math.max(halo[1], ctx.minHalo),

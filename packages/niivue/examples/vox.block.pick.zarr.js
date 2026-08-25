@@ -71,11 +71,12 @@ const WINDOW = { min: 50200, max: 51300 }
 // 3D gradient/lighting samples one voxel past each brick face; a 3-voxel halo
 // keeps that reach inside resident data so brick boundaries stay seam-free.
 const HALO = [3, 3, 3]
-// Small bricks on the left so the lattice has enough cells to be worth picking
-// from; big bricks on the right so the crop gets real detail per fetch.
-const LATTICE_DEVICE_LIMIT = 128
+// The lattice pins its block COUNT (see gridForBlocks), so its device limit is
+// no longer what decides how many bricks there are -- it is only the ceiling on
+// how big one brick's texture may get, and the coarse lattices need the full
+// 256: 4 blocks over L5 is a 181x186x123 brick before halo.
+const LATTICE_DEVICE_LIMIT = 256
 const BLOCK_DEVICE_LIMIT = 256
-const LATTICE_BUDGET_BYTES = 700_000_000
 const BLOCK_BUDGET_BYTES = 1_200_000_000
 const ZARR_CACHE_BYTES = 256 * 1024 * 1024
 // Below this many voxels on an axis a cropped level is too small to be a useful
@@ -89,6 +90,7 @@ let cv1 = null // NVChunkedVolume handle for the whole-heart lattice
 let cv2 = null // NVChunkedVolume handle for the picked brick
 let picked = null // the last ExplodedBlockPick (+ crop metadata), or null
 let latticeSeq = 0 // serializes overlapping lattice loads: last one wins
+let latticeAsked = 0 // blocks requested, so the readout can flag a grown grid
 let pickSeq = 0 // serializes overlapping brick loads: last pick wins
 let syncing = false // re-entrancy guard for the linked crosshairs
 let downX = 0
@@ -400,6 +402,33 @@ function levelIndexOf(base, datasetLevel) {
   return i < 0 ? 0 : i
 }
 
+/**
+ * Split `n` blocks into a per-axis grid whose blocks come out as close to cubic
+ * as this level's shape allows: of every factorization of `n` into three
+ * factors, keep the one whose block edges have the smallest max/min ratio.
+ *
+ * This is why the planner takes a per-axis `gridDims` rather than a block size.
+ * A single edge length cannot produce an arbitrary count on a volume that is not
+ * a cube: 9 blocks over L5's 181x186x246 is 1x3x3, and no scalar edge yields
+ * that (the counts it can reach here go 1, 2, 8, 12, 27...). Asking for a count
+ * only means something if each axis can be divided on its own.
+ */
+function gridForBlocks(shape, n) {
+  let best = null
+  for (let gx = 1; gx <= n; gx++) {
+    if (n % gx !== 0) continue
+    const rest = n / gx
+    for (let gy = 1; gy <= rest; gy++) {
+      if (rest % gy !== 0) continue
+      const grid = [gx, gy, rest / gy]
+      const edges = shape.map((d, a) => d / grid[a])
+      const score = Math.max(...edges) / Math.min(...edges)
+      if (best === null || score < best.score) best = { grid, score }
+    }
+  }
+  return best.grid
+}
+
 async function loadLattice() {
   const seq = ++latticeSeq
   clearPick()
@@ -413,10 +442,17 @@ async function loadLattice() {
     cv1?.dispose()
     cv1 = null
     nv1.removeAllVolumes()
-    // 'uniform' plans the SAME level everywhere (focus 'none', radius 'volume'),
-    // so the lattice is a regular grid of equal bricks and -- unlike the
-    // crosshair-following 'focus' plan -- it does NOT re-plan when the crosshair
-    // moves. A stable lattice is what makes picking meaningful.
+    // `gridDims` pins the lattice: an EXACT grid of equal bricks, every one
+    // drawn from the chosen level, so the block count is the one the user picked
+    // instead of whatever falls out of the brick size and the pyramid. That is
+    // what makes the lattice worth picking out of -- and it is stable, since
+    // there is no octree left to re-plan.
+    //
+    // 'uniform' still matters for its focus: 'none'. A crosshair focus would
+    // subscribe `locationChange` and re-plan on every crosshair move, and while
+    // the plan would come back identical, the work (and the churn) would not.
+    const levelIndex = levelIndexOf(base, parseInt(lattice.value, 10))
+    latticeAsked = parseInt(blocks.value, 10)
     cv1 = await nv1.loadChunkedVolume(base, {
       id: `heart-lattice#${seq}`,
       name: 'HOA human heart',
@@ -424,10 +460,10 @@ async function loadLattice() {
       calMax: WINDOW.max,
       colormap: 'gray',
       budgetPlan: 'uniform',
-      budgetBytes: LATTICE_BUDGET_BYTES,
+      gridDims: gridForBlocks(base.levels[levelIndex].shape, latticeAsked),
       deviceLimit: LATTICE_DEVICE_LIMIT,
       halo: HALO,
-      minLevel: levelIndexOf(base, parseInt(lattice.value, 10)),
+      minLevel: levelIndex,
       coarseFloor: true,
     })
     if (seq !== latticeSeq) {
@@ -527,6 +563,22 @@ async function pickAt(clientX, clientY) {
   }
 }
 
+/**
+ * The lattice line: what was built, and -- when an axis had to grow because a
+ * block would have overflowed the device texture limit at this level -- what was
+ * asked for. Growing is the planner's only honest move there: fewer blocks means
+ * bigger ones, and a block over the limit would be clamped and sample squashed.
+ */
+function latticeLine(plan, drawn) {
+  const built = plan?.chunks.length ?? 0
+  const grid = plan?.gridDims ?? [1, 1, 1]
+  const grown =
+    built !== latticeAsked
+      ? `  (asked ${latticeAsked}; grown to fit ${LATTICE_DEVICE_LIMIT}-voxel bricks)`
+      : ''
+  return `${built} bricks ${grid.join('x')} from L${drawn}${grown}`
+}
+
 function reportParent() {
   const vol = nv1.volumes?.[0]
   if (!vol) return
@@ -538,7 +590,7 @@ function reportParent() {
   const lines = [
     `<span class="k">crosshair  </span> ${fmt3(mm)} um`,
     `<span class="k">common grid</span> ${common.join(' x ')} vox @ ${(levels[0]?.spacing ?? [0]).map((s) => s.toFixed(3)).join(' x ')} um   (level 0)`,
-    `<span class="k">lattice    </span> ${plan?.chunks.length ?? 0} bricks drawn from L${drawn}   explode ${isExploded() ? `${explodeScale().toFixed(2)}x` : 'off'}`,
+    `<span class="k">lattice    </span> ${latticeLine(plan, drawn)}   explode ${isExploded() ? `${explodeScale().toFixed(2)}x` : 'off'}`,
   ]
   lines.push(
     picked
@@ -615,6 +667,10 @@ function linkFromBlock(mm) {
 }
 
 lattice.onchange = () => {
+  loadLattice()
+}
+
+blocks.onchange = () => {
   loadLattice()
 }
 

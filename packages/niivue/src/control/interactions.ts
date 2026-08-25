@@ -668,10 +668,6 @@ function pickExplodedDraw(
   const data = strokeSample(ctrl, vol)
   const dimX = (vol.dimsRAS as number[])[1]
   const dimXY = dimX * (vol.dimsRAS as number[])[2]
-  const sample = data
-    ? (x: number, y: number, z: number): number =>
-        data[x + y * dimX + z * dimXY]
-    : undefined
   // The window cal_min/cal_max are in display units; convert to the raw scale
   // getImageDataRAS returns. The first faintly-non-zero voxel is near-transparent
   // ("cloud"), so threshold a short way up the window so the paint lands on the
@@ -680,7 +676,26 @@ function pickExplodedDraw(
   const sclInter = vol.hdr?.scl_inter || 0
   const winLo = (vol.calMin - sclInter) / sclSlope
   const winHi = (vol.calMax - sclInter) / sclSlope
-  const threshold = winLo + 0.15 * (winHi - winLo)
+  let threshold = winLo + 0.15 * (winHi - winLo)
+  let sample: ((x: number, y: number, z: number) => number) | undefined
+  const base = vol.pickSampler
+  if (data) {
+    sample = (x: number, y: number, z: number): number =>
+      data[x + y * dimX + z * dimXY]
+  } else if (base) {
+    // A STREAMED volume has no CPU `img` -- its voxels live in GPU brick
+    // textures -- so fall back to the volume's own mm-space `pickSampler` (the
+    // resident coarse floor NVChunkedVolume installs). It already returns a
+    // WINDOW-VISIBLE value, so its threshold is 0 rather than a fraction of the
+    // window. Same wrapping the 3D depth pick uses (NVViewGPU/NVViewGL), so a
+    // click lands on the same voxel whether the volume is resident or streamed.
+    const matRAS = vol.matRAS as mat4
+    sample = (x: number, y: number, z: number): number => {
+      const mm = NVTransforms.vox2mm(null, [x, y, z], matRAS)
+      return base(mm[0], mm[1], mm[2])
+    }
+    threshold = 0
+  }
   const picked = pickExplodedVoxel(
     plan,
     vol.matRAS as Float32Array,

@@ -73,7 +73,7 @@ compensation work"; decode and budget plans wait behind them.
 
 ## Two-panel block inspector demo
 
-- [ ] A demo with two side-by-side panels for looking INSIDE one LOD brick.
+- [x] A demo with two side-by-side panels for looking INSIDE one LOD brick.
 
   Left panel: `hoa_heart` at a coarse level (L3 or L4) with the explode factor
   above 1, so the brick lattice is visible and individually pickable. The user
@@ -98,14 +98,30 @@ compensation work"; decode and budget plans wait behind them.
   which is a `chunkVolumeGrid` over that sub-box against level 0; both panels
   must work on both backends.
 
-  Partly built. `examples/vox.block.pick.html` does the picking half against a
-  CPU-resident NIfTI: `pickExplodedBlock` ray-tests the exploded brick boxes and
-  `extractChunkBlock` copies the picked brick out as a standalone volume that
-  keeps the parent's anatomy. What is still missing is the multi-LOD half, which
-  is the part that tests `chunkOwnedTexBox`: a streamed volume holds its voxels
-  in GPU brick textures, so `extractSubVolume` returns null for one and the right
-  panel has to be built by fetching the L0 chunks that tile the picked brick
-  rather than by copying out of `img`.
+  Built, in two halves. `examples/vox.block.pick.html` does the picking half
+  against a CPU-resident NIfTI: `pickExplodedBlock` ray-tests the exploded brick
+  boxes and `extractChunkBlock` copies the picked brick out as a standalone
+  volume that keeps the parent's anatomy.
+
+  `examples/vox.block.pick.zarr.html` does the multi-LOD half against
+  `hoa_heart` streamed from the public store, which is the part that tests
+  `chunkOwnedTexBox`. A streamed volume holds its voxels in GPU brick textures,
+  so `extractSubVolume` returns null for one and the right panel cannot be built
+  by copying out of `img`. It instead opens a SECOND streamed volume over the
+  same store, cropped to the picked brick's common-grid box, and lets that
+  volume's own octree pull the crop down toward level 0 near its crosshair. Two
+  details are worth carrying into any similar work:
+
+  - A brick is already one texture's worth of data AT ITS OWN LEVEL, so
+    re-fetching it at that level buys nothing. The detail comes from the crop
+    source's finest levels, which is why the right panel is a fresh
+    `loadChunkedVolume` over a cropped `ChunkedVolumeSource` rather than a
+    re-request of the picked brick.
+  - Picking needed a core change. `pickExplodedDraw` sampled the parent's CPU
+    `img` to find the first voxel above threshold along the ray; a streamed
+    volume has no `img`, so every pick landed on the brick's box face. It now
+    falls back to `vol.pickSampler` (mm-space, backed by the coarse floor) when
+    `img` is absent. That lives in `control/`, so both backends get it.
 
 ## OME-Zarr world origin never reaches the volume affine
 
@@ -131,6 +147,18 @@ compensation work"; decode and budget plans wait behind them.
   true anatomical mm; for an OME-Zarr parent it means the block faithfully
   reproduces an affine that was already missing its world origin. See
   `examples/vox.block.pick.html`, which demonstrates the NIfTI case.
+
+  Measured on `hoa_heart` (2026-08, all 7 levels): every dataset's
+  `translation` is exactly half its own `scale` -- e.g. L5 has scale
+  `[224.416, 224.416, 224.416]` um and translation `[112.208, 112.208,
+  112.208]`. That is the OME-NGFF voxel-CENTRE convention, not a world origin:
+  every level is corner-aligned at world 0, so what NiiVue drops for this store
+  is a uniform half-voxel shift with NO inter-level misregistration. The gap
+  still matters for any store that declares a real world origin (or per-level
+  translations that are not a pure centre offset), and it is worth fixing for
+  the half-voxel alone, but it is not the cause of any brick-alignment artifact
+  seen so far. `examples/vox.block.pick.zarr.html` prints each level's `scale`,
+  `translation`, and their ratio so the convention is visible in the demo.
 
   Shape of the fix: add an optional per-level `originMM` (or a full affine) to
   `ChunkedVolumeLevel`, populate it from the parsed `translation` in the

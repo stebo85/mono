@@ -133,6 +133,14 @@ export interface NVSlideVisibleTile {
 export interface NVSlideVisibleTiles {
   level: NVSlideLevelManifest | null
   tiles: NVSlideVisibleTile[]
+  /**
+   * Already-cached tiles from COARSER levels covering the same viewport,
+   * ordered coarsest first. A renderer paints these in array order UNDER
+   * `tiles` and skips the placeholder quad for any target tile that is still
+   * loading, so zooming in refines the image in place instead of blanking it.
+   * Empty whenever every target tile is cached. See {@link NVSlide.visibleTiles}.
+   */
+  fallback: NVSlideVisibleTile[]
 }
 
 export interface NVSlideScreenRect {
@@ -703,9 +711,69 @@ export class NVSlide extends EventTarget {
     }
   }
 
+  /**
+   * The tiles covering the viewport at the auto-selected (or pinned) level,
+   * plus a `fallback` layer of already-cached tiles from COARSER levels that
+   * the renderer paints underneath them.
+   *
+   * The fallback layer is what keeps a zoom from flashing empty: the tiles for
+   * a newly selected level arrive over hundreds of milliseconds, and until they
+   * do their screen rects have nothing to draw but a flat placeholder. Rather
+   * than discard the resolution already on screen, this hands the renderer the
+   * cached coarser tiles covering the same viewport, ordered COARSEST FIRST so
+   * painting them in array order lets each finer level overpaint the one below
+   * and the target level land on top. The layer is built only when at least one
+   * target tile is still missing, so a settled view pays nothing for it.
+   */
   visibleTiles(screen: NVSlideScreen): NVSlideVisibleTiles {
     const level = this.selectLevel()
-    if (!level) return { level: null, tiles: [] }
+    if (!level) return { level: null, tiles: [], fallback: [] }
+    const tiles = this.tilesForLevel(level, screen)
+    return { level, tiles, fallback: this.fallbackTiles(level, tiles, screen) }
+  }
+
+  /**
+   * Cached tiles from every level coarser than `target` that covers the
+   * viewport, coarsest first. Empty when every target tile is already cached
+   * (the steady state) or when `target` is the coarsest level.
+   */
+  private fallbackTiles(
+    target: NVSlideLevelManifest,
+    tiles: readonly NVSlideVisibleTile[],
+    screen: NVSlideScreen,
+  ): NVSlideVisibleTile[] {
+    let missing = false
+    for (const item of tiles) {
+      if (!this._cache.has(item.key)) {
+        missing = true
+        break
+      }
+    }
+    if (!missing) return []
+    const levels = this.manifest.levels
+    // Position in the array, not `level.index`: `selectLevel` walks the array
+    // finest-to-coarsest and a manifest may number its levels however it likes.
+    const targetPos = levels.indexOf(target)
+    if (targetPos < 0) return []
+    const out: NVSlideVisibleTile[] = []
+    for (let pos = levels.length - 1; pos > targetPos; pos--) {
+      const coarse = levels[pos]
+      if (!coarse) continue
+      for (const item of this.tilesForLevel(coarse, screen)) {
+        // Only what is ALREADY decoded: the fallback layer never issues a
+        // fetch, so it cannot compete with the target level for the load slots
+        // that will actually retire it.
+        if (this._cache.has(item.key)) out.push(item)
+      }
+    }
+    return out
+  }
+
+  /** The tiles of one pyramid level covering the current viewport. */
+  private tilesForLevel(
+    level: NVSlideLevelManifest,
+    screen: NVSlideScreen,
+  ): NVSlideVisibleTile[] {
     const dpr = screen.devicePixelRatio ?? 1
     const viewLeft =
       this.viewport.centerX - screen.widthCss / (2 * this.viewport.scale)
@@ -724,6 +792,8 @@ export class NVSlide extends EventTarget {
     // each LOD boundary, so annotations appear to jump when zooming across a
     // level. Using the exact scale makes every level cover exactly [0, base], so
     // tiles register with each other and with slide-space drawings across zoom.
+    // It is also what lets a coarse fallback tile sit exactly under the target
+    // tiles it stands in for.
     const dsX =
       level.width > 0 ? this.manifest.width / level.width : level.downsample
     const dsY =
@@ -785,7 +855,7 @@ export class NVSlide extends EventTarget {
         })
       }
     }
-    return { level, tiles }
+    return tiles
   }
 
   requestVisibleTiles(screen: NVSlideScreen): NVSlideVisibleTiles {

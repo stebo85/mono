@@ -141,8 +141,40 @@ export class SlideRenderer extends NVRenderer {
         false,
       )
       const visible = slide.requestVisibleTiles(screen)
+      // Coarser levels first, painted UNDER the target level. Non-empty only
+      // while target tiles are still arriving, so the previous resolution stays
+      // on screen and is overpainted tile by tile as the finer data lands.
+      // No tile grid here: the grid describes the target level.
+      for (const item of visible.fallback) {
+        const bitmap = slide.cachedTileBitmap(item.key)
+        if (!bitmap) continue
+        const texture = this.textureForBitmap(gl, item.key, bitmap)
+        if (!texture) continue
+        this.drawTile(
+          gl,
+          width,
+          height,
+          {
+            x: item.screenX,
+            y: item.screenY,
+            width: item.screenWidth,
+            height: item.screenHeight,
+          },
+          texture.texture,
+          slide.placeholderColor,
+          slide.gridColor,
+          slide.opacity,
+          item,
+          false,
+          false,
+        )
+      }
       for (const item of visible.tiles) {
         const bitmap = slide.cachedTileBitmap(item.key)
+        // A missing tile draws a flat placeholder ONLY when nothing coarser is
+        // behind it; otherwise the placeholder would hide the very fallback
+        // layer that is standing in for it.
+        if (!bitmap && visible.fallback.length > 0) continue
         const texture = bitmap
           ? this.textureForBitmap(gl, item.key, bitmap)
           : null

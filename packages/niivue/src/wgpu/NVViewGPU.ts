@@ -2473,6 +2473,7 @@ export default class NVView {
     pending: number
     inFlight: number
     total: number
+    staleDropped: number
   } {
     return this.volumeRenderer.chunkStreamStats()
   }

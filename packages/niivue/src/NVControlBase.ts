@@ -205,6 +205,7 @@ type ViewBackend = {
     pending: number
     inFlight: number
     total: number
+    staleDropped: number
   }
   rebakeChunkedOverlays: () => void
   /**
@@ -3790,16 +3791,22 @@ export default class NiiVue extends EventTarget {
 
   /**
    * Streaming stats across all chunked volumes (base + independent overlay) on
-   * the active backend: `{ resident, pending, inFlight, total }` brick counts.
-   * Returns null before a view is attached. Useful for HUD / debug overlays:
-   * `resident < total` with `pending > 0` for many frames indicates the working
-   * set exceeds the residency budget (thrashing).
+   * the active backend: `{ resident, pending, inFlight, total, staleDropped }`
+   * brick counts. Returns null before a view is attached. Useful for HUD / debug
+   * overlays: `resident < total` with `pending > 0` for many frames indicates the
+   * working set exceeds the residency budget (thrashing).
+   *
+   * `staleDropped` is cumulative, not per frame: queued uploads retired because
+   * the view moved on before they ran. It climbing during a pan or rotate is the
+   * queue working as intended, since that work would otherwise have uploaded
+   * bricks for viewports the user had already left.
    */
   chunkStreamStats(): {
     resident: number
     pending: number
     inFlight: number
     total: number
+    staleDropped: number
   } | null {
     return this.view?.chunkStreamStats() ?? null
   }

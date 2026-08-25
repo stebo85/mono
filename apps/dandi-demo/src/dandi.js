@@ -663,6 +663,11 @@ function updateVolumeHud() {
     <div class="row"><span class="key">levels</span><span>${
       levels.length > 0 ? levels.map((l) => `L${l}`).join(' ') : '-'
     }</span></div>
+    <div class="row"><span class="key">queue</span><span>${
+      stats
+        ? `${stats.pending} queued, ${stats.inFlight} in flight, ${stats.staleDropped} stale`
+        : '-'
+    }</span></div>
     <div class="row"><span class="key">window</span><span>${formatValue(
       windowRange[0],
     )} .. ${formatValue(windowRange[1])}</span></div>

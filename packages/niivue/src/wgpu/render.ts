@@ -1891,25 +1891,31 @@ export class VolumeRenderer extends NVRenderer {
    * Aggregate streaming stats across all chunked volumes (base + overlay), for
    * HUD / debug instrumentation. `resident` is bricks currently on the GPU,
    * `pending` queued for upload, `inFlight` mid-upload, `total` the chunk count.
+   * `staleDropped` counts queued uploads retired because the working set moved
+   * on before they ran — upload work the old cross-frame queue would have spent
+   * on viewports the user had already left.
    */
   chunkStreamStats(): {
     resident: number
     pending: number
     inFlight: number
     total: number
+    staleDropped: number
   } {
     let resident = 0
     let pending = 0
     let inFlight = 0
     let total = 0
+    let staleDropped = 0
     for (const entry of this._texCache.values()) {
       if (entry.kind !== 'chunked') continue
       resident += entry.manager.residentCount
       pending += entry.manager.pendingUploadCount
       inFlight += entry.manager.inFlightUploadCount
       total += entry.manager.chunkCount
+      staleDropped += entry.manager.staleDropCount
     }
-    return { resident, pending, inFlight, total }
+    return { resident, pending, inFlight, total, staleDropped }
   }
 
   /**

@@ -97,3 +97,45 @@ compensation work"; decode and budget plans wait behind them.
   the right panel needs the set of L0 chunks covering one brick's common box,
   which is a `chunkVolumeGrid` over that sub-box against level 0; both panels
   must work on both backends.
+
+  Partly built. `examples/vox.block.pick.html` does the picking half against a
+  CPU-resident NIfTI: `pickExplodedBlock` ray-tests the exploded brick boxes and
+  `extractChunkBlock` copies the picked brick out as a standalone volume that
+  keeps the parent's anatomy. What is still missing is the multi-LOD half, which
+  is the part that tests `chunkOwnedTexBox`: a streamed volume holds its voxels
+  in GPU brick textures, so `extractSubVolume` returns null for one and the right
+  panel has to be built by fetching the L0 chunks that tile the picked brick
+  rather than by copying out of `img`.
+
+## OME-Zarr world origin never reaches the volume affine
+
+- [ ] Thread the OME-NGFF `translation` through to the streamed volume's affine.
+
+  OME-NGFF's equivalent of a NIfTI sform/qform is the per-dataset
+  `coordinateTransformations` list, which carries a `scale` and a `translation`.
+  `src/volume/omeZarr.ts` already parses BOTH, but only the scale survives the
+  trip to a volume:
+
+  - `omeZarrChannelFile` / `channelVolumeFile` (`src/volume/omeZarrLoader.ts`)
+    build an explicitly origin-centred volume.
+  - `ChunkedVolumeLevel` (`src/volume/ChunkedVolumeSource.ts`) carries
+    `level` / `shape` / `spacing` and has no origin field.
+  - `createStreamingNVImage` (`src/volume/streamingVolume.ts`) builds
+    `affine = diag(spacing)`, pinning the origin at voxel `[0,0,0]`.
+
+  So an OME-Zarr volume's mm coordinates are relative to its own corner, not to
+  the world origin the store declares. Anything that reasons in anatomical mm is
+  affected: the crosshair readout, cross-store alignment, and in particular
+  `extractSubVolume` (`src/volume/ChunkExtract.ts`), which inherits the parent's
+  `matRAS` verbatim. For a NIfTI parent that means the extracted block reports
+  true anatomical mm; for an OME-Zarr parent it means the block faithfully
+  reproduces an affine that was already missing its world origin. See
+  `examples/vox.block.pick.html`, which demonstrates the NIfTI case.
+
+  Shape of the fix: add an optional per-level `originMM` (or a full affine) to
+  `ChunkedVolumeLevel`, populate it from the parsed `translation` in the
+  OME-Zarr loader path, and have `createStreamingNVImage` write it into the
+  affine's translation column instead of leaving it at zero. Levels declare
+  their own translation in NGFF, so the coarse levels must not be assumed to
+  share level 0's origin. Unit-testable end to end (no GPU needed): parse a
+  fixture `.zattrs`, build the streaming NVImage, assert `matRAS[3,7,11]`.

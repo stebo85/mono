@@ -858,6 +858,26 @@ and its volumes alive."""
         """
         self.send({"cmd": "moveVolumeUp", "args": _make_args(volume_index)})
 
+    async def pick_exploded_block(self, client_x: Any, client_y: Any) -> Any:
+        """Resolve a pointer position over the 3D render onto one exploded brick of a chunked volume, or null when the point misses every visible brick.
+
+        Pass `event.clientX` / `event.clientY` from a click handler: the hit test
+        runs here, so no drag needs to be in progress. Pair with
+        `extractChunkBlock(vol, pick.chunkIndex)` to copy the picked brick out as a
+        standalone volume, and with `focusBox` (using `explodedMin`/`explodedMax`) to
+        outline it in place.
+
+        Parameters
+        ----------
+        client_x : number
+        client_y : number
+
+        Returns
+        -------
+        ExplodedBlockPick | null
+        """
+        return await self._request("pickExplodedBlock", _make_args(client_x, client_y))
+
     def rebake_chunked_overlays(self) -> None:
         """Re-bake the streamed/chunked overlays in place: drop their resident bricks so the next frame re-requests and re-bakes only the blocks in the current view frustum, leaving the base volume resident.
 

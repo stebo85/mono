@@ -2477,6 +2477,29 @@
       "returnsDoc": null
     },
     {
+      "jsName": "pickExplodedBlock",
+      "pyName": "pick_exploded_block",
+      "isAsync": false,
+      "returnsValue": true,
+      "params": [
+        {
+          "name": "clientX",
+          "tsType": "number",
+          "optional": false,
+          "doc": null
+        },
+        {
+          "name": "clientY",
+          "tsType": "number",
+          "optional": false,
+          "doc": null
+        }
+      ],
+      "returns": "ExplodedBlockPick | null",
+      "doc": "Resolve a pointer position over the 3D render onto one exploded brick of a\nchunked volume, or null when the point misses every visible brick.\n\nPass `event.clientX` / `event.clientY` from a click handler: the hit test\nruns here, so no drag needs to be in progress. Pair with\n`extractChunkBlock(vol, pick.chunkIndex)` to copy the picked brick out as a\nstandalone volume, and with `focusBox` (using `explodedMin`/`explodedMax`) to\noutline it in place.",
+      "returnsDoc": null
+    },
+    {
       "jsName": "rebakeChunkedOverlays",
       "pyName": "rebake_chunked_overlays",
       "isAsync": false,

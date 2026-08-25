@@ -250,6 +250,16 @@ export type {
   VolumeChunkDesc,
 } from './volume/chunking'
 export { chunkVolumeGrid, chunkVolumeMultiLOD } from './volume/chunking'
+// Exploded-block picking: resolve a click on an exploded brick, then copy that
+// brick out as a standalone volume that keeps the parent's anatomical frame.
+export type { ExplodedBlockPick } from './control/interactions'
+export { pickExplodedBlock } from './control/interactions'
+export type { ExtractedSubVolume } from './volume/ChunkExtract'
+export {
+  extractChunkBlock,
+  extractSubVolume,
+  subVolumeAffine,
+} from './volume/ChunkExtract'
 // MRSI (spatial spectroscopic imaging) volume helpers
 export { buildDerivedScalarVolume, isMrsiVolume } from './volume/mrsi'
 // Budget plans: the policy that shapes a streamed volume's octree

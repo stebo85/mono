@@ -12,7 +12,11 @@ import {
   GRAPHICS_RECOVERING_MESSAGE,
   showCanvasMessage,
 } from '@/control/canvasMessage'
-import { removeInteractionListeners } from '@/control/interactions'
+import {
+  type ExplodedBlockPick,
+  pickExplodedBlock,
+  removeInteractionListeners,
+} from '@/control/interactions'
 import { buildLocationMessage } from '@/control/locationTracking'
 import {
   computeBoundsPixelRect,
@@ -661,6 +665,23 @@ export default class NiiVue extends EventTarget {
     // move also yields a locationChange (with voxel/intensity readout).
     this.createOnLocationChange()
     this.drawScene()
+  }
+
+  /**
+   * Resolve a pointer position over the 3D render onto one exploded brick of a
+   * chunked volume, or null when the point misses every visible brick.
+   *
+   * Pass `event.clientX` / `event.clientY` from a click handler: the hit test
+   * runs here, so no drag needs to be in progress. Pair with
+   * `extractChunkBlock(vol, pick.chunkIndex)` to copy the picked brick out as a
+   * standalone volume, and with `focusBox` (using `explodedMin`/`explodedMax`) to
+   * outline it in place.
+   */
+  pickExplodedBlock(
+    clientX: number,
+    clientY: number,
+  ): ExplodedBlockPick | null {
+    return pickExplodedBlock(this, clientX, clientY)
   }
 
   /**

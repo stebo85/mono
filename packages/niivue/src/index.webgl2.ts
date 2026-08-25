@@ -2,8 +2,13 @@
  * NiiVue — WebGL2-only distribution.
  */
 
+// biome-ignore-all lint/performance/noBarrelFile: package entry point
+
+// Exploded-block picking: resolve a click on an exploded brick, then copy that
+// brick out as a standalone volume that keeps the parent's anatomical frame.
+export type { ExplodedBlockPick } from './control/interactions'
+export { pickExplodedBlock } from './control/interactions'
 export type { NVCanvasViewportControllerOptions } from './control/NVCanvasViewportController'
-// biome-ignore lint/performance/noBarrelFile: package entry point
 export { NVExtensionContext } from './extension/context'
 export type {
   BackgroundVolumeAccess,
@@ -128,6 +133,12 @@ export {
   type BudgetPlanSpec,
   resolveBudgetPlan,
 } from './volume/budgetPlans'
+export type { ExtractedSubVolume } from './volume/ChunkExtract'
+export {
+  extractChunkBlock,
+  extractSubVolume,
+  subVolumeAffine,
+} from './volume/ChunkExtract'
 // Crosshair-focused multi-resolution (multi-LOD) streamed volumes
 export type {
   ChunkedVolumeFetch,

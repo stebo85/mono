@@ -35,6 +35,45 @@ compensation work"; decode and budget plans wait behind them.
   of the stall is `texSubImage3D` rather than decode, the answer is a different
   one (smaller bricks, or a longer upload budget spread over more frames).
 
+## Caching and prefetch
+
+Full comparison against Neuroglancer, with the staged plan: **`docs/caching.md`**
+(written for the 2026-08-26 discussion). The items it raises, shortest first:
+
+- [ ] Stale-drop and per-frame reprioritization in `ChunkResidencyManager`.
+      `_uploadQueue` is a plain FIFO that persists across frames and is pruned
+      only by `admit` and `remap`, so chunks requested for a viewport the user
+      has already left still upload ahead of what is on screen. `NVSlide` already
+      does this right (`_drainLoadQueue` pops LIFO and drops anything no longer
+      in `_wanted`); port that discipline down. Pure CPU, no GPU needed to test,
+      shared by both backends.
+
+- [ ] Instrument fetch / decode / upload separately, before the worker work
+      below. Without the split, the decode-worker win is a guess.
+
+- [ ] Directional prefetch for slice scrolling and zoom. `CHUNK_PREFETCH_WINDOW`
+      is pipeline lookahead over chunks we have already decided we need, not
+      prediction. Both dominant interactions are one-dimensional, so
+      extrapolating them needs no general framework.
+
+- [ ] Demote on eviction instead of destroying. An evicted brick currently costs
+      a full fetch + decode + upload to bring back; a small decoded tier sized
+      off the GPU budget, holding only evicted chunks, makes it a re-upload.
+
+- [ ] Persistent cross-session cache (Cache Storage or OPFS). Every tier we have
+      dies on reload. For DANDI over S3 this is the most visible improvement
+      available, and Neuroglancer does not do it.
+
+- [x] Keep the previous resolution on screen while a finer level loads
+      (NVSlide). `visibleTiles` now returns a `fallback` list of already-cached
+      tiles from coarser levels covering the same viewport, coarsest first; both
+      slide renderers paint it under the target level and skip the placeholder
+      quad for any target tile still loading. Nothing is fetched for the fallback
+      layer, and it is empty once every target tile is cached, so a settled view
+      pays nothing. The volume path's equivalent is the coarse floor, which
+      already exists. Not yet applied to the 3D slide-plane renderers, which
+      drive visibility from world geometry via `requestTile`.
+
 ## Budget plans
 
 - [ ] Give the planner named **budget plans** rather than one crosshair-focused

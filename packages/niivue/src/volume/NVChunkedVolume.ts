@@ -155,6 +155,25 @@ async function withRetry<T>(
 }
 
 /**
+ * Coerce a caller-supplied count option to a finite positive integer.
+ *
+ * Both consumers are safety limits, so every unusable input has to land on a
+ * value that still makes progress and still bounds the work:
+ *  - 0, negative, NaN, fractional: a 0 concurrency cap would deadlock
+ *    acquire() — no slot ever frees, so no fetch ever starts — and 0 attempts
+ *    would fetch nothing at all.
+ *  - Infinity: it survives both Math.floor and Math.max, and would defeat the
+ *    very limit it is asked to impose — an unbounded concurrency cap floods
+ *    the connection pool, and unbounded attempts retry a transient failure
+ *    forever on a backoff that overflows to Infinity (a delay that never
+ *    resolves, hanging that read for good).
+ */
+function positiveIntOption(value: number): number {
+  if (!Number.isFinite(value)) return 1
+  return Math.max(1, Math.floor(value) || 1)
+}
+
+/**
  * Wrap a {@link ChunkedVolumeSource} as a renderer `VolumeChunkSource`: dispatch
  * each brick to its own pyramid level (`desc.sourceLevel`), bound in-flight
  * fetches to `maxConcurrentLoads` (so a big focus never floods the connection
@@ -166,13 +185,9 @@ export function createSourceChunkLoader(
   source: ChunkedVolumeSource,
   opts: { maxConcurrentLoads: number; retryAttempts: number },
 ): VolumeChunkSource {
-  // Clamp at the point the options are consumed. A 0 (or NaN/negative)
-  // concurrency cap would deadlock acquire() — no slot ever frees, so no fetch
-  // ever starts; it must be a positive integer. `totalAttempts` is the number of
-  // fetch tries withRetry makes, so a passed retryAttempts of 0 ('no retries')
-  // must still fetch once — clamp to >= 1.
-  const maxConcurrent = Math.max(1, Math.floor(opts.maxConcurrentLoads) || 1)
-  const totalAttempts = Math.max(1, Math.floor(opts.retryAttempts) || 1)
+  // Clamp at the point the options are consumed; see positiveIntOption.
+  const maxConcurrent = positiveIntOption(opts.maxConcurrentLoads)
+  const totalAttempts = positiveIntOption(opts.retryAttempts)
   // One entry per in-flight REGION, which several chunk requests may share (a
   // plan swap changes the chunk index but not the region). `waiters` counts
   // the callers still interested: the underlying read is aborted only when the

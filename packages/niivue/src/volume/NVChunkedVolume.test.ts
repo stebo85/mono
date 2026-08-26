@@ -328,6 +328,87 @@ describe('createSourceChunkLoader', () => {
     expect((out as Uint8Array).byteLength).toBe(8)
   })
 
+  test('clamps a non-finite maxConcurrentLoads so the flood cap survives', async () => {
+    // Infinity passes straight through both Math.floor and Math.max, so an
+    // unguarded clamp leaves `active < maxConcurrent` permanently true and the
+    // bound is gone: all 5 would run at once.
+    let active = 0
+    let peak = 0
+    const source: ChunkedVolumeSource = {
+      datatypeCode: 4,
+      levels: [{ level: 0, shape: [64, 64, 64], spacing: [1, 1, 1] }],
+      fetchChunk: async () => {
+        active++
+        peak = Math.max(peak, active)
+        await new Promise((r) => setTimeout(r, 15))
+        active--
+        return new Uint8Array(8)
+      },
+    }
+    const load = createSourceChunkLoader(source, {
+      maxConcurrentLoads: Number.POSITIVE_INFINITY,
+      retryAttempts: 1,
+    })
+    // 5 distinct regions (distinct texOrigin, so no dedup) fired at once.
+    await Promise.all(
+      Array.from({ length: 5 }, (_, i) => load(req(0, [i, 0, 0], [1, 1, 1]))),
+    )
+    // Falls back to the safe floor of 1, not to 'all five at once'.
+    expect(peak).toBe(1)
+  })
+
+  test('clamps a non-finite retryAttempts so retries stay bounded', async () => {
+    // Infinity here is the worse half: withRetry's loop has no end, and once the
+    // backoff 80 * 2 ** i overflows to Infinity the delay never resolves, so the
+    // read hangs for good. Race a timer so a regression fails fast and loudly
+    // rather than stalling the run until the job timeout.
+    let calls = 0
+    const source: ChunkedVolumeSource = {
+      datatypeCode: 4,
+      levels: [{ level: 0, shape: [8, 8, 8], spacing: [1, 1, 1] }],
+      // TypeError is withRetry's 'transient' signal, the one it retries.
+      fetchChunk: async () => {
+        calls++
+        throw new TypeError('Failed to fetch')
+      },
+    }
+    const load = createSourceChunkLoader(source, {
+      maxConcurrentLoads: 2,
+      retryAttempts: Number.POSITIVE_INFINITY,
+    })
+    const outcome = await Promise.race([
+      Promise.resolve(load(req(0, [0, 0, 0], [1, 1, 1]))).then(
+        () => 'resolved',
+        () => 'rejected',
+      ),
+      new Promise((r) => setTimeout(() => r('still retrying'), 500)),
+    ])
+    // Clamped to the floor of 1: one attempt, give up, no unbounded backoff.
+    expect(outcome).toBe('rejected')
+    expect(calls).toBe(1)
+  })
+
+  test('clamps NaN and fractional counts to a usable floor', async () => {
+    let calls = 0
+    const source: ChunkedVolumeSource = {
+      datatypeCode: 4,
+      levels: [{ level: 0, shape: [8, 8, 8], spacing: [1, 1, 1] }],
+      fetchChunk: async () => {
+        calls++
+        return new Uint8Array(8)
+      },
+    }
+    // NaN would make every `active < maxConcurrent` comparison false (nothing
+    // ever starts); 0.5 floors to 0, which is the same deadlock.
+    const load = createSourceChunkLoader(source, {
+      maxConcurrentLoads: Number.NaN,
+      retryAttempts: 0.5,
+    })
+    const out = await load(req(0, [0, 0, 0], [1, 1, 1]))
+    expect(calls).toBe(1)
+    expect((out as Uint8Array).byteLength).toBe(8)
+  })
+
   test('retryAttempts:0 still fetches exactly once', async () => {
     let calls = 0
     const source: ChunkedVolumeSource = {

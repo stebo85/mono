@@ -1423,18 +1423,17 @@ function applyBlocks() {
   nv.drawScene()
 }
 
-// Show or hide the 3D crosshair, and size it to whatever is loaded.
+// Show or hide the 3D crosshair, and size its centre gap to whatever is loaded.
 //
-// The crosshair's thickness and centre gap are absolute MM (they end up as the
-// radius and the endpoint inset of the six cylinders core builds between
-// extentsMin and extentsMax), and the defaults -- 1 mm thick, 10 mm gap -- assume
-// a human-scale volume. This demo's stores span four orders of magnitude: the
-// synthetic shard is ~250 mm across, while the HOA heart's 7.013 um spacing is
-// read as mm and gives a ~46 m scene, where a 1 mm cylinder is far below one
-// pixel and the crosshair simply cannot be seen. Deriving both from the mean
-// scene span keeps it the same apparent size everywhere; the fractions are
-// chosen to reproduce the stock look at human scale.
-const CROSSHAIR_WIDTH_FRACTION = 0.005
+// The gap is an absolute MM inset on the six cylinders core builds between
+// extentsMin and extentsMax, and its 10 mm default assumes a human-scale volume.
+// This demo's stores span four orders of magnitude: the synthetic shard is
+// ~250 mm across, while the HOA heart's 7.013 um spacing is read as mm and gives
+// a ~46 m scene, where a 10 mm gap is far below one pixel and the crosshair
+// closes up. Deriving it from the mean scene span keeps it the same apparent
+// size everywhere; the fraction reproduces the stock look at human scale.
+// crosshairWidth needs no such treatment -- it is canvas pixels, so it already
+// draws the same weight at any scale.
 const CROSSHAIR_GAP_FRACTION = 0.05
 
 function applyCrosshair() {
@@ -1447,7 +1446,6 @@ function applyCrosshair() {
   const span =
     lo && hi ? (hi[0] - lo[0] + (hi[1] - lo[1]) + (hi[2] - lo[2])) / 3 : 0
   if (Number.isFinite(span) && span > 0) {
-    nv.crosshairWidth = span * CROSSHAIR_WIDTH_FRACTION
     nv.crosshairGap = span * CROSSHAIR_GAP_FRACTION
   }
   nv.drawScene()

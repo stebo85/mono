@@ -69,6 +69,12 @@ export default defineConfig({
       },
     }),
   ],
+  // zarrita loads its blosc/lz4/zstd codecs through dynamic imports. Those
+  // would split a worker bundle into chunks, and an inlined worker is a single
+  // blob with nowhere to fetch a chunk from, so fold them into the one output.
+  worker: {
+    rollupOptions: { output: { inlineDynamicImports: true } },
+  },
   build: {
     outDir: 'dist',
     emptyOutDir: true,

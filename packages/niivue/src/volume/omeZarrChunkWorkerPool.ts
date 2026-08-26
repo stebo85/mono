@@ -1,0 +1,157 @@
+/**
+ * A pool of workers that read OME-Zarr chunks, so fetch and decode stop
+ * competing with the render loop.
+ *
+ * Stage B measured the problem (`docs/caching.md` 2.5): 20 seconds of
+ * uninteracted streaming cost the render loop 8.6 seconds over a 24 ms frame
+ * budget, of which only 125 ms was texture upload. Everything else was the
+ * store read and the decode inside zarrita, and all of it ran on the thread
+ * that draws. This pool moves that work; the upload and the gradient pass stay
+ * where they must be, next to the GPU context.
+ *
+ * Each worker opens the store itself and keeps its own byte LRU, so a request
+ * is routed by hashing its region rather than by picking the idlest worker --
+ * see {@link routeChunkToWorker} for why that matters.
+ *
+ * A worker failure is not automatically fatal: the caller still holds a
+ * main-thread source and can read there. Only failures a re-run would repeat
+ * (a missing store, a region that will not decode) come back marked final.
+ */
+
+import { NVWorker } from '@/workers/NVWorker'
+import OmeZarrChunkWorker from '@/workers/omeZarrChunk.worker?worker&inline'
+import type { ChunkedVolumeFetch } from './ChunkedVolumeSource'
+import {
+  type ChunkTimingSnapshot,
+  mergeOffThreadChunkTiming,
+} from './chunkTiming'
+import {
+  chunkRegionKey,
+  chunkTimingDelta,
+  routeChunkToWorker,
+  sumByteCacheStats,
+} from './chunkWorkerRouting'
+import type {
+  ByteCacheStats,
+  FetchOmeZarrChunkedSourceOptions,
+} from './omeZarrChunkedSource'
+
+/** What one worker returns for one chunk. */
+interface ChunkReply {
+  bytes: Uint8Array
+  timing: ChunkTimingSnapshot
+  cache: ByteCacheStats | null
+}
+
+/** Options for {@link OmeZarrChunkWorkerPool}. */
+export interface OmeZarrChunkPoolOptions {
+  /** Workers to start. Clamped to at least one. */
+  size: number
+  /** Byte budget for EACH worker's store cache. */
+  cacheBytesPerWorker: number
+}
+
+export class OmeZarrChunkWorkerPool {
+  private readonly workers: NVWorker[]
+  private readonly lastTiming: (ChunkTimingSnapshot | null)[]
+  private readonly lastCache: (ByteCacheStats | null)[]
+  private readonly workerOptions: FetchOmeZarrChunkedSourceOptions
+  private nextTaskId = 0
+  private disposed = false
+
+  constructor(
+    private readonly url: string,
+    options: FetchOmeZarrChunkedSourceOptions,
+    private readonly pool: OmeZarrChunkPoolOptions,
+  ) {
+    const size = Math.max(1, Math.floor(pool.size) || 1)
+    this.workers = Array.from(
+      { length: size },
+      () => new NVWorker(() => new OmeZarrChunkWorker()),
+    )
+    this.lastTiming = new Array(size).fill(null)
+    this.lastCache = new Array(size).fill(null)
+    // Rebuild the options the worker needs rather than forwarding whatever
+    // came in: `fetchImpl` is a function and would not survive the clone (the
+    // caller declines the pool when one is set), and the worker must not build
+    // a pool of its own.
+    //
+    // `levels` and `ignoreMissingLevels` MUST cross: they decide which
+    // datasets get opened, and `levelIndex` is an index into that opened list.
+    // Drop them and every request would silently address the wrong level.
+    this.workerOptions = {
+      channel: options.channel,
+      timepoint: options.timepoint,
+      levels: options.levels,
+      ignoreMissingLevels: options.ignoreMissingLevels,
+      cacheBytes: pool.cacheBytesPerWorker,
+      workers: 0,
+    }
+  }
+
+  /** Workers running. */
+  get size(): number {
+    return this.workers.length
+  }
+
+  /**
+   * Read one chunk on a worker. Rejects with an `AbortError` when `req.signal`
+   * fires, and with the worker's own error otherwise; the caller decides
+   * whether that error is worth a main-thread retry.
+   */
+  async fetchChunk(req: ChunkedVolumeFetch): Promise<Uint8Array> {
+    if (this.disposed) throw new Error('OME-Zarr chunk pool: already disposed')
+    const { levelIndex, texOrigin, texDims, bytesPerVoxel, signal } = req
+    signal?.throwIfAborted()
+    const index = routeChunkToWorker(
+      chunkRegionKey({ levelIndex, texOrigin, texDims }),
+      this.workers.length,
+    )
+    const worker = this.workers[index]
+    const taskId = this.nextTaskId++
+    // The cancel reaches the worker's own read, not just its queue: an abort
+    // while the bytes are already on the wire is the case worth cancelling.
+    const onAbort = (): void => worker.notify({ cancel: taskId })
+    signal?.addEventListener('abort', onAbort, { once: true })
+    try {
+      const reply = await worker.execute<ChunkReply>({
+        taskId,
+        url: this.url,
+        options: this.workerOptions,
+        req: { levelIndex, texOrigin, texDims, bytesPerVoxel },
+      })
+      this.merge(index, reply)
+      return reply.bytes
+    } finally {
+      signal?.removeEventListener('abort', onAbort)
+    }
+  }
+
+  /**
+   * The pool's byte caches, summed. The numbers are as of each worker's last
+   * reply, so an idle pool reports its last known state rather than nothing.
+   */
+  byteCacheStats(): ByteCacheStats {
+    return sumByteCacheStats(
+      this.lastCache,
+      this.pool.cacheBytesPerWorker * this.workers.length,
+    )
+  }
+
+  /** Terminate every worker and reject whatever is outstanding. */
+  dispose(): void {
+    if (this.disposed) return
+    this.disposed = true
+    for (const worker of this.workers) worker.terminate()
+  }
+
+  private merge(index: number, reply: ChunkReply): void {
+    if (reply.timing) {
+      mergeOffThreadChunkTiming(
+        chunkTimingDelta(reply.timing, this.lastTiming[index]),
+      )
+      this.lastTiming[index] = reply.timing
+    }
+    if (reply.cache) this.lastCache[index] = reply.cache
+  }
+}

@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, test } from 'bun:test'
 import {
   chunkTimingSnapshot,
+  mergeOffThreadChunkTiming,
   recordChunkPhase,
   resetChunkTiming,
   timeChunkNetAsync,
@@ -27,10 +28,12 @@ describe('chunk phase timing', () => {
         totalMs: 0,
         maxMs: 0,
         bytes: 0,
+        offThreadMs: 0,
       })
     }
     expect(snap.netBusyMs).toBe(0)
     expect(snap.mainThreadMs).toBe(0)
+    expect(snap.offThreadMs).toBe(0)
   })
 
   test('accumulates count, total, max and bytes', () => {
@@ -158,5 +161,58 @@ describe('chunk phase timing', () => {
       timeChunkPhaseAsync('read', () => Promise.reject(new Error('nope'))),
     ).rejects.toThrow('nope')
     expect(chunkTimingSnapshot().phases.read.count).toBe(1)
+  })
+})
+
+describe('off-thread merge', () => {
+  beforeEach(() => {
+    resetChunkTiming()
+  })
+
+  test('folds a worker delta in and books it as off-thread', () => {
+    recordChunkPhase('assemble', 6, 100)
+    mergeOffThreadChunkTiming({
+      phases: { assemble: { count: 2, totalMs: 30, maxMs: 20, bytes: 400 } },
+      netBusyMs: 25,
+    })
+    const snap = chunkTimingSnapshot()
+    expect(snap.phases.assemble.count).toBe(3)
+    expect(snap.phases.assemble.totalMs).toBe(36)
+    expect(snap.phases.assemble.bytes).toBe(500)
+    // A max is taken, never summed.
+    expect(snap.phases.assemble.maxMs).toBe(20)
+    expect(snap.phases.assemble.offThreadMs).toBe(30)
+    expect(snap.offThreadMs).toBe(30)
+    // Only the 6 ms this thread ran blocked the render loop.
+    expect(snap.mainThreadMs).toBe(6)
+    expect(snap.netBusyMs).toBe(25)
+  })
+
+  test('keeps a larger local max over a smaller worker one', () => {
+    recordChunkPhase('read', 50)
+    mergeOffThreadChunkTiming({
+      phases: { read: { count: 1, totalMs: 5, maxMs: 5, bytes: 0 } },
+      netBusyMs: 0,
+    })
+    expect(chunkTimingSnapshot().phases.read.maxMs).toBe(50)
+  })
+
+  test('a phase the worker never ran is left alone', () => {
+    mergeOffThreadChunkTiming({ phases: {}, netBusyMs: 0 })
+    const snap = chunkTimingSnapshot()
+    expect(snap.phases.upload.count).toBe(0)
+    expect(snap.offThreadMs).toBe(0)
+  })
+
+  test('reset clears merged off-thread totals', () => {
+    mergeOffThreadChunkTiming({
+      phases: { net: { count: 1, totalMs: 12, maxMs: 12, bytes: 64 } },
+      netBusyMs: 12,
+    })
+    resetChunkTiming()
+    const snap = chunkTimingSnapshot()
+    expect(snap.phases.net.count).toBe(0)
+    expect(snap.offThreadMs).toBe(0)
+    expect(snap.netBusyMs).toBe(0)
   })
 })

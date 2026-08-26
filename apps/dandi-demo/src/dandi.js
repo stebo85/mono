@@ -684,6 +684,18 @@ function brickCost() {
   return `${net}, ${main}, ${Math.round(t.mainThreadMs)} ms total`
 }
 
+// What the chunk worker pool took off the render thread. `mainThreadMs` above
+// already excludes it, so this row is what that exclusion is worth: with the
+// pool off it reads "off" and `main` carries the whole cost.
+function workerCost() {
+  const t = nv?.chunkTimingStats?.()
+  if (!t) return '-'
+  if (t.offThreadMs <= 0) return 'off'
+  const blocking = t.mainThreadMs + t.offThreadMs
+  const share = blocking > 0 ? Math.round((100 * t.offThreadMs) / blocking) : 0
+  return `${Math.round(t.offThreadMs)} ms off-thread (${share}% of streaming work)`
+}
+
 // Whether the store-level byte budget is earning its keep. A run of all
 // misses is ambiguous on its own -- the budget may be too small to hold the
 // working set, or the access pattern may simply never revisit a chunk -- and
@@ -691,7 +703,10 @@ function brickCost() {
 // no hits is thrash, no evictions with no hits means there was nothing to
 // reuse.
 function byteCacheCost() {
-  const c = chunkSource?.byteCache?.stats
+  // `byteCacheStats()` rather than `byteCache.stats`: with the chunk worker
+  // pool on, the caches live on the workers and there is no single LRU on this
+  // thread to read. It answers for either arrangement.
+  const c = chunkSource?.byteCacheStats?.() ?? chunkSource?.byteCache?.stats
   if (!c) return 'off'
   const looks = c.hits + c.misses
   const rate = looks > 0 ? Math.round((100 * c.hits) / looks) : 0
@@ -742,6 +757,7 @@ function updateVolumeHud() {
     }</span></div>
     <div class="row"><span class="key">stream cost</span><span>${brickCost()}</span></div>
     <div class="row"><span class="key">byte cache</span><span>${byteCacheCost()}</span></div>
+    <div class="row"><span class="key">workers</span><span>${workerCost()}</span></div>
     <div class="row"><span class="key">stalls</span><span>${stallCost()}</span></div>
     <div class="row"><span class="key">window</span><span>${formatValue(
       windowRange[0],
@@ -900,12 +916,22 @@ async function loadDataset() {
   // a fresh measurement window rather than averaging two stores together.
   nv?.resetChunkTiming()
   resetStalls()
+  // The outgoing store may own a pool of chunk workers. Switching datasets
+  // without releasing it leaks four workers -- and their byte caches -- per
+  // switch, so the release happens here rather than at some later teardown.
+  chunkSource?.dispose?.()
+  chunkSource = null
   try {
     const source = await fetchOmeZarrChunkedSource(datasetUrl(def), {
       cacheBytes: ZARR_CACHE_BYTES,
       ignoreMissingLevels: true,
     })
-    if (token !== loadToken) return
+    // A switch that landed while this one was opening owns the panes now; this
+    // store has no reader, so let go of its workers instead of orphaning them.
+    if (token !== loadToken) {
+      source.dispose?.()
+      return
+    }
     chunkSource = source
     windowRange = await autoWindow(source)
     if (token !== loadToken) return

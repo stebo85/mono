@@ -165,9 +165,13 @@ export {
   type ChunkPhaseTiming,
   type ChunkTimingSnapshot,
   chunkTimingSnapshot,
+  mergeOffThreadChunkTiming,
+  type OffThreadChunkTiming,
   recordChunkPhase,
   resetChunkTiming,
 } from './volume/chunkTiming'
+// OME-Zarr chunk-streaming adapter for nv.loadChunkedVolume
+export { fetchOmeZarrChunkedSource } from './volume/fetchOmeZarrChunkedSource'
 // MRSI (spatial spectroscopic imaging) volume helpers
 export { buildDerivedScalarVolume, isMrsiVolume } from './volume/mrsi'
 export {
@@ -210,18 +214,19 @@ export {
   parseOmeroColor,
   parseOmeZarrAttrs,
 } from './volume/omeZarr'
-// OME-Zarr chunk-streaming adapter for nv.loadChunkedVolume
 export {
   type ByteCacheStats,
   ByteLruCache,
   type FetchOmeZarrChunkedSourceOptions,
-  fetchOmeZarrChunkedSource,
   OME_ZARR_CHUNK_CACHE_BYTES,
+  OME_ZARR_CHUNK_ERROR,
   type OmeZarrChunkedSource,
   type OmeZarrChunkedSourceOptions,
   omeZarrChunkedSource,
+  openOmeZarrChunkedSource,
   withChunkTiming,
 } from './volume/omeZarrChunkedSource'
+export type { OmeZarrChunkPoolOptions } from './volume/omeZarrChunkWorkerPool'
 export {
   defaultOmeZarrLevel,
   fetchOmeZarr,

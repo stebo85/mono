@@ -20,6 +20,13 @@ export interface ChunkedVolumeFetch {
   texDims: Vec3i
   /** Bytes per voxel for {@link ChunkedVolumeSource.datatypeCode}. */
   bytesPerVoxel: number
+  /**
+   * Abort the read. A source that can stop work in progress SHOULD honour it
+   * and reject with an `AbortError`; one that cannot may ignore it, so the
+   * caller must treat a resolved chunk after an abort as possible. Optional
+   * because a source over an already-resident buffer has nothing to cancel.
+   */
+  signal?: AbortSignal
 }
 
 /**

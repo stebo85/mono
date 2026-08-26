@@ -217,6 +217,18 @@ export interface OmeZarrChunkedSource extends ChunkedVolumeSource {
    * doing anything; absent when the caller brought its own store.
    */
   readonly byteCache?: ByteLruCache
+  /**
+   * The byte cache's counters, wherever the cache lives. Prefer this over
+   * {@link byteCache} in a host that just wants to report a hit rate: with the
+   * chunk worker pool on there is no single `ByteLruCache` on this thread to
+   * read, and this returns the pool's caches summed instead.
+   */
+  readonly byteCacheStats?: () => ByteCacheStats
+  /**
+   * Release what this source holds open. Terminates the chunk worker pool when
+   * one is running; a no-op otherwise. Safe to call more than once.
+   */
+  readonly dispose?: () => void
 }
 
 /**
@@ -278,7 +290,7 @@ async function readLevelRegion(
     return zarr.slice(z0, z0 + rz)
   })
 
-  const block = await zarr.get(array, selection)
+  const block = await zarr.get(array, selection, { signal: req.signal })
   if (typeof block !== 'object' || block === null || !('data' in block)) {
     throw new Error('OME-Zarr: reading a level region returned no block')
   }
@@ -435,17 +447,42 @@ export interface FetchOmeZarrChunkedSourceOptions
    * remembered absent chunks). 0 disables caching. Default 256 MiB.
    */
   cacheBytes?: number
+  /**
+   * Chunk-reading workers to run. Omit for the default (half the reported
+   * cores, at most four); `0` keeps every read on the calling thread.
+   *
+   * With a pool running, `cacheBytes` is SPLIT across the workers rather than
+   * given to each, so the budget still bounds total memory. Ignored when
+   * `fetchImpl` is set (a function cannot cross to a worker) or where Workers
+   * are unavailable, and a read that fails for an infrastructure reason falls
+   * back to this thread.
+   */
+  workers?: number
 }
 
 /** Default byte budget for {@link fetchOmeZarrChunkedSource}'s store cache. */
 export const OME_ZARR_CHUNK_CACHE_BYTES = 256 * 2 ** 20
 
 /**
- * One-call convenience: open a store by URL with a byte-caching wrapper and
- * adapt it for `nv.loadChunkedVolume`. The opened pyramid stays reachable on
- * the result's `zarr` property (level metadata, omero channels).
+ * `Error.name` for a chunk read that failed on its own terms — a missing
+ * store, a region that will not decode. It marks the failures that re-running
+ * elsewhere would only repeat, so the worker path knows not to pay for the
+ * same read twice on the render thread.
  */
-export async function fetchOmeZarrChunkedSource(
+export const OME_ZARR_CHUNK_ERROR = 'OmeZarrChunkError'
+
+/**
+ * Open a store by URL with a byte-caching wrapper and adapt it for
+ * `nv.loadChunkedVolume`. The opened pyramid stays reachable on the result's
+ * `zarr` property (level metadata, omero channels).
+ *
+ * Every read runs on the CALLING thread. This is the primitive both sides of
+ * the worker pool are built from: {@link fetchOmeZarrChunkedSource} calls it
+ * to hold the metadata and to keep a fallback read path, and each chunk worker
+ * calls it to do the reading. Reach for it directly when you want a store with
+ * no pool behind it at all.
+ */
+export async function openOmeZarrChunkedSource(
   url: string,
   options: FetchOmeZarrChunkedSourceOptions = {},
 ): Promise<OmeZarrChunkedSource> {
@@ -464,5 +501,6 @@ export async function fetchOmeZarrChunkedSource(
     await openOmeZarr(store, options),
     options,
   )
-  return byteCache ? { ...source, byteCache } : source
+  if (!byteCache) return source
+  return { ...source, byteCache, byteCacheStats: () => byteCache.stats }
 }

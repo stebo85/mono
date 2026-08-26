@@ -554,8 +554,10 @@ function openPersistTier(
 ): Promise<PersistentByteCache | null> {
   if (!persist) return Promise.resolve(null)
   const options = persist === true ? {} : persist
+  // Spread rather than pick: `scope` and `scopes` decide which keys this cache
+  // owns, and dropping them would hand every worker the whole store.
   return openPersistentByteCache({
+    ...options,
     maxBytes: options.maxBytes ?? OME_ZARR_PERSIST_BYTES,
-    name: options.name,
   })
 }

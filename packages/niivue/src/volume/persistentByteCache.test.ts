@@ -449,3 +449,17 @@ describe('scoped caches over one backing', () => {
     expect(reads).toBe(1)
   })
 })
+
+test('openPersistentByteCache honours the scope it is given', async () => {
+  const backing = new FakeBacking()
+  const cache = await openPersistentByteCache({
+    backing,
+    maxBytes: 1024,
+    scope: 'w2/',
+    scopes: ['w0/', 'w1/', 'w2/'],
+  })
+  expect(cache?.scope).toBe('w2/')
+  await cache?.set('brick', new Uint8Array(8))
+  await cache?.idle()
+  expect((await backing.keys())[0]).toContain('w2%2F')
+})

@@ -184,6 +184,16 @@ export class Registry {
     return `${id}_${n}`
   }
 
+  /** The first dataset key not already owned by a different source. */
+  private claimFreeDataset(dataset: string): string {
+    const used = new Set(
+      [...this.entries.values()].map((entry) => entry.dataset),
+    )
+    let n = 2
+    while (used.has(`${dataset}_${n}`)) n++
+    return `${dataset}_${n}`
+  }
+
   async load(id: string): Promise<RegistryEntry> {
     const entry = this.entries.get(id)
     if (!entry) throw new HttpError(404, `Unknown volume id: ${id}`)
@@ -249,6 +259,16 @@ export class Registry {
             full,
             sanitizeId(stripVolumeExtensions(item.name)),
           )
+        }
+        const dataset = entries[0]?.dataset
+        if (
+          dataset &&
+          [...this.entries.values()].some(
+            (entry) => entry.dataset === dataset && entry.source !== full,
+          )
+        ) {
+          const renamedDataset = this.claimFreeDataset(dataset)
+          for (const entry of entries) entry.dataset = renamedDataset
         }
         for (const entry of entries) {
           // Two SOURCES can sanitize to colliding ids too (`a b.nii` and

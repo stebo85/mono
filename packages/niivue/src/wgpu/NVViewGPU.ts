@@ -38,6 +38,7 @@ import {
   chunksCrossingSlice,
   identityChunkSampleTransform,
 } from '@/volume/chunking'
+import type { DecodedChunkStats } from '@/volume/decodedChunkCache'
 import { WGPUBench } from './bench'
 import { ColorbarRenderer } from './colorbar'
 import { CrosshairRenderer } from './crosshair'
@@ -2475,6 +2476,7 @@ export default class NVView {
     total: number
     staleDropped: number
     predicted: number
+    decoded: DecodedChunkStats
   } {
     return this.volumeRenderer.chunkStreamStats()
   }

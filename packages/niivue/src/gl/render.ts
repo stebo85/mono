@@ -48,6 +48,11 @@ import {
   warnIfCubicUnsafe,
 } from '@/volume/chunking'
 import { ChunkTravelPredictor } from '@/volume/chunkPrediction'
+import {
+  DecodedChunkCache,
+  type DecodedChunkStats,
+  decodedTierBudgetBytes,
+} from '@/volume/decodedChunkCache'
 import { buildModulationParams } from '@/volume/modulation'
 import {
   chunkedDisplayKey,
@@ -208,6 +213,27 @@ interface ChunkedTexEntry {
   speculative: Set<number>
   /** Speculative fetches started for this volume, cumulative. */
   predictedCount: number
+  /**
+   * Decoded source bytes for this volume's chunks, so a chunk evicted from the
+   * GPU is demoted here instead of destroyed. Owned by the entry rather than
+   * the uploader: the bytes outlive an uploader rebuild, and survive a plan
+   * swap by being re-keyed alongside the resident chunks.
+   */
+  decoded: DecodedChunkCache
+  /** Source bytes per voxel, which sets what the decoded tier costs to hold. */
+  sourceBytesPerVoxel: number
+}
+
+/**
+ * Set a chunked entry's GPU residency budget, keeping its decoded tier sized
+ * against it. The two move together by construction: the tier exists to shadow
+ * the resident set, so a share change that shrinks one must shrink the other.
+ */
+function setChunkBudget(entry: ChunkedTexEntry, bytes: number): void {
+  entry.manager.setBudgetBytes(bytes)
+  entry.decoded.setMaxBytes(
+    decodedTierBudgetBytes(bytes, entry.sourceBytesPerVoxel),
+  )
 }
 
 type TexCacheEntry = SingleTexEntry | ChunkedTexEntry
@@ -770,11 +796,15 @@ export class VolumeRenderer extends NVRenderer {
         // new state so the volume stays present while the working set refills —
         // the same drop-and-refill mechanism as _refreshUnlitChunksForLighting.
         existing.displayKey = displayKey
+        // The decoded tier is deliberately kept: it holds SOURCE bytes, and a
+        // colormap or window change re-orients the same source. The re-stream
+        // below therefore costs uploads, not fetches.
         const newUploader = createChunkUploaderGL(
           gl,
           vol,
           existing.plan,
           () => this.gradientAmount > 0,
+          existing.decoded,
         )
         existing.uploader.dispose()
         existing.uploader = newUploader
@@ -790,6 +820,9 @@ export class VolumeRenderer extends NVRenderer {
     // The entry holds the live uploader so an in-place plan swap can replace it;
     // the prefetch hook reads it off `entry` (not a creation closure) so it
     // always targets the current plan.
+    const decoded = new DecodedChunkCache(
+      decodedTierBudgetBytes(budgetBytes, bpv),
+    )
     const entry: ChunkedTexEntry = {
       kind: 'chunked',
       volume: vol,
@@ -799,6 +832,7 @@ export class VolumeRenderer extends NVRenderer {
         vol,
         plan,
         () => this.gradientAmount > 0,
+        decoded,
       ),
       plan,
       displayKey,
@@ -807,6 +841,8 @@ export class VolumeRenderer extends NVRenderer {
       requestedThisFrame: [],
       speculative: new Set(),
       predictedCount: 0,
+      decoded,
+      sourceBytesPerVoxel: bpv,
     }
     warnIfCubicUnsafe(vol.name, entry.cubicSafe, this.isCubicInterpolation)
     entry.manager = new ChunkResidencyManager<VolumeChunkGL>(
@@ -866,10 +902,15 @@ export class VolumeRenderer extends NVRenderer {
       vol,
       newPlan,
       () => this.gradientAmount > 0,
+      entry.decoded,
     )
     entry.uploader.dispose()
     entry.uploader = newUploader
     entry.manager.remap(oldToNew, newPlan.chunks.length)
+    // Chunk indices are plan-relative, so the tier is re-keyed by the same
+    // content match: a brick the new plan still contains keeps its bytes, and
+    // a refocus back to this level finds them.
+    entry.decoded.remap(oldToNew)
     entry.plan = newPlan
     // A new grid makes the recorded travel meaningless, and the old uploader
     // took its outstanding speculative reads with it.
@@ -1421,6 +1462,7 @@ export class VolumeRenderer extends NVRenderer {
     if (entry.kind === 'chunked') {
       entry.manager.destroy()
       entry.uploader.dispose()
+      entry.decoded.clear()
       if (this._activeChunked === entry) this._activeChunked = null
       if (this._activeOverlayChunked === entry)
         this._activeOverlayChunked = null
@@ -1795,10 +1837,11 @@ export class VolumeRenderer extends NVRenderer {
     const entry = await this._ensureChunkedVolumeEntry(gl, vol, overlayBudget)
     // Apply the split even when the entry was reused from the cache (its
     // manager may have been built with a different budget).
-    entry.manager.setBudgetBytes(overlayBudget)
+    setChunkBudget(entry, overlayBudget)
     this._activeOverlayChunked = entry
     if (this._activeChunked && this._activeChunked !== entry) {
-      this._activeChunked.manager.setBudgetBytes(
+      setChunkBudget(
+        this._activeChunked,
         this._chunkResidencyBytes * (1 - OVERLAY_RESIDENCY_FRACTION),
       )
     }
@@ -1812,7 +1855,9 @@ export class VolumeRenderer extends NVRenderer {
    */
   clearOverlayChunked(): void {
     this._activeOverlayChunked = null
-    this._activeChunked?.manager.setBudgetBytes(this._chunkResidencyBytes)
+    if (this._activeChunked) {
+      setChunkBudget(this._activeChunked, this._chunkResidencyBytes)
+    }
   }
 
   hasOverlayChunked(): boolean {
@@ -1842,11 +1887,12 @@ export class VolumeRenderer extends NVRenderer {
       (this._chunkResidencyBytes * OVERLAY_RESIDENCY_FRACTION) / vols.length
     for (const vol of vols) {
       const entry = await this._ensureChunkedVolumeEntry(gl, vol, overlayBudget)
-      entry.manager.setBudgetBytes(overlayBudget)
+      setChunkBudget(entry, overlayBudget)
       this._combinedOverlayEntries.push(entry)
     }
     if (this._activeChunked) {
-      this._activeChunked.manager.setBudgetBytes(
+      setChunkBudget(
+        this._activeChunked,
         this._chunkResidencyBytes * (1 - OVERLAY_RESIDENCY_FRACTION),
       )
     }
@@ -1856,7 +1902,9 @@ export class VolumeRenderer extends NVRenderer {
   private _clearCombinedOverlayChunked(): void {
     if (this._combinedOverlayEntries.length === 0) return
     this._combinedOverlayEntries = []
-    this._activeChunked?.manager.setBudgetBytes(this._chunkResidencyBytes)
+    if (this._activeChunked) {
+      setChunkBudget(this._activeChunked, this._chunkResidencyBytes)
+    }
   }
 
   /** The NVImage backing the active independent chunked overlay (or null). */
@@ -1870,7 +1918,9 @@ export class VolumeRenderer extends NVRenderer {
    * `pending` queued for upload, `inFlight` mid-upload, `total` the chunk count.
    * `staleDropped` counts queued uploads retired because the working set moved
    * on before they ran — upload work the old cross-frame queue would have spent
-   * on viewports the user had already left.
+   * on viewports the user had already left. `decoded` sums the decoded-chunk
+   * tiers: its hit rate is the share of source reads that an evicted brick's
+   * return cost nothing but an upload.
    */
   chunkStreamStats(): {
     resident: number
@@ -1879,6 +1929,7 @@ export class VolumeRenderer extends NVRenderer {
     total: number
     staleDropped: number
     predicted: number
+    decoded: DecodedChunkStats
   } {
     let resident = 0
     let pending = 0
@@ -1886,6 +1937,16 @@ export class VolumeRenderer extends NVRenderer {
     let total = 0
     let staleDropped = 0
     let predicted = 0
+    const decoded: DecodedChunkStats = {
+      hits: 0,
+      misses: 0,
+      admitted: 0,
+      rejected: 0,
+      evicted: 0,
+      entries: 0,
+      bytes: 0,
+      maxBytes: 0,
+    }
     for (const entry of this._texCache.values()) {
       if (entry.kind !== 'chunked') continue
       resident += entry.manager.residentCount
@@ -1894,8 +1955,25 @@ export class VolumeRenderer extends NVRenderer {
       total += entry.manager.chunkCount
       staleDropped += entry.manager.staleDropCount
       predicted += entry.predictedCount
+      const d = entry.decoded.stats
+      decoded.hits += d.hits
+      decoded.misses += d.misses
+      decoded.admitted += d.admitted
+      decoded.rejected += d.rejected
+      decoded.evicted += d.evicted
+      decoded.entries += d.entries
+      decoded.bytes += d.bytes
+      decoded.maxBytes += d.maxBytes
     }
-    return { resident, pending, inFlight, total, staleDropped, predicted }
+    return {
+      resident,
+      pending,
+      inFlight,
+      total,
+      staleDropped,
+      predicted,
+      decoded,
+    }
   }
 
   /**

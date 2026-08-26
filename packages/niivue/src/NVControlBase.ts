@@ -151,6 +151,7 @@ import {
   chunkTimingSnapshot,
   resetChunkTiming as clearChunkTiming,
 } from '@/volume/chunkTiming'
+import type { DecodedChunkStats } from '@/volume/decodedChunkCache'
 import {
   computeDescriptiveStats,
   type DescriptiveStats,
@@ -212,6 +213,7 @@ type ViewBackend = {
     total: number
     staleDropped: number
     predicted: number
+    decoded: DecodedChunkStats
   }
   rebakeChunkedOverlays: () => void
   /**
@@ -3811,6 +3813,11 @@ export default class NiiVue extends EventTarget {
    * set, from the direction the view is travelling. Those never enter the
    * upload queue, so they show up here and in the source's byte-cache hit rate
    * rather than in `resident`.
+   *
+   * `decoded` is the decoded-chunk tier summed over every chunked volume: the
+   * CPU-side source bytes a brick is demoted to when the GPU evicts it. Its
+   * hits are source reads that skipped the network AND the decode entirely,
+   * costing only a texture upload; `bytes` / `maxBytes` is how full it is.
    */
   chunkStreamStats(): {
     resident: number
@@ -3819,6 +3826,7 @@ export default class NiiVue extends EventTarget {
     total: number
     staleDropped: number
     predicted: number
+    decoded: DecodedChunkStats
   } | null {
     return this.view?.chunkStreamStats() ?? null
   }

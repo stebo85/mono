@@ -715,6 +715,22 @@ function byteCacheCost() {
   )}, ${c.evicted} evicted)`
 }
 
+// The decoded tier holds a brick's SOURCE bytes for as long as it is cheap to,
+// so a brick the GPU evicts is demoted rather than destroyed. A hit here is a
+// brick that came back for the cost of a texture upload alone -- no network, no
+// codec, no assemble -- which is what makes a scrub back over ground you just
+// covered cheaper than seeing it the first time. Read it next to `byte cache`:
+// that one saves the network, this one also saves the decode.
+function decodedTierCost(stats) {
+  const d = stats?.decoded
+  if (!d || d.maxBytes === 0) return 'off'
+  const looks = d.hits + d.misses
+  const rate = looks > 0 ? Math.round((100 * d.hits) / looks) : 0
+  return `${rate}% of ${looks} (${formatBytes(d.bytes)} of ${formatBytes(
+    d.maxBytes,
+  )}, ${d.evicted} dropped)`
+}
+
 function updateVolumeHud() {
   if (!chunkSource || !nv) return
   const def = DATASETS[els.dataset.value]
@@ -758,6 +774,9 @@ function updateVolumeHud() {
     <div class="row"><span class="key">prefetch</span><span>${
       stats ? `${stats.predicted} predicted ahead` : '-'
     }</span></div>
+    <div class="row"><span class="key">decoded tier</span><span>${decodedTierCost(
+      stats,
+    )}</span></div>
     <div class="row"><span class="key">stream cost</span><span>${brickCost()}</span></div>
     <div class="row"><span class="key">byte cache</span><span>${byteCacheCost()}</span></div>
     <div class="row"><span class="key">workers</span><span>${workerCost()}</span></div>

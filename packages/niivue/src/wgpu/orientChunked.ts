@@ -25,6 +25,7 @@ import type { NVImage } from '@/NVTypes'
 import { buildOrientUniforms } from '@/view/NVOrient'
 import type { ChunkPlan, Vec3i, VolumeChunkDesc } from '@/volume/chunking'
 import { recordChunkPhase } from '@/volume/chunkTiming'
+import type { DecodedChunkCache } from '@/volume/decodedChunkCache'
 import {
   chunkRGBA,
   extractChunkBytes,
@@ -334,6 +335,12 @@ export async function createChunkUploaderGPU(
   // this crosses false->true (see VolumeRendererGPU). Defaults to always-on so
   // existing callers keep prior behavior.
   wantsGradient: () => boolean = () => true,
+  // Decoded-chunk tier, owned by the renderer's cache entry so it survives an
+  // uploader rebuild (a colormap/window change re-orients bytes it already
+  // holds) and can be re-keyed through a plan swap. Never populated for an
+  // in-memory volume, whose chunks are a cheap copy out of a buffer we are
+  // already holding -- shadowing those would only duplicate the image.
+  decoded: DecodedChunkCache | null = null,
 ): Promise<ChunkUploaderGPU> {
   if (!nvimage.dimsRAS) {
     throw new Error('orientChunked: missing dimsRAS')
@@ -444,6 +451,11 @@ export async function createChunkUploaderGPU(
     if (!chunkSource) return computeBytes(index)
     const cached = fetchCache.get(index)
     if (cached) return cached.promise
+    // The decoded tier is consulted AFTER the in-flight map so a read already
+    // on the wire is never duplicated, and before any new read so an evicted
+    // chunk comes back as an upload rather than a fetch + decode.
+    const held = decoded?.get(index)
+    if (held) return Promise.resolve(held)
     const controller = new AbortController()
     const promise = computeBytes(index, controller.signal)
     const entry: ChunkFetch = { promise, controller }
@@ -458,6 +470,9 @@ export async function createChunkUploaderGPU(
   function prefetchChunk(index: number, speculative = false): void {
     if (!chunkSource) return
     if (fetchCache.has(index)) return
+    // Already decoded: there is nothing to warm, and counting the lookup here
+    // would credit the tier for a read the pump never made.
+    if (decoded?.has(index)) return
     const cap = speculative
       ? MAX_PREFETCHED_CHUNKS - PREFETCH_SLOTS_RESERVED
       : MAX_PREFETCHED_CHUNKS
@@ -490,6 +505,10 @@ export async function createChunkUploaderGPU(
     const chunkBytes = await fetchBytes(index)
     // Consumed — free the CPU buffer reference so prefetch headroom recovers.
     fetchCache.delete(index)
+    // Hand the decoded bytes to the tier instead of dropping them: this is the
+    // only moment they exist, and holding them through the chunk's residency
+    // is what makes its eventual eviction a demotion rather than a loss.
+    if (chunkSource) decoded?.set(index, chunkBytes)
     // Timed as `upload`: the queue write plus the orient pass, awaited to
     // completion, so this is the part of a chunk's cost that a decode worker
     // could never take off this thread.

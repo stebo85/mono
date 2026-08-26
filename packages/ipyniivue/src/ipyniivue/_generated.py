@@ -402,9 +402,19 @@ and its volumes alive."""
         queue working as intended, since that work would otherwise have uploaded
         bricks for viewports the user had already left.
 
+        `predicted` is also cumulative: source reads started AHEAD of the working
+        set, from the direction the view is travelling. Those never enter the
+        upload queue, so they show up here and in the source's byte-cache hit rate
+        rather than in `resident`.
+
+        `decoded` is the decoded-chunk tier summed over every chunked volume: the
+        CPU-side source bytes a brick is demoted to when the GPU evicts it. Its
+        hits are source reads that skipped the network AND the decode entirely,
+        costing only a texture upload; `bytes` / `maxBytes` is how full it is.
+
         Returns
         -------
-        { resident: number; pending: number; inFlight: number; total: number; staleDropped: number; } | null
+        { resident: number; pending: number; inFlight: number; total: number; staleDropped: number; predicted: number; decoded: DecodedChunkStats; } | null
         """
         return await self._request("chunkStreamStats", [])
 

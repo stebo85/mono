@@ -236,6 +236,12 @@ loadButton.onclick = async () => {
 const LOCAL_MIRROR =
   'http://localhost:8080/allen/COMP_crop_Interphase_atlas.json'
 async function startOnLocalMirror() {
+  // An https: page cannot fetch http://localhost at all — the browser blocks
+  // it as mixed content and logs a console error before the request is made.
+  // The catch below would swallow the rejection, but the error still reaches
+  // the console of every visitor to the public demo site, so skip the probe
+  // outright when the page itself is not on http:.
+  if (window.location.protocol !== 'http:') return
   try {
     const probe = new AbortController()
     const timer = setTimeout(() => probe.abort(), 1500)

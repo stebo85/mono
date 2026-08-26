@@ -17,8 +17,11 @@ import {
   rayBoxEntryMM,
   rayMarchFirstVisibleMM,
   slicePlaneEquation,
+  stepZoom2D,
   unprojectScreen,
   vox2mm,
+  ZOOM_2D_MAX,
+  ZOOM_2D_MIN,
   zoomPan2DAbout,
 } from './NVTransforms'
 
@@ -904,5 +907,68 @@ describe('zoomPan2DAbout', () => {
     const next = zoomPan2DAbout([4, 4, 4, 2], 4, [10, 10, 10], flat, flat)
     for (const v of next) expect(Number.isFinite(v)).toBe(true)
     approx(next[0], 2)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// stepZoom2D
+// ---------------------------------------------------------------------------
+
+describe('stepZoom2D', () => {
+  test('everyNotchMovesTheZoom', () => {
+    // The plain snapped 10% step froze at 0.5 on the way down and left every
+    // smaller zoom stuck in both directions.
+    for (const dir of [1, -1]) {
+      let zoom = dir > 0 ? ZOOM_2D_MIN : ZOOM_2D_MAX
+      for (let i = 0; i < 200; i++) {
+        const next = stepZoom2D(zoom, dir)
+        if (next === ZOOM_2D_MAX || next === ZOOM_2D_MIN) break
+        expect(next).not.toBe(zoom)
+        zoom = next
+      }
+    }
+  })
+
+  test('bothEndsOfTheRangeAreReachable', () => {
+    let zoom = 1
+    for (let i = 0; i < 200 && zoom > ZOOM_2D_MIN; i++)
+      zoom = stepZoom2D(zoom, -1)
+    expect(zoom).toBe(ZOOM_2D_MIN)
+    for (let i = 0; i < 200 && zoom < ZOOM_2D_MAX; i++)
+      zoom = stepZoom2D(zoom, 1)
+    expect(zoom).toBe(ZOOM_2D_MAX)
+  })
+
+  test('lowEndStepsAreReversible', () => {
+    // Where the forced increment governs, the grid is walked one tenth at a
+    // time and a notch back undoes a notch in. Higher up the proportional step
+    // takes over and does not round-trip (7 -> 7.7 -> 6.9), which is the
+    // multiplicative curve working as intended, not a defect.
+    for (const zoom of [0.1, 0.2, 0.3, 0.4]) {
+      approx(stepZoom2D(stepZoom2D(zoom, 1), -1), zoom)
+    }
+  })
+
+  test('staysOnTheTenthsGrid', () => {
+    let zoom = 1
+    for (let i = 0; i < 40; i++) {
+      zoom = stepZoom2D(zoom, i % 3 === 0 ? -1 : 1)
+      approx(zoom * 10, Math.round(zoom * 10))
+    }
+  })
+
+  test('clampsRatherThanRunningPastTheRange', () => {
+    expect(stepZoom2D(ZOOM_2D_MAX, 1)).toBe(ZOOM_2D_MAX)
+    expect(stepZoom2D(ZOOM_2D_MIN, -1)).toBe(ZOOM_2D_MIN)
+  })
+
+  test('noDirectionIsANoOp', () => {
+    expect(stepZoom2D(1.7, 0)).toBe(1.7)
+  })
+
+  test('aBrokenZoomRecoversToTheFloor', () => {
+    for (const bad of [0, -3, Number.NaN, Number.POSITIVE_INFINITY]) {
+      expect(stepZoom2D(bad, 1)).toBe(ZOOM_2D_MIN)
+    }
   })
 })

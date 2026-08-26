@@ -2388,9 +2388,10 @@ export function initInteraction(ctrl: NiiVue): void {
         ctrl.model.interaction.secondaryDragMode === DRAG_MODE.slicer3D
       if (isPanZoomMode) {
         const zoomDirection = evt.deltaY < 0 ? 1 : -1
-        let zoom = ctrl.model.scene.pan2Dxyzmm[3] * (1.0 + 0.1 * zoomDirection)
-        zoom = Math.round(zoom * 10) / 10
-        zoom = Math.max(0.1, Math.min(10.0, zoom))
+        const zoom = NVTransforms.stepZoom2D(
+          ctrl.model.scene.pan2Dxyzmm[3],
+          zoomDirection,
+        )
         if (ctrl.model.interaction.isYoked3DTo2DZoom) {
           ctrl.model.scene.scaleMultiplier = zoom
           emitScaleMultiplierChange(ctrl)

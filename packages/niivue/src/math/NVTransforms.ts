@@ -162,6 +162,33 @@ export function validateAffine(affine: number[][]): void {
   }
 }
 
+/** Coarsest 2D zoom the wheel will reach, and the step it snaps to. */
+export const ZOOM_2D_MIN = 0.1
+export const ZOOM_2D_MAX = 10
+const ZOOM_2D_SNAP = 0.1
+
+/**
+ * One wheel notch of 2D zoom: 10% of the current zoom, snapped to a tenth and
+ * clamped to `[ZOOM_2D_MIN, ZOOM_2D_MAX]`.
+ *
+ * The snap is what makes the zoom land on readable values, but on its own it
+ * also swallows the whole low end: 10% of 0.5 is 0.05, which rounds straight
+ * back to 0.5, and every zoom below that is fixed in BOTH directions -- 0.2
+ * moves to neither 0.18 nor 0.22. So the wheel could never take the view below
+ * half size and could never leave a smaller zoom set from code, even though the
+ * range says 0.1. When the snap lands back on the zoom we started from, step one
+ * whole snap increment instead; the multiplicative feel is untouched everywhere
+ * the proportional step is already larger than that.
+ */
+export function stepZoom2D(zoom: number, direction: number): number {
+  if (!Number.isFinite(zoom) || zoom <= 0) return ZOOM_2D_MIN
+  const dir = Math.sign(direction)
+  if (dir === 0) return zoom
+  let next = Math.round(zoom * (1 + 0.1 * dir) * 10) / 10
+  if (next === zoom) next = Math.round((zoom + ZOOM_2D_SNAP * dir) * 10) / 10
+  return Math.max(ZOOM_2D_MIN, Math.min(ZOOM_2D_MAX, next))
+}
+
 /**
  * New 2D pan that holds `anchorMM` at the same place on screen while the zoom
  * changes from `pan[3]` to `newZoom`.

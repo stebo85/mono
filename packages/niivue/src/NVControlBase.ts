@@ -4154,10 +4154,20 @@ export default class NiiVue extends EventTarget {
   ): void {
     const levels = slide.manifest.levels
     if (levels.length === 0) return
+    const pinnedLevel = opts.levelIndex
+    const levelIndex =
+      pinnedLevel !== undefined &&
+      (!Number.isInteger(pinnedLevel) ||
+        !levels.some((level) => level.index === pinnedLevel))
+        ? undefined
+        : pinnedLevel
+    if (pinnedLevel !== undefined && levelIndex === undefined) {
+      log.warn(`setSlidePlane: unknown level index ${pinnedLevel}`)
+    }
     const state: SlidePlaneState = {
       slide,
       pixelToWorld: [...opts.pixelToWorld],
-      levelIndex: opts.levelIndex,
+      levelIndex,
       tilesByLevel: new Map(),
     }
     // Prime the coarsest level so something shows on the first frame before the
@@ -4194,6 +4204,16 @@ export default class NiiVue extends EventTarget {
    */
   setSlidePlaneLevel(levelIndex?: number): void {
     if (!this._slidePlane) return
+    if (
+      levelIndex !== undefined &&
+      (!Number.isInteger(levelIndex) ||
+        !this._slidePlane.slide.manifest.levels.some(
+          (level) => level.index === levelIndex,
+        ))
+    ) {
+      log.warn(`setSlidePlaneLevel: unknown level index ${levelIndex}`)
+      return
+    }
     this._slidePlane.levelIndex = levelIndex
     this.drawScene()
   }

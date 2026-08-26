@@ -108,18 +108,21 @@ export function tiffPlaneIndices(
   const nIfds = source.tiff.ifds.length
   const channel = selection.channel ?? 0
   const timepoint = selection.timepoint ?? 0
+  const validateSelection = (
+    value: number,
+    count: number,
+    name: string,
+  ): void => {
+    if (!Number.isInteger(value) || value < 0 || value >= count) {
+      throw new Error(
+        `OME-TIFF: ${name} ${value} is out of range (file has ${count})`,
+      )
+    }
+  }
   if (source.ome) {
     const info = source.ome
-    if (channel >= omeEffectiveSizeC(info)) {
-      throw new Error(
-        `OME-TIFF: channel ${channel} is out of range (file has ${omeEffectiveSizeC(info)})`,
-      )
-    }
-    if (timepoint >= info.sizeT) {
-      throw new Error(
-        `OME-TIFF: timepoint ${timepoint} is out of range (file has ${info.sizeT})`,
-      )
-    }
+    validateSelection(channel, omeEffectiveSizeC(info), 'channel')
+    validateSelection(timepoint, info.sizeT, 'timepoint')
     if (omePlaneCount(info) > nIfds) {
       // A pyramidal or multi-file OME-TIFF splits its planes across companion
       // files; the plane map here only covers this file's IFDs.
@@ -143,6 +146,8 @@ export function tiffPlaneIndices(
   }
   const imagej = source.imagej
   if (imagej && (imagej.channels > 1 || imagej.frames > 1)) {
+    validateSelection(channel, imagej.channels, 'channel')
+    validateSelection(timepoint, imagej.frames, 'timepoint')
     const slices = imagej.slices > 0 ? imagej.slices : nIfds
     const indices: number[] = []
     for (let z = 0; z < slices; z++) {

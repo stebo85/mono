@@ -174,5 +174,12 @@ describe('cross-source id collisions', () => {
       bySource.set(entry.source, (bySource.get(entry.source) ?? 0) + 1)
     }
     expect([...bySource.values()]).toEqual([2, 2])
+    // The demo groups entries by dataset. IDs alone are not enough: distinct
+    // sources that sanitize alike must not become one mixed channel set.
+    const byDataset = new Map<string, number>()
+    for (const entry of reg.entries.values()) {
+      byDataset.set(entry.dataset, (byDataset.get(entry.dataset) ?? 0) + 1)
+    }
+    expect([...byDataset.values()]).toEqual([2, 2])
   })
 })

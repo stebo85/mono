@@ -3053,8 +3053,9 @@ export class VolumeRenderer extends NVRenderer {
         ...paqdUniforms,
         earlyTermination,
         // clipPlaneOverlay sits at WGSL offset 372 (the f32 immediately after
-        // earlyTermination); the following _pad0: vec3f aligns to 384. These 7
-        // floats advance the byte cursor 372 → 400 (to the next vec4f), unchanged.
+        // earlyTermination); the following _pad0: vec2f aligns to 384 and ends
+        // at 392, and the next vec4f aligns to 400. These 7 floats advance the
+        // byte cursor 372 → 400 (to that vec4f), unchanged.
         this.clipPlaneOverlay ? 1.0 : 0.0,
         // fadeAlpha (lane after clipPlaneOverlay): streaming cross-fade weight.
         fadeAlpha,

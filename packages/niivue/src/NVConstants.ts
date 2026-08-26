@@ -32,6 +32,15 @@ export enum DRAG_MODE {
  *
  * Applies to the 3D render only; a 2D slice draws one plane, where the two
  * modes are identical.
+ *
+ * MAXIMUM on a CHUNKED (streamed) volume additionally assumes a black
+ * background. The per-chunk cube draws are merged with a component-wise MAX
+ * blend so the result is independent of chunk draw order, and that max also
+ * applies against whatever the tile was cleared to — so a non-black
+ * `backColor` is itself a lower bound on every pixel of the cube and washes
+ * the projection out. Non-chunked MAXIMUM composites normally and is
+ * unaffected. See `_drawChunkedVolume` in gl/render.ts and the
+ * `pipelineChunkedMip` variant in wgpu/render.ts.
  */
 export enum VOLUME_RENDER_MODE {
   COMPOSITE = 0,

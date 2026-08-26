@@ -99,6 +99,18 @@ describe('tiffPlaneIndices', () => {
     )
   })
 
+  test('rejects malformed channel and timepoint selectors', () => {
+    const source = describeTiff(parseTiff(stackTiff(6, OME_TWO_CHANNEL)))
+    for (const value of [-1, 0.5, Number.NaN, Number.POSITIVE_INFINITY]) {
+      expect(() => tiffPlaneIndices(source, { channel: value })).toThrow(
+        /out of range/,
+      )
+      expect(() => tiffPlaneIndices(source, { timepoint: value })).toThrow(
+        /out of range/,
+      )
+    }
+  })
+
   test('keeps only the planes this file actually holds', () => {
     // Metadata claims 6 planes, the file carries 4.
     const source = describeTiff(parseTiff(stackTiff(4, OME_TWO_CHANNEL)))

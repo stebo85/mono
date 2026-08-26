@@ -108,6 +108,7 @@ function installDomPath(options: {
   fate: 'load' | 'error'
   context?: unknown
   getImageDataThrows?: boolean
+  srcThrows?: boolean
 }): void {
   const ctx =
     options.context !== undefined
@@ -141,6 +142,7 @@ function installDomPath(options: {
       width = 3
       height = 2
       set src(_value: string) {
+        if (options.srcThrows) throw new Error('source assignment exploded')
         queueMicrotask(() => {
           if (options.fate === 'load') {
             this.onload?.()
@@ -226,6 +228,15 @@ describe('decodeImageRGBA', () => {
     installDomPath({ fate: 'load', getImageDataThrows: true })
     const urls = trackObjectUrls()
     await expect(decodeImageRGBA(BUFFER)).rejects.toThrow('readback exploded')
+    expect(urls.revoked).toEqual(urls.created)
+  })
+
+  test('a synchronous source assignment failure still revokes the URL', async () => {
+    installDomPath({ fate: 'load', srcThrows: true })
+    const urls = trackObjectUrls()
+    await expect(decodeImageRGBA(BUFFER)).rejects.toThrow(
+      'source assignment exploded',
+    )
     expect(urls.revoked).toEqual(urls.created)
   })
 

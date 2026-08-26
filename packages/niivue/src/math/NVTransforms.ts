@@ -246,6 +246,64 @@ export function zoomPan2DAbout(
   return out
 }
 
+/**
+ * Millimetres of world space covered by one canvas pixel on a 2D slice tile.
+ *
+ * The inverse of the scale {@link calculateMvpMatrix2D} sets up: that function
+ * maps the `mn[0]..mx[0]` span (divided by the 2D zoom) across the tile's full
+ * pixel width, so the ratio below is the tile's uniform mm-per-pixel. It is the
+ * same in both axes because the layout already gives the tile the aspect ratio
+ * of its mm extents. Radiological convention only mirrors the U axis, so it
+ * leaves the scale alone.
+ *
+ * Use it to size screen-weight chrome (crosshair thickness, marker radii) that
+ * has to be expressed as world geometry.
+ *
+ * @param mn - world-mm minimum of the tile's ortho window
+ * @param mx - world-mm maximum of the tile's ortho window
+ * @param leftTopWidthHeight - the tile's canvas rectangle
+ * @param pan - the tile's `[panU, panV, zoom]`, as {@link slicePanUV} returns
+ * @returns mm per canvas pixel, or 0 for a degenerate tile
+ */
+export function mmPerPixel2D(
+  mn: ArrayLike<number>,
+  mx: ArrayLike<number>,
+  leftTopWidthHeight: ArrayLike<number>,
+  pan?: ArrayLike<number>,
+): number {
+  const widthPx = leftTopWidthHeight[2]
+  if (!(widthPx > 0)) return 0
+  const zoom = pan && pan.length > 2 ? pan[2] : 1
+  const span = Math.abs(mx[0] - mn[0]) / (zoom > 0 ? zoom : 1)
+  return span / widthPx
+}
+
+/**
+ * Millimetres of world space covered by one canvas pixel on the 3D render tile.
+ *
+ * {@link calculateMvpMatrix} projects orthographically, so this is a single
+ * number rather than a depth-dependent one: the frustum's short side is
+ * `2 * 0.8 * furthestFromPivot / volScaleMultiplier` and it is mapped onto the
+ * tile's short side in pixels. Keep the two in step -- this reads the same
+ * `baseScale` expression that builds the projection.
+ *
+ * @param leftTopWidthHeight - the tile's canvas rectangle
+ * @param furthestFromPivot - scene radius, as passed to {@link calculateMvpMatrix}
+ * @param volScaleMultiplier - the render zoom, likewise
+ * @returns mm per canvas pixel, or 0 for a degenerate tile
+ */
+export function mmPerPixelRender(
+  leftTopWidthHeight: ArrayLike<number>,
+  furthestFromPivot: number,
+  volScaleMultiplier: number,
+): number {
+  const shortSidePx = Math.min(leftTopWidthHeight[2], leftTopWidthHeight[3])
+  if (!(shortSidePx > 0)) return 0
+  const zoom = volScaleMultiplier > 0 ? volScaleMultiplier : 1
+  const scale = (0.8 * furthestFromPivot) / zoom
+  return (2 * scale) / shortSidePx
+}
+
 export function calculateMvpMatrix2D(
   _leftTopWidthHeight: number[],
   mn: number[],

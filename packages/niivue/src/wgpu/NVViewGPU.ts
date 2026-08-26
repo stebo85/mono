@@ -961,10 +961,10 @@ export default class NVView {
       screenSlices = fit.screenSlices
       this.screenSlices = screenSlices
     }
-    // Update crosshair geometry based on current model state
-    if (this.crosshairRenderer.isReady) {
-      this.crosshairRenderer.update(md)
-    }
+    // Crosshair geometry is written per tile rather than once per frame: its
+    // radius is a screen weight, so it depends on the tile's mm-per-pixel. Each
+    // tile that draws one claims the next vertex slot.
+    let crosshairSlot = 0
     const ann3DData = md.annotation.isVisibleIn3D
       ? NVAnnotation.buildAnnotation3DRenderData(md)
       : null
@@ -1337,15 +1337,23 @@ export default class NVView {
       // Layer 2a: Crosshairs (skip on all mosaic tiles and global3d tiles)
       const isMosaicTile =
         tile.renderOrientation !== undefined || tile.sliceMM !== undefined
-      if (
+      const chRadiusMM =
         tile.space !== 'global3d' &&
         md.ui.is3DCrosshairVisible &&
         !isMosaicTile &&
-        this.crosshairRenderer.isReady &&
-        this.meshPipelines
-      ) {
+        this.crosshairRenderer.isReady
+          ? NVSliceLayout.crosshairRadiusMM(md, tile)
+          : 0
+      // A zero radius is either crosshairWidth: 0 or a degenerate tile; both
+      // mean there is nothing to draw.
+      const chSlot = crosshairSlot
+      let chDrawn = false
+      if (chRadiusMM > 0 && this.meshPipelines) {
         const pipeline = this.meshPipelines.phong
         if (pipeline) {
+          crosshairSlot++
+          chDrawn = true
+          this.crosshairRenderer.update(md, chRadiusMM, chSlot)
           this.crosshairRenderer.draw(
             device,
             pass,
@@ -1354,6 +1362,7 @@ export default class NVView {
             normalMatrix as Float32Array,
             i,
             tile.axCorSag,
+            chSlot,
           )
         }
       }
@@ -1434,12 +1443,9 @@ export default class NVView {
       const xrayTile = i + screenSlices.length
       if (xrayAlpha > 0 && this.meshXRayPipelines) {
         // Re-draw crosshairs with xray (skip on all mosaic tiles and global3d)
-        if (
-          tile.space !== 'global3d' &&
-          md.ui.is3DCrosshairVisible &&
-          !isMosaicTile &&
-          this.crosshairRenderer.isReady
-        ) {
+        // Same vertex slot as Layer 2a: only the uniforms differ. Gated on that
+        // pass having run, since the slot holds this tile's radius only if it did.
+        if (chDrawn) {
           const xPipeline = this.meshXRayPipelines.phong
           if (xPipeline) {
             this.crosshairRenderer.drawXRay(
@@ -1451,6 +1457,7 @@ export default class NVView {
               xrayTile,
               tile.axCorSag,
               xrayAlpha,
+              chSlot,
             )
           }
         }

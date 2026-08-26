@@ -96,6 +96,43 @@ export function slicePanUV(
   return [pan[map[0]], pan[map[1]], pan[3] ?? 1]
 }
 
+/**
+ * World-mm cylinder radius that makes the crosshair `ui.crosshairWidth` canvas
+ * pixels thick on this tile.
+ *
+ * `crosshairWidth` is a screen weight, like every other piece of UI chrome, and
+ * the mosaic cross-lines have always treated it that way. The 2D and 3D
+ * crosshairs are world-space cylinders, so the value has to be converted with
+ * the tile's own mm-per-pixel or the same setting comes out as a solid block on
+ * a millimetre-wide microscopy volume and a hairline on a whole-body scan, and
+ * grows as you zoom. Halved because the width is a diameter.
+ *
+ * Returns 0 for tiles that draw no crosshair (mosaic tiles, global3d tiles) and
+ * for degenerate geometry, which callers can use to skip the draw.
+ */
+export function crosshairRadiusMM(model: NVModel, tile: SliceTile): number {
+  const widthPx = model.ui.crosshairWidth
+  if (!(widthPx > 0)) return 0
+  const ltwh = tile.leftTopWidthHeight
+  if (!ltwh) return 0
+  let mmPerPixel = 0
+  if (tile.axCorSag === NVConstants.SLICE_TYPE.RENDER) {
+    mmPerPixel = NVTransforms.mmPerPixelRender(
+      ltwh,
+      model.furthestFromPivot,
+      model.scene.scaleMultiplier,
+    )
+  } else if (tile.screen) {
+    mmPerPixel = NVTransforms.mmPerPixel2D(
+      tile.screen.mnMM,
+      tile.screen.mxMM,
+      ltwh,
+      slicePanUV(model.scene.pan2Dxyzmm, tile.axCorSag),
+    )
+  }
+  return (widthPx * mmPerPixel) / 2
+}
+
 const buildScreens = (
   extentsMin: vec3,
   extentsMax: vec3,

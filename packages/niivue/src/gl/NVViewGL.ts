@@ -652,10 +652,8 @@ export default class NVGlview {
       screenSlices = fit.screenSlices
       this.screenSlices = screenSlices
     }
-    // Update crosshair geometry based on current model state
-    if (this.crosshairRenderer.isReady) {
-      this.crosshairRenderer.update(md)
-    }
+    // Crosshair geometry is rebuilt per tile rather than once per frame: its
+    // radius is a screen weight, so it depends on the tile's mm-per-pixel.
     const ann3DData = md.annotation.isVisibleIn3D
       ? NVAnnotation.buildAnnotation3DRenderData(md)
       : null
@@ -1036,12 +1034,17 @@ export default class NVGlview {
       // Layer 2a: Crosshairs (skip on all mosaic tiles)
       const isMosaicTile =
         tile.renderOrientation !== undefined || tile.sliceMM !== undefined
-      if (
+      const chRadiusMM =
         tile.space !== 'global3d' &&
         md.ui.is3DCrosshairVisible &&
         !isMosaicTile &&
         this.crosshairRenderer.isReady
-      ) {
+          ? NVSliceLayout.crosshairRadiusMM(md, tile)
+          : 0
+      // A zero radius is either crosshairWidth: 0 or a degenerate tile; both
+      // mean there is nothing to draw.
+      if (chRadiusMM > 0) {
+        this.crosshairRenderer.update(md, chRadiusMM)
         this.crosshairRenderer.draw(
           gl,
           mvpMatrix as Float32Array,
@@ -1109,12 +1112,8 @@ export default class NVGlview {
       const xrayAlpha = md.mesh.xRay
       if (xrayAlpha > 0) {
         // Re-draw crosshairs with xray (skip on all mosaic tiles and global3d)
-        if (
-          tile.space !== 'global3d' &&
-          md.ui.is3DCrosshairVisible &&
-          !isMosaicTile &&
-          this.crosshairRenderer.isReady
-        ) {
+        // The geometry still holds this tile's radius from Layer 2a.
+        if (chRadiusMM > 0) {
           this.crosshairRenderer.drawXRay(
             gl,
             mvpMatrix as Float32Array,

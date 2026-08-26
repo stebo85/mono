@@ -1,9 +1,10 @@
 import { describe, expect, test } from 'bun:test'
-import { mat4, vec3 } from 'gl-matrix'
+import { mat4, vec3, vec4 } from 'gl-matrix'
 import type { AffineMatrix, NVGlobalCamera, NVImage } from '@/NVTypes'
 import {
   arrayToMat4,
   calculateGlobalVolumeMvp,
+  calculateMvpMatrix,
   calculateMvpMatrix2D,
   cart2sphDeg,
   copyAffine,
@@ -13,6 +14,8 @@ import {
   mat4ToArray,
   mm2frac,
   mm2vox,
+  mmPerPixel2D,
+  mmPerPixelRender,
   multiplyAffine,
   rayBoxEntryMM,
   rayMarchFirstVisibleMM,
@@ -970,5 +973,103 @@ describe('stepZoom2D', () => {
     for (const bad of [0, -3, Number.NaN, Number.POSITIVE_INFINITY]) {
       expect(stepZoom2D(bad, 1)).toBe(ZOOM_2D_MIN)
     }
+  })
+})
+
+describe('mmPerPixel2D', () => {
+  // Project a 1 mm step through the very matrix the helper claims to invert and
+  // check it lands one reported pixel away. Pinned against the matrix rather
+  // than against a formula so the two cannot drift apart.
+  const pixelsPerMM = (
+    mn: number[],
+    mx: number[],
+    ltwh: number[],
+    pan?: number[],
+  ): number => {
+    const [mvp] = calculateMvpMatrix2D(
+      ltwh,
+      mn,
+      mx,
+      Infinity,
+      undefined,
+      0,
+      0,
+      false,
+      undefined,
+      undefined,
+      pan,
+      false,
+    )
+    const at = (u: number): number => {
+      const p = vec4.fromValues(u, 0, 0, 1)
+      vec4.transformMat4(p, p, mvp)
+      // NDC x spans [-1, 1] across the tile's pixel width.
+      return ((p[0] / p[3]) * ltwh[2]) / 2
+    }
+    return Math.abs(at(1) - at(0))
+  }
+
+  test('reports the tile scale calculateMvpMatrix2D sets up', () => {
+    const mn = [-90, -110, 0]
+    const mx = [90, 110, 0]
+    const ltwh = [0, 0, 360, 440]
+    const measured = pixelsPerMM(mn, mx, ltwh)
+    expect(mmPerPixel2D(mn, mx, ltwh)).toBeCloseTo(1 / measured, 6)
+    expect(mmPerPixel2D(mn, mx, ltwh)).toBeCloseTo(0.5, 6)
+  })
+
+  test('shrinks with the 2D zoom', () => {
+    const mn = [-90, -110, 0]
+    const mx = [90, 110, 0]
+    const ltwh = [0, 0, 360, 440]
+    const pan = [0, 0, 4]
+    const measured = pixelsPerMM(mn, mx, ltwh, pan)
+    expect(mmPerPixel2D(mn, mx, ltwh, pan)).toBeCloseTo(1 / measured, 6)
+    // A crosshair asking for a fixed pixel weight therefore asks for a quarter
+    // of the world radius once the view is zoomed 4x.
+    expect(mmPerPixel2D(mn, mx, ltwh, pan)).toBeCloseTo(
+      mmPerPixel2D(mn, mx, ltwh) / 4,
+      6,
+    )
+  })
+
+  test('is 0 for a tile with no width', () => {
+    expect(mmPerPixel2D([-1, -1, 0], [1, 1, 0], [0, 0, 0, 10])).toBe(0)
+  })
+})
+
+describe('mmPerPixelRender', () => {
+  const pixelsPerMM = (
+    ltwh: number[],
+    furthest: number,
+    zoom: number,
+  ): number => {
+    const [mvp] = calculateMvpMatrix(ltwh, 0, 0, [0, 0, 0], furthest, zoom)
+    const at = (u: number): number => {
+      const p = vec4.fromValues(u, 0, 0, 1)
+      vec4.transformMat4(p, p, mvp as mat4)
+      return ((p[0] / p[3]) * ltwh[2]) / 2
+    }
+    return Math.abs(at(1) - at(0))
+  }
+
+  test('reports the scale calculateMvpMatrix sets up', () => {
+    const ltwh = [0, 0, 600, 400]
+    const measured = pixelsPerMM(ltwh, 100, 1)
+    expect(mmPerPixelRender(ltwh, 100, 1)).toBeCloseTo(1 / measured, 6)
+  })
+
+  test('shrinks with the render zoom', () => {
+    const ltwh = [0, 0, 400, 600]
+    const measured = pixelsPerMM(ltwh, 100, 2)
+    expect(mmPerPixelRender(ltwh, 100, 2)).toBeCloseTo(1 / measured, 6)
+    expect(mmPerPixelRender(ltwh, 100, 2)).toBeCloseTo(
+      mmPerPixelRender(ltwh, 100, 1) / 2,
+      6,
+    )
+  })
+
+  test('is 0 for a tile with no area', () => {
+    expect(mmPerPixelRender([0, 0, 600, 0], 100, 1)).toBe(0)
   })
 })

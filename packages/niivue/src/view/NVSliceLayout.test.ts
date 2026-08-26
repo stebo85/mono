@@ -1,6 +1,13 @@
 import { describe, expect, test } from 'bun:test'
 import { vec3 } from 'gl-matrix'
-import { fitSlicesAndGraph, type SliceLayoutConfig } from './NVSliceLayout'
+import * as NVConstants from '@/NVConstants'
+import type NVModel from '@/NVModel'
+import {
+  crosshairRadiusMM,
+  fitSlicesAndGraph,
+  type SliceLayoutConfig,
+  type SliceTile,
+} from './NVSliceLayout'
 
 // Wide pane (2000x400) with a cube volume: a single-orientation slice is ~square
 // (~400 wide), leaving large horizontal slack the graph should reclaim.
@@ -41,5 +48,80 @@ describe('fitSlicesAndGraph', () => {
       base,
     )
     expect(graphWidth).toBe(base)
+  })
+})
+
+// Only the fields crosshairRadiusMM reads; the rest of NVModel is irrelevant to
+// a unit conversion.
+const chModel = (crosshairWidth: number, scaleMultiplier = 1): NVModel =>
+  ({
+    ui: { crosshairWidth },
+    scene: { scaleMultiplier, pan2Dxyzmm: [0, 0, 0, 1] },
+    furthestFromPivot: 100,
+  }) as unknown as NVModel
+
+const axialTile = (widthPx: number, mmAcross: number): SliceTile =>
+  ({
+    axCorSag: NVConstants.SLICE_TYPE.AXIAL,
+    leftTopWidthHeight: [0, 0, widthPx, widthPx],
+    screen: {
+      mnMM: [-mmAcross / 2, -mmAcross / 2, 0],
+      mxMM: [mmAcross / 2, mmAcross / 2, 0],
+    },
+  }) as unknown as SliceTile
+
+describe('crosshairRadiusMM', () => {
+  test('gives the world radius that subtends the requested pixel width', () => {
+    // 180 mm across 360 px is 0.5 mm/px, so a 3 px thick crosshair is a
+    // cylinder 1.5 mm across -- radius 0.75.
+    expect(crosshairRadiusMM(chModel(3), axialTile(360, 180))).toBeCloseTo(
+      0.75,
+      6,
+    )
+  })
+
+  test('holds the pixel weight as the field of view changes', () => {
+    // The bug this replaces: one setting, wildly different thickness. A 2 mm
+    // microscopy stack and a 1800 mm whole-body scan now agree on screen.
+    const px = 400
+    const tiny = crosshairRadiusMM(chModel(2), axialTile(px, 2))
+    const huge = crosshairRadiusMM(chModel(2), axialTile(px, 1800))
+    expect(tiny / 2).toBeCloseTo(huge / 1800, 9)
+    expect(tiny).toBeCloseTo(0.005, 9)
+  })
+
+  test('shrinks with the 2D zoom so the crosshair does not thicken', () => {
+    const tile = axialTile(360, 180)
+    const zoomed = chModel(3)
+    zoomed.scene.pan2Dxyzmm = [0, 0, 0, 3]
+    expect(crosshairRadiusMM(zoomed, tile)).toBeCloseTo(
+      crosshairRadiusMM(chModel(3), tile) / 3,
+      9,
+    )
+  })
+
+  test('scales with the render zoom on the 3D tile', () => {
+    const renderTile = {
+      axCorSag: NVConstants.SLICE_TYPE.RENDER,
+      leftTopWidthHeight: [0, 0, 800, 500],
+    } as unknown as SliceTile
+    const plain = crosshairRadiusMM(chModel(4), renderTile)
+    const zoomed = crosshairRadiusMM(chModel(4, 2), renderTile)
+    // 0.8 * 100 mm across the 500 px short side, halved for a radius.
+    expect(plain).toBeCloseTo((4 * ((2 * 80) / 500)) / 2, 9)
+    expect(zoomed).toBeCloseTo(plain / 2, 9)
+  })
+
+  test('is 0 when the crosshair is off or the tile is degenerate', () => {
+    expect(crosshairRadiusMM(chModel(0), axialTile(360, 180))).toBe(0)
+    expect(crosshairRadiusMM(chModel(3), axialTile(0, 180))).toBe(0)
+    // A tile with no screen bounds is a mosaic or global3d tile, which draws no
+    // crosshair at all.
+    expect(
+      crosshairRadiusMM(chModel(3), {
+        axCorSag: NVConstants.SLICE_TYPE.AXIAL,
+        leftTopWidthHeight: [0, 0, 360, 360],
+      } as unknown as SliceTile),
+    ).toBe(0)
   })
 })

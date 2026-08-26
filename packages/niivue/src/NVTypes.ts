@@ -667,6 +667,12 @@ export type UIConfig = {
   placeholderText: string
   crosshairColor: number[]
   crosshairGap: number
+  /**
+   * Crosshair thickness in canvas pixels, on 2D slice tiles, on the 3D render
+   * tile and on mosaic cross-lines alike. It is a screen weight, so it holds
+   * steady as you zoom and does not depend on the volume's field of view. 0
+   * hides the crosshair.
+   */
   crosshairWidth: number
   fontColor: number[]
   fontScale: number
@@ -1089,6 +1095,12 @@ export type NiiVueOptions = {
   placeholderText?: string
   crosshairColor?: number[]
   crosshairGap?: number
+  /**
+   * Crosshair thickness in canvas pixels, on 2D slice tiles, on the 3D render
+   * tile and on mosaic cross-lines alike. It is a screen weight, so it holds
+   * steady as you zoom and does not depend on the volume's field of view. 0
+   * hides the crosshair.
+   */
   crosshairWidth?: number
   fontColor?: number[]
   fontScale?: number

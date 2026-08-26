@@ -12,12 +12,13 @@ Companion docs: `high-res-streaming.md` (how the chunked path works),
 already grades our scheduler and budgets as partial),
 `streaming-todos.md` (the open work list this doc feeds).
 
-**Status:** Every stage has landed (A through G, 2026-08-25).
-Sections 2.2, 2.3, 2.4, 2.5, 2.6, 2.7, 2.8 and the stage table below describe
-what changed. Section 2.5 is the measured answer to the
-question this doc was written to ask, and it moved two items up the list.
-Section 2.6 retires stage G: the byte cache turned out to be sized correctly,
-and the finding that said otherwise was a misreading of section 2.5's numbers.
+**Status:** Every stage has landed (A through G, 2026-08-25), and the branch
+is pushed. Sections 2.2 through 2.9 and the stage table below describe what
+changed. Four of those sections are measurements rather than designs: 2.5 is
+the answer to the question this doc was written to ask and it moved two items
+up the list, 2.6 retires stage G (the byte cache was already sized correctly,
+and the finding that said otherwise misread 2.5's numbers), 2.7 shows the
+main-thread stall gone, and 2.9 puts a number on the warm start.
 
 ## 1. What we cache today
 
@@ -508,15 +509,53 @@ it. All browser contact is confined to a four-method backing interface, so the
 cache logic is unit-tested under Bun (which has no `caches`) and an OPFS
 implementation would need no change to it.
 
+### 2.9 Measured: what a warm start buys, and what nearly broke it
+
+Same instrument as 2.6 and 2.7, smaller store: the DANDI demo's default block
+(000722 OCT, 106 MB, over S3), WebGL2 in Chrome, four chunk workers, 512 MB
+persistent budget, 25 seconds of streaming with no interaction.
+
+| Figure | Cold (cache deleted) | Warm (reload) |
+|---|---|---|
+| Persistent hit rate | 0% of 26 lookups | 85% of 26 lookups |
+| Entries written | 22 | 0 |
+| Bytes on disk after the run | 1.0 MB | 1.0 MB, unchanged |
+
+The 15% that still missed are the misses that cannot be served: the first
+lookups of the run race the writes of the same chunks, and one level's
+metadata is fetched before any chunk key exists. Nothing was re-fetched that
+had been paid for before.
+
+The interesting part is what the numbers looked like BEFORE the fix. The unit
+tests all passed, the built bundle contained the scoping code, and the hit rate
+was still respectable, because an unscoped cache is not a broken cache: every
+worker simply adopted every key. What gave it away was reading the keys
+themselves in Chrome, where all 22 sat under no scope at all instead of
+splitting across `w0/` and `w3/`. The cause was one layer above the cache:
+`openPersistTier` picked `maxBytes` and `name` out of its options and dropped
+the rest, so `scope` never reached the constructor (`eb661670`). The cost of
+leaving it in would have been paid only on a warm start with a full cache, when
+each of four workers would have evicted the pool down to its own quarter share
+and thrown away three quarters of the disk it had filled.
+
+Two lessons worth keeping. A unit test cannot see an options field that is
+never forwarded, because both sides of the boundary are correct in isolation;
+the assertion that catches it has to be on the artifact the system actually
+produced, which here is the key. And a cache whose only symptom is a
+lower-than-necessary hit rate is a bug that hides well, so the stats worth
+exposing are the ones that would have to be a specific shape if the design were
+working, not just the ones that go up when it is.
+
 ## 3. What we should say tomorrow
 
-We are not starting from nothing: three tiers on the volume side, two on the
-slide side, byte budgets everywhere, frame-accurate LRU protection, a coarse
-floor that means we never draw a hole, and a stale-request discipline on the
-slide side that Neuroglancer's design agrees with. The honest gaps are
-off-thread decode, a priority queue on the volume side, demotion instead of
-destruction, and real prediction. The priority queue is now closed (stage A),
-and we have measured the rest rather than guessing at it (stage B).
+We are not starting from nothing, and as of this week we are not mid-list
+either. The four gaps this doc opened with have all closed: the priority queue
+(A), off-thread fetch and decode (C), real prediction (D), and demotion instead
+of destruction (E), on top of the tiers we already had, byte budgets
+everywhere, frame-accurate LRU protection, a coarse floor that means we never
+draw a hole, and a stale-request discipline on the slide side that
+Neuroglancer's design agrees with. Each of those was measured before and after
+rather than asserted, which is what stage B bought.
 
 The one number worth putting on a slide: streaming a HiP-CT volume from S3 for
 20 seconds costs the render loop 8.6 seconds, and 125 ms of that is GPU upload.
@@ -544,7 +583,7 @@ Two places we can be BETTER than Neuroglancer rather than catching up:
 | C | DONE Worker pool for chunk fetch + decode (`omeZarrChunkWorkerPool.ts`, `workers/omeZarrChunk.worker.ts`) | medium | Measured (2.7): the 8.6 s of lost frame time is gone, 100% of streaming work is off-thread |
 | D | DONE (`1281a74b`) Directional prefetch: travel of the working-set centroid, extrapolated and fetched ahead (`chunkPrediction.ts`) | small | One mechanism covers scrub and pan, no camera plumbing, identical on both backends |
 | E | DONE Decoded-chunk demotion tier under GPU eviction (`decodedChunkCache.ts`) | medium | Makes eviction cheap to undo; sized off the GPU budget and the source datatype |
-| F | DONE (`d6037b60`) Persistent raw-byte cache in Cache Storage (`persistentByteCache.ts`) | medium | The differentiator; warm starts across reloads |
+| F | DONE (`d6037b60`, `eb661670`) Persistent raw-byte cache in Cache Storage (`persistentByteCache.ts`) | medium | The differentiator; measured (2.9): a reload serves 85% of its lookups from disk |
 
 A, B, G and C are done. A and B were the two that make every later stage
 measurable, and B changed the order of what followed: G came straight out of the
@@ -566,9 +605,10 @@ cleverness about what to admit.
 
 F closed the list, and it is the one stage that makes a difference the user
 sees without measuring anything: the second visit to a dataset is faster than
-the first. Its design is in 2.8; the short version is that the persisted unit
-is raw store bytes, and our own index is the budget because Cache Storage will
-not bound itself.
+the first. Its design is in 2.8 and its numbers are in 2.9; the short version
+is that the persisted unit is raw store bytes, and our own index is the budget
+because Cache Storage will not bound itself. It also produced the one bug in
+the series that no test could have found, which 2.9 records.
 
 ## 5. Known gaps not covered above
 

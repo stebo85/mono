@@ -176,9 +176,22 @@ Full comparison against Neuroglancer, with the staged plan: **`docs/caching.md`*
       plan exceeds the residency budget is needed before the `decoded tier` HUD
       row reads anything but 0 hits.
 
-- [ ] Persistent cross-session cache (Cache Storage or OPFS). Every tier we have
-      dies on reload. For DANDI over S3 this is the most visible improvement
-      available, and Neuroglancer does not do it.
+- [x] Persistent cross-session cache (Cache Storage). Every in-memory tier dies
+      on reload, so `persistentByteCache.ts` holds RAW compressed store bytes
+      below the byte LRU and above the fetch store: format-agnostic, keyed by
+      the store key, and the smallest form a chunk has. Cache Storage bounds
+      nothing, so our in-memory index is the budget -- each entry's byte length
+      rides in its backing key, and one `keys()` listing rebuilds the index and
+      the accounting without reading a body. Absences are deliberately NOT
+      persisted (a missing chunk can become bytes tomorrow; bytes cannot
+      change). Under the worker pool each worker owns a scope of one shared
+      backing, which routing determinism makes a partition rather than a
+      collision. Off by default -- it writes to the user's disk -- with the
+      DANDI demo opting in at 512 MB and reporting the warm-start rate.
+
+      Still open: an OPFS backing (the four-method `PersistentCacheBacking`
+      interface exists for it), and persisting the decoded tier rather than the
+      compressed one for stores whose codec is expensive.
 
 - [x] Keep the previous resolution on screen while a finer level loads
       (NVSlide). `visibleTiles` now returns a `fallback` list of already-cached

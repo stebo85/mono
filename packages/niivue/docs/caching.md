@@ -12,9 +12,9 @@ Companion docs: `high-res-streaming.md` (how the chunked path works),
 already grades our scheduler and budgets as partial),
 `streaming-todos.md` (the open work list this doc feeds).
 
-**Status:** Stages A, B, C, D, E and G have landed (2026-08-25).
-Sections 2.2, 2.3, 2.4, 2.5, 2.6, 2.7 and the stage table below describe what
-changed; only F is still open. Section 2.5 is the measured answer to the
+**Status:** Every stage has landed (A through G, 2026-08-25).
+Sections 2.2, 2.3, 2.4, 2.5, 2.6, 2.7, 2.8 and the stage table below describe
+what changed. Section 2.5 is the measured answer to the
 question this doc was written to ask, and it moved two items up the list.
 Section 2.6 retires stage G: the byte cache turned out to be sized correctly,
 and the finding that said otherwise was a misreading of section 2.5's numbers.
@@ -455,6 +455,59 @@ stops them competing with drawing. The amplification measured in 2.5, 15x to 39x
 between bytes delivered and voxels used, is untouched and is what stage D is
 for.
 
+### 2.8 Stage F: bytes that survive a reload (`persistentByteCache.ts`)
+
+Every tier described above dies with the tab. A second visit to a DANDI volume
+re-fetched what the first visit had already paid for, which for a store over S3
+is the most expensive thing we do.
+
+Stage F adds a tier that persists. Three decisions shaped it.
+
+**What to persist, and where.** The tier holds RAW compressed store bytes and
+sits BELOW the byte LRU and ABOVE the fetch store, so it only ever sees what
+memory could not answer. That layer wins on three counts: it is format-agnostic
+(one path for every codec and dtype, rather than one per decoded
+representation), it is keyed by something already unique and stable (the store
+key), and it is the smallest form a chunk has. Decoding again is cheap next to
+the round trip, and the round trip is what is being bought back.
+
+**Absences are not persisted.** The in-memory `ByteLruCache` remembers a
+missing chunk, because within one load a missing chunk means fill value and
+that answer cannot change. Across days it can: a store still being written
+would otherwise carry its holes forever in a cache the user cannot see. Bytes
+are content-addressed by definition; an absence is the one thing that can turn
+into something else.
+
+**The index is the budget.** Cache Storage has no size limit and no eviction
+policy, so ours must be the authority. `PersistentByteCache` keeps an in-memory
+insertion-ordered map from store identity to backing key, re-inserted on every
+hit so iteration order is LRU-first, and each entry's byte length rides in the
+backing key itself. One `keys()` listing therefore rebuilds both the index and
+the byte accounting without reading a single body. Across a reload the recency
+order is lost (a listing returns insertion order), so a cold start evicts
+oldest-written first and warms into true LRU as entries are touched. A quota
+error halves our budget rather than retrying into the same wall: our ceiling is
+a policy, the browser's is not.
+
+Everything is best effort. The browser may clear the bucket, a write may exceed
+quota, a non-secure context has no Cache Storage at all. Every failure is
+counted in the stats and every read falls through to the store.
+
+With the worker pool running, each worker opens its own cache over the SAME
+backing and owns a SCOPE of it, with the budget split across workers. That is
+sound precisely because `routeChunkToWorker` hashes the region key: a brick
+always returns to the worker that holds it, so the scopes partition the store
+rather than shadowing it. A worker leaves a sibling's keys alone and deletes
+only what belongs to no current scope, which is what the leftovers of a
+differently sized pool look like.
+
+The tier is OFF by default, because it writes to the user's disk and that
+should be the application's call. The DANDI demo opts in with 512 MB and
+reports the warm-start rate in its HUD; `clearPersistentByteCaches()` empties
+it. All browser contact is confined to a four-method backing interface, so the
+cache logic is unit-tested under Bun (which has no `caches`) and an OPFS
+implementation would need no change to it.
+
 ## 3. What we should say tomorrow
 
 We are not starting from nothing: three tiers on the volume side, two on the
@@ -472,11 +525,11 @@ is measured rather than asserted.
 
 Two places we can be BETTER than Neuroglancer rather than catching up:
 
-- **Persistence across sessions.** Every cache described above dies on reload.
-  For DANDI over S3 the expensive part is the round trip, and Cache Storage or
-  OPFS would let a second visit to a dataset start warm. Neuroglancer does not
-  do this. It is the most visible thing we could offer a workshop audience
-  clicking the same demo repeatedly.
+- **Persistence across sessions.** Every in-memory cache dies on reload. For
+  DANDI over S3 the expensive part is the round trip, so stage F (2.8) added a
+  Cache Storage tier under the byte LRU: a second visit to a dataset starts
+  warm. Neuroglancer does not do this. It is the most visible thing we can
+  offer a workshop audience clicking the same demo repeatedly.
 - **The coarse floor.** A whole-volume coarsest level pinned resident is a
   cheap guarantee that the screen is never empty, and it composes with
   everything above.
@@ -491,7 +544,7 @@ Two places we can be BETTER than Neuroglancer rather than catching up:
 | C | DONE Worker pool for chunk fetch + decode (`omeZarrChunkWorkerPool.ts`, `workers/omeZarrChunk.worker.ts`) | medium | Measured (2.7): the 8.6 s of lost frame time is gone, 100% of streaming work is off-thread |
 | D | DONE (`1281a74b`) Directional prefetch: travel of the working-set centroid, extrapolated and fetched ahead (`chunkPrediction.ts`) | small | One mechanism covers scrub and pan, no camera plumbing, identical on both backends |
 | E | DONE Decoded-chunk demotion tier under GPU eviction (`decodedChunkCache.ts`) | medium | Makes eviction cheap to undo; sized off the GPU budget and the source datatype |
-| F | Persistent cache (Cache Storage / OPFS) | medium | The differentiator; warm starts across reloads |
+| F | DONE (`d6037b60`) Persistent raw-byte cache in Cache Storage (`persistentByteCache.ts`) | medium | The differentiator; warm starts across reloads |
 
 A, B, G and C are done. A and B were the two that make every later stage
 measurable, and B changed the order of what followed: G came straight out of the
@@ -511,7 +564,11 @@ only evicted chunks, it must shadow the resident set, and the reason that is
 affordable is the 8-bytes-on-GPU against 1-to-4-on-CPU ratio rather than any
 cleverness about what to admit.
 
-What remains is F: persist.
+F closed the list, and it is the one stage that makes a difference the user
+sees without measuring anything: the second visit to a dataset is faster than
+the first. Its design is in 2.8; the short version is that the persisted unit
+is raw store bytes, and our own index is the budget because Cache Storage will
+not bound itself.
 
 ## 5. Known gaps not covered above
 

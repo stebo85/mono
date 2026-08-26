@@ -12,9 +12,9 @@ Companion docs: `high-res-streaming.md` (how the chunked path works),
 already grades our scheduler and budgets as partial),
 `streaming-todos.md` (the open work list this doc feeds).
 
-**Status:** Stages A, B and G landed on 2026-08-25 (`1a9d525d`, `1a76c7c5`).
-Sections 2.2, 2.5, 2.6 and the stage table below describe what changed;
-everything else is still open. Section 2.5 is the measured answer to the
+**Status:** Stages A, B, C, D and G have landed (2026-08-25).
+Sections 2.2, 2.4, 2.5, 2.6, 2.7 and the stage table below describe what
+changed; E and F are still open. Section 2.5 is the measured answer to the
 question this doc was written to ask, and it moved two items up the list.
 Section 2.6 retires stage G: the byte cache turned out to be sized correctly,
 and the finding that said otherwise was a misreading of section 2.5's numbers.
@@ -190,7 +190,7 @@ as a fraction of the GPU budget, holding only chunks evicted from GPU (not
 every chunk ever decoded), so it is a demotion buffer rather than a second
 full cache.
 
-### 2.4 Prefetch is predictive, ours is pipeline lookahead
+### 2.4 Prefetch is predictive, ours is pipeline lookahead (DONE, stage D)
 
 `CHUNK_PREFETCH_WINDOW` is not prediction. It looks 16 entries into a queue we
 have already decided we need, purely so the fetch pipe stays full ahead of the
@@ -198,17 +198,67 @@ serial upload. Neuroglancer extrapolates the navigation state and requests
 chunks for where the view is GOING, at a priority tier that can never evict or
 delay a visible chunk.
 
-For our two dominant interactions the extrapolation is easy and does not need
-a general framework:
+Stage D adds that. It measures travel in the one space both backends already
+share, the chunk grid. Each frame the view hands its working set (the chunks it
+just asked to have resident) to a `ChunkTravelPredictor`
+(`src/volume/chunkPrediction.ts`). The centroid of that set moves when the view
+moves: a slice scrub marches it along the slice axis, a pan slides it across the
+plane. The predictor smooths that motion, extrapolates three frames forward, and
+returns the same footprint translated by the resulting whole-chunk step, which
+is the next slabs along a scrub or the tiles about to arrive at the leading edge
+of a pan. One mechanism therefore covers both of the interactions listed below
+without a general framework, and it needs nothing from the camera plumbing,
+which is why it lands identically on `gl/render.ts` and `wgpu/render.ts`.
 
-- Slice scrolling: the user is stepping along one axis at a steady rate. Fetch
-  the next N slices in the direction of travel. This is the single highest-value
-  prediction for DANDI-style data and it is nearly free.
-- Zoom: a zoom in progress will cross a level boundary. Start the next level's
-  centre tiles before the boundary is reached.
+- Slice scrolling: the centroid marches along one axis, so the predicted step is
+  the next slabs in the direction of travel.
+- Pan and 2D zoom: the centroid slides across the plane, so the predicted step is
+  the leading edge. Crossing a level boundary is not yet predicted; the plan swap
+  resets the predictor, which is correct but conservative.
 
-Both are cheap because they are one-dimensional. Camera-orbit prediction is
-the expensive case and I would not build it first.
+Camera-orbit prediction is still not built, and still should not be first.
+
+Three properties keep speculation subordinate to what the view can actually see:
+
+- Predicted chunks are FETCHED, never made resident. They never enter the
+  residency queue, never stamp the eviction clock, and can never delay a visible
+  chunk. That is our version of Neuroglancer's priority tier.
+- Speculative reads are capped below the per-uploader prefetch limit
+  (`MAX_PREFETCHED_CHUNKS - PREFETCH_SLOTS_RESERVED`), so real reads always have
+  slots.
+- At most one flight of guesses is outstanding (`CHUNK_PREDICT_WINDOW`, 4). New
+  reads start only as the view consumes standing ones, so a drag cannot cancel
+  and restart speculation on every frame.
+
+Two behaviours are worth recording because the obvious implementation gets them
+wrong, and browser testing rather than unit testing is what exposed both.
+
+Travel is measured per MOVE, not per frame. Interaction is bursty: a wheel step
+lands in one frame and the next comes thirty frames later. Decaying the velocity
+on the idle frames means prediction only ever fires during a continuous drag,
+which is the one case that needs it least, so a still frame holds the velocity
+instead.
+
+An empty prediction leaves standing guesses alone. Releasing them on the first
+idle frame cancels exactly the reads a discrete scrub had just started for its
+next step. Guesses are dropped when the view arrives at them (without
+cancelling, since by then the read belongs to the pump), and cancelled only when
+nothing standing lies on the new heading, which is the definition of a turn.
+
+Observability: `chunkStreamStats()` gained a cumulative `predicted` count,
+surfaced as a `prefetch` row in the dandi demo HUD. The payoff shows up in the
+source's byte-cache hit rate rather than in residency, since a predicted chunk
+is a byte-cache entry until the view asks for it.
+
+Honest limitation on verification: in the dandi demo the working set rarely
+travels by a whole chunk. `budgetPlan: 'focus'` sizes the plan to the byte
+budget, so most of its datasets end up entirely resident and the centroid never
+moves, and on a coarse level a single wheel step is a small fraction of a chunk.
+The prediction is unit-tested (16 cases in `chunkPrediction.test.ts`, covering
+scrub, reversal, burst-with-idle-frames, pan, jump, cap and reset), but a live
+`predicted > 0` reading needs a store whose plan exceeds the residency budget
+being navigated at a fine level. That is a demo gap, not a feature gap, and it
+is the first thing to fix when stage E is measured.
 
 ### 2.5 Measured: where the time actually goes
 
@@ -404,7 +454,7 @@ Two places we can be BETTER than Neuroglancer rather than catching up:
 | B | DONE Per-phase timing (`chunkTimingStats`) plus a main-thread stall monitor in the demo | small | Turned stage C from a guess into a measurement |
 | G | DONE Hit / miss / eviction counters on `ByteLruCache`, exposed as `source.byteCache.stats` | small | Measured (2.6): zero evictions on a 1 TB store, so no budget or policy change was needed |
 | C | DONE Worker pool for chunk fetch + decode (`omeZarrChunkWorkerPool.ts`, `workers/omeZarrChunk.worker.ts`) | medium | Measured (2.7): the 8.6 s of lost frame time is gone, 100% of streaming work is off-thread |
-| D | Directional prefetch for slice scrolling and zoom | small | One-dimensional prediction, big felt win, no framework needed |
+| D | DONE (`1281a74b`) Directional prefetch: travel of the working-set centroid, extrapolated and fetched ahead (`chunkPrediction.ts`) | small | One mechanism covers scrub and pan, no camera plumbing, identical on both backends |
 | E | Decoded-chunk demotion tier under GPU eviction | medium | Makes eviction cheap to undo; sized off the GPU budget |
 | F | Persistent cache (Cache Storage / OPFS) | medium | The differentiator; warm starts across reloads |
 
@@ -416,9 +466,11 @@ confirmed as the big one and delivered accordingly. The in-flight half of A, an
 worker pool owns the fetch, so a cancelled read is now aborted on the wire
 rather than merely ignored on arrival.
 
-What remains is D, E, F: predict, then soften eviction, then persist. D is next
-and it is the one that attacks a cost C did not touch, since a worker pool moves
-the decode but does not avoid it.
+D followed and attacked a cost C did not touch, since a worker pool moves the
+decode but does not avoid it. Its one surprise was that the demo cannot easily
+show it working: see the verification note at the end of 2.4.
+
+What remains is E and F: soften eviction, then persist.
 
 ## 5. Known gaps not covered above
 

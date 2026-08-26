@@ -120,10 +120,34 @@ Full comparison against Neuroglancer, with the staged plan: **`docs/caching.md`*
       delivered total above the budget is evidence of reuse, not of thrash.
       Details in `docs/caching.md` 2.6.
 
-- [ ] Directional prefetch for slice scrolling and zoom. `CHUNK_PREFETCH_WINDOW`
+- [x] Directional prefetch for slice scrolling and zoom. `CHUNK_PREFETCH_WINDOW`
       is pipeline lookahead over chunks we have already decided we need, not
-      prediction. Both dominant interactions are one-dimensional, so
-      extrapolating them needs no general framework.
+      prediction. `src/volume/chunkPrediction.ts` now tracks the working-set
+      centroid in chunk-grid coordinates, smooths it, extrapolates three frames,
+      and fetches the same footprint translated by the resulting whole-chunk
+      step. One mechanism covers scrub and pan, it needs nothing from the camera
+      plumbing, and both renderers call it the same way. Predicted chunks are
+      fetched and never made resident, speculative reads are capped below the
+      per-uploader prefetch limit, and only one flight of guesses is outstanding
+      at a time, so speculation can never delay or evict a visible chunk.
+
+      Two behaviours the obvious implementation gets wrong, both found in the
+      browser rather than in tests: velocity must be held across the idle frames
+      between discrete wheel steps (otherwise prediction only fires during a
+      continuous drag), and an empty prediction must leave standing guesses
+      alone (otherwise the first idle frame cancels the reads the scrub just
+      started). Guesses are dropped on arrival without cancelling and cancelled
+      only on a turn.
+
+      Follow-up: the dandi demo cannot easily show this working, because
+      `budgetPlan: 'focus'` sizes the plan to the byte budget and most datasets
+      end up entirely resident, so the centroid never moves. A live
+      `predicted > 0` reading needs a store whose plan exceeds the residency
+      budget navigated at a fine level. Worth a dedicated demo preset before
+      stage E is measured.
+
+      Not yet predicted: crossing a level boundary during a zoom. The plan swap
+      resets the predictor, which is correct but conservative.
 
 - [ ] Demote on eviction instead of destroying. An evicted brick currently costs
       a full fetch + decode + upload to bring back; a small decoded tier sized

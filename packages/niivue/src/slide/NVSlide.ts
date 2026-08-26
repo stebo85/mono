@@ -183,6 +183,20 @@ const DEFAULT_RANGE_LOG_LENGTH = 24
 // once on a gigapixel slide), spiking network sockets, decode threads, and
 // GPU-backed bitmap allocations in the browser's GPU process.
 const DEFAULT_MAX_CONCURRENT_TILE_LOADS = 12
+
+/**
+ * Coerce the caller's tile concurrency cap to a finite positive integer.
+ *
+ * A bare Math.max(1, x) lets Infinity and NaN through, and both remove the
+ * cap rather than raise it: every capacity test is `_activeLoads >= cap`, which
+ * is false for either value, so no tile is ever queued and every request goes
+ * straight to _runLoad. Flooring to a whole number also keeps the effective cap
+ * equal to the number asked for — 2.5 would otherwise admit a third load.
+ */
+function clampTileLoadCap(value: number): number {
+  if (!Number.isFinite(value)) return DEFAULT_MAX_CONCURRENT_TILE_LOADS
+  return Math.max(1, Math.floor(value) || 1)
+}
 // Safety valve for pathological manifests (e.g. a missing tileSize defaulting
 // to 1px tiles): never enumerate more visible tiles than this per frame. A
 // sane pyramid level never exceeds a few hundred on screen.
@@ -490,8 +504,7 @@ export class NVSlide extends EventTarget {
     this._cache = new NVSlideTileCache(
       options.maxCacheBytes ?? DEFAULT_CACHE_BYTES,
     )
-    this._maxConcurrentLoads = Math.max(
-      1,
+    this._maxConcurrentLoads = clampTileLoadCap(
       options.maxConcurrentLoads ?? DEFAULT_MAX_CONCURRENT_TILE_LOADS,
     )
     this._source = options.source ?? new ManifestRangeSource(manifest)

@@ -103,6 +103,25 @@ describe('NVSlide tile loading', () => {
     slide.dispose()
   })
 
+  it('keeps the cap when maxConcurrentLoads is Infinity or NaN', async () => {
+    // Neither value raises the cap, they remove it: every capacity test is
+    // `_activeLoads >= cap`, false for both, so nothing is ever queued and all
+    // 30 tiles go straight to _runLoad. Both must fall back to the default.
+    for (const bad of [Number.POSITIVE_INFINITY, Number.NaN]) {
+      NVSlide.registerTileDecoder('image/jpeg', async () => fakeBitmap())
+      const tileCount = 30
+      const source = new CountingSource(makeManifest(tileCount))
+      const slide = NVSlide.fromSource(source, { maxConcurrentLoads: bad })
+      const level = slide.manifest.levels[0]
+      if (!level) throw new Error('manifest has no level')
+      for (const tile of level.tiles) slide.requestTile(level, tile)
+      await waitFor(() => slide.stats.completed === tileCount)
+      expect(source.peak).toBeLessThanOrEqual(12)
+      expect(slide.stats.failures).toBe(0)
+      slide.dispose()
+    }
+  })
+
   it('accounts the cache in decoded (RGBA) bytes, not encoded bytes', async () => {
     NVSlide.registerTileDecoder('image/jpeg', async () => fakeBitmap())
     const tileCount = 5

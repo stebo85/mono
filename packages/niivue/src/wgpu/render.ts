@@ -252,7 +252,9 @@ type TexCacheEntry = SingleTexEntry | ChunkedTexEntry
 //   16 mvp + 16 norm + 16 matRAS + 4 volScale + 4 rayDir + 4 (gradient/numVol/cutaway/pad)
 //   + 4 clipPlaneColor + 24 clipPlanes + 4 paqd + 8 scalars (earlyTermination,
 //     clipPlaneOverlay, fadeAlpha, renderMode, cubicFilter, invGamma,
-//     lodOpacityScale, backOpacity — what used to be 1 + a 7-lane _pad0)
+//     lodOpacityScale, backOpacity). The last four replaced a 2-lane _pad0
+//     plus the 2 lanes WGSL was already inserting implicitly to 16-align
+//     volumeTexDimsFull, so the group is 8 lanes before and after.
 //   + 4 volumeTexDimsFull + 4 chunkSubOrigin + 4 chunkSubSize
 //   + 4 dataOriginTexFrac + 4 dataSizeTexFrac + 4 rayStepTexVox
 // Still rounds up to the same 512-byte alignedRenderSize (UNIFORM_ALIGNMENT 256),

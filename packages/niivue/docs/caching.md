@@ -12,9 +12,9 @@ Companion docs: `high-res-streaming.md` (how the chunked path works),
 already grades our scheduler and budgets as partial),
 `streaming-todos.md` (the open work list this doc feeds).
 
-**Status:** Stages A, B, C, D and G have landed (2026-08-25).
-Sections 2.2, 2.4, 2.5, 2.6, 2.7 and the stage table below describe what
-changed; E and F are still open. Section 2.5 is the measured answer to the
+**Status:** Stages A, B, C, D, E and G have landed (2026-08-25).
+Sections 2.2, 2.3, 2.4, 2.5, 2.6, 2.7 and the stage table below describe what
+changed; only F is still open. Section 2.5 is the measured answer to the
 question this doc was written to ask, and it moved two items up the list.
 Section 2.6 retires stage G: the byte cache turned out to be sized correctly,
 and the finding that said otherwise was a misreading of section 2.5's numbers.
@@ -175,20 +175,55 @@ The shape of the fix was NVSlide's `_wanted` discipline ported down into
 `ChunkResidencyManager`: pure CPU bookkeeping, unit-tested with no GPU, and it
 landed in both backends at once because the manager is shared.
 
-### 2.3 Eviction demotes; ours destroys
+### 2.3 Eviction demotes; ours destroyed (DONE, stage E)
 
 In Neuroglancer a chunk evicted from GPU memory falls back to system memory
 rather than disappearing, so bringing it back is a re-upload. For us, eviction
-calls `destroy` and the brick is gone: showing it again costs fetch, decode,
-AND upload. The only thing that survives is its compressed bytes in the store
-LRU, and only if they have not been evicted there too.
+called `destroy` and the brick was gone: showing it again cost fetch, decode,
+AND upload. The only thing that survived was its compressed bytes in the store
+LRU, and only if they had not been evicted there too.
 
-Worth being honest about the shape of this: a decoded-chunk CPU tier is bytes
-we are choosing to hold in JS heap, and browsers are less forgiving about that
-than about GPU memory. The version I would build is a small decoded tier sized
-as a fraction of the GPU budget, holding only chunks evicted from GPU (not
-every chunk ever decoded), so it is a demotion buffer rather than a second
-full cache.
+Stage E adds the tier (`src/volume/decodedChunkCache.ts`). It holds the DECODED
+source bytes for a chunk, exactly what the uploader's `fetchBytes` returns, so a
+hit costs a texture upload and nothing else. Given 2.6, where the byte cache
+already avoids most of the network, the decode is the part this actually saves,
+and 2.5 measured the decode as the expensive part.
+
+Designing it corrected the plan this doc originally carried. "Hold only chunks
+evicted from GPU, not every chunk ever decoded" is not implementable: to have an
+evicted chunk's bytes you must still be holding them at the moment of eviction,
+which means holding them throughout its GPU residency. A tier that drops a
+chunk's bytes on upload has nothing left to demote later. So the tier shadows
+the resident set by construction, and the honest question is not how to avoid
+the shadow but what it costs.
+
+It costs less than the framing suggested, because a chunk is much narrower on
+the CPU than on the GPU. A resident chunk carries an RGBA8 color texture plus an
+RGBA8 gradient, 8 bytes per voxel; its source is 1 to 4. Shadowing the whole
+resident set is therefore an eighth to a half of the GPU budget in JS heap, so
+`decodedTierBudgetBytes` sizes the tier at that shadow plus a 50% tail, capped
+at 384 MiB. The size tracks the datatype rather than being a flat fraction of
+the GPU budget, since a uint8 volume shadows for an eighth of what a float32
+volume costs. The tail is the part that pays: it is what a scrub finds when it
+turns around.
+
+Eviction is plain LRU, which is what that structure wants. The newest entries
+are the chunks still on the GPU, whose copies cost nothing to lose, and the
+oldest are the chunks evicted longest ago, which a reversal reaches last. So
+dropping from the old end keeps precisely the frontier the view is about to
+cross back over, and the reversal depth the tier buys is its slot count minus
+the GPU's.
+
+One win fell out of where the tier lives. It is owned by the renderer's cache
+entry rather than the uploader, because it holds SOURCE bytes and only the
+orient output depends on the colormap and window. A colormap or window change
+rebuilds the uploader and re-streams every chunk; that re-stream is now uploads
+rather than fetches. A multi-LOD plan swap re-keys the tier with the same
+`matchChunksByContent` map the residency manager uses, so a refocus back to a
+level finds its bricks.
+
+The HUD gains a `decoded tier` row next to `byte cache`, and
+`chunkStreamStats().decoded` carries the counters.
 
 ### 2.4 Prefetch is predictive, ours is pipeline lookahead (DONE, stage D)
 
@@ -455,7 +490,7 @@ Two places we can be BETTER than Neuroglancer rather than catching up:
 | G | DONE Hit / miss / eviction counters on `ByteLruCache`, exposed as `source.byteCache.stats` | small | Measured (2.6): zero evictions on a 1 TB store, so no budget or policy change was needed |
 | C | DONE Worker pool for chunk fetch + decode (`omeZarrChunkWorkerPool.ts`, `workers/omeZarrChunk.worker.ts`) | medium | Measured (2.7): the 8.6 s of lost frame time is gone, 100% of streaming work is off-thread |
 | D | DONE (`1281a74b`) Directional prefetch: travel of the working-set centroid, extrapolated and fetched ahead (`chunkPrediction.ts`) | small | One mechanism covers scrub and pan, no camera plumbing, identical on both backends |
-| E | Decoded-chunk demotion tier under GPU eviction | medium | Makes eviction cheap to undo; sized off the GPU budget |
+| E | DONE Decoded-chunk demotion tier under GPU eviction (`decodedChunkCache.ts`) | medium | Makes eviction cheap to undo; sized off the GPU budget and the source datatype |
 | F | Persistent cache (Cache Storage / OPFS) | medium | The differentiator; warm starts across reloads |
 
 A, B, G and C are done. A and B were the two that make every later stage
@@ -470,7 +505,13 @@ D followed and attacked a cost C did not touch, since a worker pool moves the
 decode but does not avoid it. Its one surprise was that the demo cannot easily
 show it working: see the verification note at the end of 2.4.
 
-What remains is E and F: soften eviction, then persist.
+E then removed the decode altogether for a brick the GPU had already seen, and
+corrected the design this doc had sketched for it (2.3): the tier cannot hold
+only evicted chunks, it must shadow the resident set, and the reason that is
+affordable is the 8-bytes-on-GPU against 1-to-4-on-CPU ratio rather than any
+cleverness about what to admit.
+
+What remains is F: persist.
 
 ## 5. Known gaps not covered above
 

@@ -149,9 +149,32 @@ Full comparison against Neuroglancer, with the staged plan: **`docs/caching.md`*
       Not yet predicted: crossing a level boundary during a zoom. The plan swap
       resets the predictor, which is correct but conservative.
 
-- [ ] Demote on eviction instead of destroying. An evicted brick currently costs
-      a full fetch + decode + upload to bring back; a small decoded tier sized
-      off the GPU budget, holding only evicted chunks, makes it a re-upload.
+- [x] Demote on eviction instead of destroying. An evicted brick used to cost a
+      full fetch + decode + upload to bring back; `src/volume/decodedChunkCache.ts`
+      holds its decoded source bytes so the return is a re-upload. With the byte
+      cache already avoiding most of the network (see `caching.md` 2.6), the
+      decode is what this saves.
+
+      The plan said "holding only evicted chunks", which is not implementable:
+      to have an evicted chunk's bytes you must still hold them when it is
+      evicted, so the tier necessarily shadows the resident set. It is
+      affordable because a resident chunk is 8 bytes per voxel on the GPU
+      (RGBA8 color + RGBA8 gradient) against 1 to 4 on the CPU, so
+      `decodedTierBudgetBytes` sizes the tier at that shadow plus a 50% tail,
+      scaled by the source datatype and capped at 384 MiB. Eviction is plain
+      LRU: the newest entries are the chunks still resident and the oldest are
+      the chunks evicted longest ago, so dropping from the old end keeps exactly
+      the frontier a reversal crosses back over.
+
+      The tier belongs to the renderer's cache entry, not the uploader, so it
+      also turns a colormap or window change from a full re-fetch into a
+      re-upload (only the orient output depends on those), and it is re-keyed
+      through a multi-LOD plan swap by the same content match the residency
+      manager uses.
+
+      Still to measure: the same demo-preset gap as stage D above. A store whose
+      plan exceeds the residency budget is needed before the `decoded tier` HUD
+      row reads anything but 0 hits.
 
 - [ ] Persistent cross-session cache (Cache Storage or OPFS). Every tier we have
       dies on reload. For DANDI over S3 this is the most visible improvement

@@ -36,6 +36,7 @@ const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || `http://${HOST}:${PORT}`
 const FIXTURES_DIR =
   process.env.FIXTURES_DIR || path.resolve(__dirname, '..', 'fixtures')
 const OMEZARR_FIXTURES_DIR = path.join(FIXTURES_DIR, 'omezarr')
+const ALLEN_FIXTURES_DIR = path.join(FIXTURES_DIR, 'allen')
 
 interface NiivuePackage {
   name: string
@@ -144,6 +145,15 @@ async function main(): Promise<void> {
     )
   }
 
+  // Raw Allen JSON+PNG atlas files (fetch-allen output). The live Allen host
+  // sends no CORS headers, so browser demos of the library's atlas loader
+  // (e.g. niivue's allen.atlas.html) can only fetch the format from this
+  // local mirror; the global cors() above is what makes that possible.
+  if (fs.existsSync(ALLEN_FIXTURES_DIR)) {
+    console.log(`Mounting Allen atlas fixtures from ${ALLEN_FIXTURES_DIR}`)
+    app.use('/allen', express.static(ALLEN_FIXTURES_DIR))
+  }
+
   if (NIIVUE_DIST) {
     console.log(`Mounting niivue dist from ${NIIVUE_DIST}`)
     app.use(
@@ -222,6 +232,16 @@ async function main(): Promise<void> {
         format: v.format,
         shape: v.shape,
         dtype: v.dtype,
+        // Voxel size in the source's own units — a microscopy client shows
+        // um/voxel, and fetching it per volume would be a request each.
+        spacing: v.spacing,
+        // Null on a single-channel source. When set, several entries came
+        // from one file and `dataset` is the key that groups them back
+        // together (ids cannot be split reliably: a channel name may itself
+        // contain an underscore).
+        channel: v.channel,
+        channelName: v.channelName,
+        dataset: v.dataset,
         levels: v.levels,
         manifest: `${PUBLIC_BASE_URL}/iiif/presentation/${v.id}/manifest`,
         raw: `${PUBLIC_BASE_URL}/volumes/${v.id}/raw`,

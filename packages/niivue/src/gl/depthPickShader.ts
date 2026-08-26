@@ -113,15 +113,27 @@ void main() {
       }
     }
   }
-  // --- Overlay depth pick (no clip plane) ---
+  // --- Overlay depth pick. Overlays ignore the clip plane by default, but
+  // when clipPlaneOverlay is set the RENDER clips them with the base (solid
+  // keeps [sampleRange.x, sampleRange.y], cutaway skips it; see
+  // renderShader.ts clipPassSkip). The pick must march the same clipped ray,
+  // or a double-click lands on invisible cut-away voxels in front of the
+  // plane. Gate on hasClip, matching the render. ---
   float overDepth = 1.0;
   bool overHit = false;
+  bool clipOverlay = (clipPlaneOverlay > 0.5) && hasClip;
   if (numVolumes > 1.0) {
     vec4 overSamplePos = vec4(origStart + dir * (stepSize * origRan), stepSize * origRan);
     vec4 overSamplePosStart = overSamplePos;
     // Overlay fast pass
     for (int oj = 0; oj < 1024; oj++) {
       if (overSamplePos.a > origLen) { break; }
+      if (clipOverlay && !cutaway && overSamplePos.a > sampleRange.y) { break; }
+      bool ovInRange = overSamplePos.a >= sampleRange.x && overSamplePos.a <= sampleRange.y;
+      if (clipOverlay && (cutaway ? ovInRange : !ovInRange)) {
+        overSamplePos += deltaDirFast;
+        continue;
+      }
       float alpha = texture(overlay, overSamplePos.xyz).a;
       if (alpha >= 0.01) { break; }
       overSamplePos += deltaDirFast;
@@ -132,6 +144,12 @@ void main() {
       // Overlay fine pass
       for (int oi = 0; oi < 2048; oi++) {
         if (overSamplePos.a > origLen) { break; }
+        if (clipOverlay && !cutaway && overSamplePos.a > sampleRange.y) { break; }
+        bool ovInRange = overSamplePos.a >= sampleRange.x && overSamplePos.a <= sampleRange.y;
+        if (clipOverlay && (cutaway ? ovInRange : !ovInRange)) {
+          overSamplePos += deltaDir;
+          continue;
+        }
         float alpha = texture(overlay, overSamplePos.xyz).a;
         if (alpha >= 0.01) {
           overDepth = frac2ndc(overSamplePos.xyz);

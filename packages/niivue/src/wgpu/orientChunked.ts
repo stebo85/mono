@@ -125,6 +125,11 @@ function writeIdentityOrientUniforms(
   for (let i = 0; i < 16; i++)
     dv.setFloat32(112 + i * 4, IDENTITY_MAT4[i], true)
   dv.setFloat32(176, 0, true)
+  // atlasOutline probes neighbours in the SOURCE texture; a chunk's texture is
+  // a tile of the volume, so probes at a chunk seam would read the neighbouring
+  // chunk's edge and draw a spurious border. Outlining is therefore off for the
+  // chunked path.
+  dv.setFloat32(180, 0, true)
   device.queue.writeBuffer(uniformBuffer, 0, ab)
 }
 
@@ -167,7 +172,7 @@ async function createColormapResources(
   }
   const colormapTexture = await wgpu.lutBytes2texture(
     device,
-    NVCmaps.lutrgba8(nvimage.colormap),
+    NVCmaps.lutrgba8(nvimage.colormap, nvimage.isColormapInverted),
   )
   const hasNegativeColormap = !!(
     nvimage.colormapNegative && nvimage.colormapNegative.length > 0
@@ -175,7 +180,7 @@ async function createColormapResources(
   const negativeColormapTexture = hasNegativeColormap
     ? await wgpu.lutBytes2texture(
         device,
-        NVCmaps.lutrgba8(nvimage.colormapNegative),
+        NVCmaps.lutrgba8(nvimage.colormapNegative, nvimage.isColormapInverted),
       )
     : colormapTexture
   return {

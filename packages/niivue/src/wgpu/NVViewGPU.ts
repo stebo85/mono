@@ -771,6 +771,9 @@ export default class NVView {
     // (entry creation, request, pump) so chunk uploaders can skip the gradient
     // pass when unlit. Matches the gradientAmount passed to the volume draw.
     this.volumeRenderer.gradientAmount = md.volume.illumination
+    // Composite (OVER) vs maximum-intensity projection, for every volume pass this
+    // frame (base, overlay, PAQD, drawing, and the independent hi-res overlay cube).
+    this.volumeRenderer.renderMode = md.volume.renderMode
     markCpuStart()
     // Phase 3d: advance the chunk-residency LRU clock before the tile loop
     // requests this frame's working set, so eviction protects visible chunks.
@@ -1116,6 +1119,7 @@ export default class NVView {
             overlayAlphaShader: md.volume.alphaShader,
             overlayOutlineWidth: md.volume.outlineWidth,
             isAlphaClipDark: md.volume.isAlphaClipDark,
+            isColormapAlphaOn2D: md.volume.isColormapAlphaOn2D,
             drawRimOpacity: md.draw.rimOpacity,
             isV1SliceShader: md.volume.isV1SliceShader,
           }
@@ -2705,7 +2709,20 @@ export default class NVView {
           volumeTexture.depthOrArrayLayers,
         ]
         const zeroPaqdUniforms = [0, 0, 0, 0]
-        const renderParamPadding = [0, 0, 0, 0, 0, 0, 0]
+        // The 7 floats after earlyTermination: clipPlaneOverlay, fadeAlpha,
+        // renderMode, then _pad0 + implicit struct padding. clipPlaneOverlay
+        // must carry the LIVE flag — the pick shader clips its overlay pass
+        // with it, and a zero here made picks land on cut-away overlay voxels
+        // (WebGL2 sets the same uniform by name in drawDepthPick).
+        const renderParamPadding = [
+          md.scene.clipPlaneOverlay ? 1.0 : 0.0,
+          1.0, // fadeAlpha: no cross-fade in a pick draw
+          0,
+          0,
+          0,
+          0,
+          0,
+        ]
         const identityChunkUniforms = [
           ...volumeTexDimsFull,
           1,

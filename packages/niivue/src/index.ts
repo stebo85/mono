@@ -57,6 +57,7 @@ export {
   NiiDataType,
   SHOW_RENDER,
   SLICE_TYPE,
+  VOLUME_RENDER_MODE,
 } from './NVConstants'
 export { default, default as NiiVue } from './NVControl'
 // Document save options (settings policy + linkData)
@@ -198,6 +199,23 @@ export { axialPlaneTransform, slidePlaneTiles } from './slide/slidePlane'
 export type { SlideVectorKind, SlideVectorShape } from './slide/slideVector'
 export { SlideVectorLayer } from './slide/slideVector'
 export { buildDrawingLut, drawingBitmapToRGBA } from './view/NVDrawingTexture'
+// Allen "volume-viewer" JSON + PNG atlas datasets (multi-channel microscopy)
+export {
+  type AllenAtlasImage,
+  type AllenAtlasInfo,
+  allenAtlasSpacing,
+  allenAtlasVolumeDims,
+  deinterleaveAllenAtlasPlane,
+  findAllenAtlasChannel,
+  parseAllenAtlasInfo,
+} from './volume/allenAtlas'
+export {
+  type AllenAtlasLoadOptions,
+  allenAtlasChannelColormap,
+  allenAtlasChannelFile,
+  fetchAllenAtlasInfo,
+  loadAllenAtlasVolumes,
+} from './volume/allenAtlasLoader'
 // UIKit overlay lifecycle hook — the seam @niivue/uikit widgets draw into
 export type {
   UIKitBackendHandle,
@@ -211,6 +229,11 @@ export type {
   ChunkedVolumeLevel,
   ChunkedVolumeSource,
 } from './volume/ChunkedVolumeSource'
+// OME-TIFF and plain TIFF stacks (multi-channel microscopy)
+export {
+  CHANNEL_COLORMAPS,
+  channelColormapFor,
+} from './volume/channelColormaps'
 export type {
   ChunkPlan,
   MultiLodFocus,
@@ -230,9 +253,95 @@ export {
 // (e.g. wrapping segmentation labels into an overlay NVImage)
 export { nii2volume, writeVolume } from './volume/NVVolume'
 export {
+  type ImageJStackInfo,
+  type OmeChannel,
+  type OmeTiffInfo,
+  omeChannelName,
+  omeLengthToMicrons,
+  omePlaneCount,
+  omePlaneIndex,
+  parseImageJDescription,
+  parseOmeColor,
+  parseOmeXml,
+} from './volume/omeTiff'
+export {
+  fetchOmeTiff,
+  loadOmeTiffVolumes,
+  type OmeTiffLoadOptions,
+  omeTiffChannelColormap,
+  omeTiffChannelFile,
+  omeTiffVolumesFrom,
+} from './volume/omeTiffLoader'
+// OME-Zarr (OME-NGFF) multiscale microscopy stores
+export {
+  type OmeZarrAxis,
+  type OmeZarrAxisIndices,
+  type OmeZarrChannel,
+  type OmeZarrDataset,
+  type OmeZarrInfo,
+  type OmeZarrSpatialOrder,
+  type OmeZarrWindow,
+  omeZarrAxisIndices,
+  omeZarrResolveAxes,
+  omeZarrSpatialOrder,
+  omeZarrSpatialScaleUm,
+  parseOmeroColor,
+  parseOmeZarrAttrs,
+} from './volume/omeZarr'
+// OME-Zarr chunk-streaming adapter for nv.loadChunkedVolume
+export {
+  ByteLruCache,
+  type FetchOmeZarrChunkedSourceOptions,
+  fetchOmeZarrChunkedSource,
+  OME_ZARR_CHUNK_CACHE_BYTES,
+  type OmeZarrChunkedSource,
+  type OmeZarrChunkedSourceOptions,
+  omeZarrChunkedSource,
+} from './volume/omeZarrChunkedSource'
+export {
+  defaultOmeZarrLevel,
+  fetchOmeZarr,
+  loadOmeZarrVolumes,
+  OME_ZARR_LEVEL_BUDGET_BYTES,
+  type OmeZarrLevel,
+  type OmeZarrLoadOptions,
+  type OmeZarrSource,
+  type OpenOmeZarrOptions,
+  omeZarrBlockToDisplay,
+  omeZarrChannelColormap,
+  omeZarrChannelCount,
+  omeZarrChannelFile,
+  omeZarrChannelName,
+  omeZarrNiftiDatatype,
+  omeZarrVolumesFrom,
+  openOmeZarr,
+} from './volume/omeZarrLoader'
+export {
   createStreamingNVImage,
   type StreamingVolumeSpec,
 } from './volume/streamingVolume'
+export {
+  parseTiff,
+  readTiffImage,
+  type TiffFile,
+  type TiffIfd,
+  type TiffImage,
+  tiffImageDescription,
+  tiffResolutionMm,
+} from './volume/tiff'
+export {
+  describeTiff,
+  readTiffVolume,
+  type TiffSource,
+  type TiffVolume,
+  type TiffVolumeSelection,
+  tiffChannelCount,
+  tiffChannelName,
+  tiffIsTiled,
+  tiffPlaneIndices,
+  tiffTimepointCount,
+  tiffVolumeAffine,
+} from './volume/tiffVolume'
 // Transform types
 export type {
   OptionField,

@@ -1,5 +1,6 @@
 node_modules/
 .nx/
+.repo-graph/
 .pixi/
 dist/
 _site/

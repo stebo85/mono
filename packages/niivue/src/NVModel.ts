@@ -300,6 +300,9 @@ export default class NVModel {
       ...(options.volumeIsAlphaClipDark !== undefined && {
         isAlphaClipDark: options.volumeIsAlphaClipDark,
       }),
+      ...(options.volumeIsColormapAlphaOn2D !== undefined && {
+        isColormapAlphaOn2D: options.volumeIsColormapAlphaOn2D,
+      }),
       ...(options.volumeIsNearestInterpolation !== undefined && {
         isNearestInterpolation: options.volumeIsNearestInterpolation,
       }),
@@ -314,6 +317,9 @@ export default class NVModel {
       }),
       ...(options.volumeTransmittanceCutoff !== undefined && {
         transmittanceCutoff: options.volumeTransmittanceCutoff,
+      }),
+      ...(options.volumeRenderMode !== undefined && {
+        renderMode: options.volumeRenderMode,
       }),
     }
     // Mesh — flat options mapped to mesh group
@@ -666,6 +672,7 @@ export default class NVModel {
         min: isZeroBased ? 0 : v.calMin,
         max: v.calMax,
         thresholdMin: isZeroBased ? v.calMin : undefined,
+        isInverted: v.isColormapInverted,
       })
       if (v.colormapNegative) {
         const [negThresh, negMaxColor] = resolveNegativeRange(
@@ -680,6 +687,7 @@ export default class NVModel {
           max: negMaxColor,
           thresholdMin: isZeroBased ? negThresh : undefined,
           isNegative: true,
+          isInverted: v.isColormapInverted,
         })
       }
     }

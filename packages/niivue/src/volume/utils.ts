@@ -439,7 +439,7 @@ export function hdrToArrayBuffer(
   hdr: NIFTIHeader,
   isDrawing8 = false,
   isInputEndian = false,
-): Uint8Array {
+): Uint8Array<ArrayBuffer> {
   const SHORT_SIZE = 2
   const FLOAT32_SIZE = 4
   let isLittleEndian = true
@@ -551,9 +551,11 @@ export function createNiftiArray(
   dims: number[] = [256, 256, 256],
   pixDims: number[] = [1, 1, 1],
   affine: number[] = [1, 0, 0, -128, 0, 1, 0, -128, 0, 0, 1, -128, 0, 0, 0, 1],
-  datatypeCode = NiiDataType.DT_UINT8,
+  // Annotated: without it the default narrows the parameter to the DT_UINT8
+  // literal, so a caller computing a datatype at runtime cannot pass it.
+  datatypeCode: number = NiiDataType.DT_UINT8,
   img: TypedVoxelArray | Uint8Array = new Uint8Array(),
-): Uint8Array {
+): Uint8Array<ArrayBuffer> {
   const hdr = createNiftiHeader(dims, pixDims, affine, datatypeCode)
   const hdrBytes = hdrToArrayBuffer(hdr, false)
 

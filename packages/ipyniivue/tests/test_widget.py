@@ -27,6 +27,11 @@ def test_non_json_serializable_loader_hook_is_not_exposed() -> None:
     assert not hasattr(NiiVue, "use_loader")
 
 
+def test_non_json_serializable_overlay_hooks_are_not_exposed() -> None:
+    assert not hasattr(NiiVue, "register_overlay_renderer")
+    assert not hasattr(NiiVue, "unregister_overlay_renderer")
+
+
 def test_binary_response_payload_decodes_to_bytes() -> None:
     payload = {
         "__ipyniivue_binary__": True,

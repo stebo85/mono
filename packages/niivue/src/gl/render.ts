@@ -36,7 +36,11 @@ import {
   type Vec3i,
 } from '@/volume/chunking'
 import { buildModulationParams } from '@/volume/modulation'
-import { chunkOverlayMatrix, extractChunkBytes } from '@/volume/orientChunked'
+import {
+  chunkedDisplayKey,
+  chunkOverlayMatrix,
+  extractChunkBytes,
+} from '@/volume/orientChunked'
 import * as depthPickShader from './depthPickShader'
 import * as gradient from './gradient'
 import {
@@ -147,6 +151,12 @@ interface ChunkedTexEntry {
   /** On-demand uploader the streaming pump drives to fill the manager. */
   uploader: ChunkUploaderGL
   plan: ChunkPlan
+  /**
+   * chunkedDisplayKey at uploader creation. Resident chunk textures bake the
+   * colormap/window this key captures, so a mismatch on updateVolume forces an
+   * uploader rebuild + full re-stream (see _ensureChunkedVolumeEntry).
+   */
+  displayKey: string
 }
 
 type TexCacheEntry = SingleTexEntry | ChunkedTexEntry
@@ -245,6 +255,9 @@ export class VolumeRenderer extends NVRenderer {
   // Scene flag (set per-frame from md.scene): clip the overlay/PAQD/drawing passes
   // with the base volume instead of letting them ignore the clip plane.
   clipPlaneOverlay = false
+  // Volume flag (set per-frame from md.volume.renderMode): 0 = composite (OVER),
+  // 1 = maximum-intensity projection. See VOLUME_RENDER_MODE.
+  renderMode = 0
   // Coarse whole-volume "floor" texture for the active base, drawn behind the
   // resident fine chunks on 2D slices so a deep-zoom slice never blanks while
   // finer chunks stream. Oriented once from a coarse pyramid level the app
@@ -647,9 +660,30 @@ export class VolumeRenderer extends NVRenderer {
       )
     }
     const cacheKey = vol.url || vol.name
+    const displayKey = chunkedDisplayKey(vol)
     const existing = cacheKey ? this._texCache.get(cacheKey) : undefined
     if (existing && existing.kind === 'chunked') {
       existing.volume = vol
+      if (existing.displayKey !== displayKey) {
+        // Colormap/window/frame changed after load. Resident chunk textures
+        // bake the old state, so rebuild the uploader (recaptures the 4D frame
+        // window) and re-stream: evict everything, then admit chunk 0 with the
+        // new state so the volume stays present while the working set refills —
+        // the same drop-and-refill mechanism as _refreshUnlitChunksForLighting.
+        existing.displayKey = displayKey
+        const newUploader = createChunkUploaderGL(
+          gl,
+          vol,
+          existing.plan,
+          () => this.gradientAmount > 0,
+        )
+        existing.uploader.dispose()
+        existing.uploader = newUploader
+        existing.manager.remap(new Map(), existing.plan.chunks.length)
+        const chunk0 = await existing.uploader.uploadChunk(0)
+        if (!chunk0.hasGradient) this._uploadedUnlit = true
+        existing.manager.admit(0, chunk0)
+      }
       return existing
     }
     if (existing) this._destroyTexEntry(gl, existing)
@@ -667,6 +701,7 @@ export class VolumeRenderer extends NVRenderer {
         () => this.gradientAmount > 0,
       ),
       plan,
+      displayKey,
     }
     entry.manager = new ChunkResidencyManager<VolumeChunkGL>(
       plan.chunks.length,
@@ -715,6 +750,7 @@ export class VolumeRenderer extends NVRenderer {
     entry.manager.remap(oldToNew, newPlan.chunks.length)
     entry.plan = newPlan
     entry.volume = vol
+    entry.displayKey = chunkedDisplayKey(vol)
     vol.chunkPlan = newPlan
     if (entry.manager.residentCount === 0) {
       const chunk0 = await entry.uploader.uploadChunk(0)
@@ -1976,6 +2012,8 @@ export class VolumeRenderer extends NVRenderer {
       )
     if (shader.uniforms.overlayLayerMode)
       gl.uniform1f(shader.uniforms.overlayLayerMode, 0.0)
+    if (shader.uniforms.renderMode)
+      gl.uniform1f(shader.uniforms.renderMode, this.renderMode)
     // Default fully present; the chunk loop overrides per fading chunk.
     if (shader.uniforms.fadeAlpha) gl.uniform1f(shader.uniforms.fadeAlpha, 1.0)
     if (shader.uniforms.paqdUniforms)
@@ -2066,6 +2104,16 @@ export class VolumeRenderer extends NVRenderer {
     // against each other, or a chunk behind an already-drawn chunk is
     // rejected and its contribution is lost. Restored to LESS after the loop.
     gl.depthFunc(gl.ALWAYS)
+    // MIP: merge chunk draws (and the overlay entry's draws over the base) by
+    // component-wise max instead of OVER — each cube emits its ray segment's
+    // premultiplied maximum and the shader's own per-layer MIP rule is also
+    // max, so MAX blending reconstructs the true full-ray maximum independent
+    // of chunk draw order (OVER would let a high-alpha near chunk occlude a
+    // brighter voxel in a farther chunk). Assumes a black tile behind the cube
+    // (the classic MAX-blend MIP convention); non-chunked MIP composites OVER.
+    // GL_MAX ignores the blend factors. Restored to FUNC_ADD after the loop.
+    const mip = this.renderMode > 0.5
+    if (mip) gl.blendEquation(gl.MAX)
     const explode = entry.volume.chunkExplode
     const order = chunksBackToFront(
       entry.plan,
@@ -2223,6 +2271,7 @@ export class VolumeRenderer extends NVRenderer {
       }
       gl.drawElements(gl.TRIANGLE_STRIP, indexCount, gl.UNSIGNED_SHORT, 0)
     }
+    if (mip) gl.blendEquation(gl.FUNC_ADD)
     gl.depthFunc(gl.LESS)
   }
 
@@ -2320,6 +2369,8 @@ export class VolumeRenderer extends NVRenderer {
       )
     if (shader.uniforms.overlayLayerMode)
       gl.uniform1f(shader.uniforms.overlayLayerMode, 1.0)
+    if (shader.uniforms.renderMode)
+      gl.uniform1f(shader.uniforms.renderMode, this.renderMode)
     if (shader.uniforms.paqdUniforms)
       gl.uniform4fv(shader.uniforms.paqdUniforms, paqdUniforms as number[])
     if (shader.uniforms.earlyTermination)

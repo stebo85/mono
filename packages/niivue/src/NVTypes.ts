@@ -157,6 +157,13 @@ export type NVImage = {
   maxShearDeg?: number
   colormap?: string
   colormapNegative?: string
+  /**
+   * Reverse this volume's colormap (and its negative colormap, when set), so
+   * the color at the top of the intensity range moves to the bottom. Applied
+   * where the LUT is built, so it affects 2D slices, the 3D ray-march, and the
+   * colorbar alike. Default: false.
+   */
+  isColormapInverted?: boolean
   calMinNeg?: number
   calMaxNeg?: number
   colormapType?: number
@@ -181,6 +188,16 @@ export type NVImage = {
   id?: string
   /** Label colormap for atlas/parcellation volumes (compiled LUT with optional text labels) */
   colormapLabel?: LUT | null
+  /**
+   * Draw this label/atlas volume as region outlines instead of filled regions.
+   * 0 (default) fills. A positive value is the neighbour probe distance in the
+   * volume's own voxels: a voxel survives only when one of its six neighbours
+   * carries a different label, so interiors become transparent and the anatomy
+   * underneath shows through. Applied in the orient prepass, so it reaches 2D
+   * slices and the 3D ray-march on both backends. Ignored unless
+   * {@link colormapLabel} is set. See {@link NiiVue.setAtlasOutline}.
+   */
+  atlasOutline?: number
   /** Whether this volume has imaginary data (complex) */
   isImaginary?: boolean
   /**
@@ -288,6 +305,8 @@ export type ColorbarInfo = {
   max: number
   thresholdMin?: number
   isNegative?: boolean
+  /** Draw the colormap reversed, matching a volume's `isColormapInverted`. */
+  isInverted?: boolean
 }
 
 // ============================================================
@@ -650,11 +669,25 @@ export type VolumeRenderConfig = {
   alphaShader: number
   isBackgroundMasking: boolean
   isAlphaClipDark: boolean
+  /**
+   * Honour the background volume's per-voxel colormap alpha on 2D slices.
+   * The 3D ray-march always uses it; 2D slices historically replaced it with
+   * the flat volume opacity, so a colormap that carries structure in alpha
+   * (constant RGB with a ramped A, as fluorescence palettes use) rendered as
+   * a flat wash and COLORMAP_TYPE's below-threshold fade had no effect on the
+   * background. Off by default: many built-in colormaps ramp alpha, so
+   * enabling it unconditionally would change standard neuro rendering.
+   * Overlays are unaffected either way (the orient prepass already bakes
+   * their alpha, and the slice shader blends it).
+   */
+  isColormapAlphaOn2D: boolean
   isNearestInterpolation: boolean
   isV1SliceShader: boolean
   matcap: string
   paqdUniforms: [number, number, number, number]
   transmittanceCutoff: number
+  /** How the 3D ray-march combines samples. VOLUME_RENDER_MODE.COMPOSITE | MAXIMUM */
+  renderMode: number
 }
 
 /** Mesh rendering config: global settings for mesh display */
@@ -911,11 +944,15 @@ export type NiiVueOptions = {
   volumeAlphaShader?: number
   volumeIsBackgroundMasking?: boolean
   volumeIsAlphaClipDark?: boolean
+  /** Honour the background volume's colormap alpha on 2D slices (default false) */
+  volumeIsColormapAlphaOn2D?: boolean
   volumeIsNearestInterpolation?: boolean
   volumeIsV1SliceShader?: boolean
   volumeMatcap?: string
   volumePaqdUniforms?: [number, number, number, number]
   volumeTransmittanceCutoff?: number
+  /** VOLUME_RENDER_MODE.COMPOSITE (default) | MAXIMUM */
+  volumeRenderMode?: number
 
   // Mesh (prefixed)
   meshXRay?: number
@@ -1056,6 +1093,10 @@ export type ImageFromUrlOptions = {
   colormap?: string
   /** Colormap for negative intensities */
   colormapNegative?: string
+  /** Reverse the colormap (and the negative colormap, when set). Default: false */
+  isColormapInverted?: boolean
+  /** Outline width for a label/atlas volume, in its own voxels (default 0 = filled) */
+  atlasOutline?: number
   /** Minimum intensity for negative color mapping (default: NaN = symmetric) */
   calMinNeg?: number
   /** Maximum intensity for negative color mapping (default: NaN = symmetric) */

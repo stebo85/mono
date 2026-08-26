@@ -34,7 +34,11 @@ import {
   type Vec3i,
 } from '@/volume/chunking'
 import { buildModulationParams } from '@/volume/modulation'
-import { chunkOverlayMatrix, extractChunkBytes } from '@/volume/orientChunked'
+import {
+  chunkedDisplayKey,
+  chunkOverlayMatrix,
+  extractChunkBytes,
+} from '@/volume/orientChunked'
 import { MAX_TILES, UNIFORM_ALIGNMENT } from './mesh'
 import * as orient from './orient'
 import {
@@ -162,6 +166,12 @@ interface ChunkedTexEntry {
   plan: ChunkPlan
   /** Per-chunk cached bind group; null until built or after invalidation. */
   bindGroups: (GPUBindGroup | null)[]
+  /**
+   * chunkedDisplayKey at uploader creation. Resident chunk textures bake the
+   * colormap/window this key captures, so a mismatch on updateVolume forces an
+   * uploader rebuild + full re-stream (see _ensureChunkedVolumeEntry).
+   */
+  displayKey: string
 }
 
 type TexCacheEntry = SingleTexEntry | ChunkedTexEntry
@@ -265,6 +275,18 @@ export class VolumeRenderer extends NVRenderer {
    * depth-test against each other. Safe because meshes draw after the volume.
    */
   pipelineChunked: GPURenderPipeline | null
+  /**
+   * MIP variant of `pipelineChunked` — identical except the framebuffer blend
+   * is a component-wise `max`. Each chunked MIP cube draw emits its ray
+   * segment's premultiplied maximum (the shader's per-layer MIP rule is also
+   * `max`, see depthAwareMix), so maxing across the chunk draws reconstructs
+   * the full-ray MIP regardless of chunk order — OVER blending would let a
+   * high-alpha near chunk occlude a brighter voxel in a farther chunk.
+   * Limitation: the max also applies against the pre-existing framebuffer, so
+   * a chunked MIP assumes the tile behind the cube is black (the classic
+   * MAX-blend MIP convention); non-chunked MIP still composites OVER.
+   */
+  pipelineChunkedMip: GPURenderPipeline | null
   bindLayout: GPUBindGroupLayout | null
   bindGroup: GPUBindGroup | null
   matcapTexture: GPUTexture | null
@@ -303,6 +325,9 @@ export class VolumeRenderer extends NVRenderer {
   // Scene flag (set per-frame from md.scene): clip the overlay/PAQD/drawing passes
   // with the base volume instead of letting them ignore the clip plane.
   clipPlaneOverlay = false
+  // Volume flag (set per-frame from md.volume.renderMode): 0 = composite (OVER),
+  // 1 = maximum-intensity projection. See VOLUME_RENDER_MODE.
+  renderMode = 0
   private _matcapUrl: string | null = null
   private _bindTexVol: GPUTexture | null = null
   private _bindTexGrad: GPUTexture | null = null
@@ -382,6 +407,7 @@ export class VolumeRenderer extends NVRenderer {
     super()
     this.pipeline = null
     this.pipelineChunked = null
+    this.pipelineChunkedMip = null
     this.bindLayout = null
     this.bindGroup = null
     this.matcapTexture = null
@@ -589,48 +615,54 @@ export class VolumeRenderer extends NVRenderer {
       },
     })
 
-    this.pipelineChunked = device.createRenderPipeline({
-      layout: device.createPipelineLayout({
-        bindGroupLayouts: [this.bindLayout],
-      }),
-      multisample: { count: msaaCount },
-      vertex: {
-        module: shaderModule,
-        entryPoint: 'vertex_main',
-        buffers: [
-          {
-            arrayStride: 12,
-            attributes: [{ format: 'float32x3', offset: 0, shaderLocation: 0 }],
-          },
-        ],
-      },
-      fragment: {
-        module: shaderModule,
-        entryPoint: 'fragment_main',
-        targets: [
-          {
-            format: format,
-            blend: {
-              color: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha' },
-              alpha: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha' },
+    const chunkedBindLayout = this.bindLayout
+    const chunkedPipeline = (blend: GPUBlendState): GPURenderPipeline =>
+      device.createRenderPipeline({
+        layout: device.createPipelineLayout({
+          bindGroupLayouts: [chunkedBindLayout],
+        }),
+        multisample: { count: msaaCount },
+        vertex: {
+          module: shaderModule,
+          entryPoint: 'vertex_main',
+          buffers: [
+            {
+              arrayStride: 12,
+              attributes: [
+                { format: 'float32x3', offset: 0, shaderLocation: 0 },
+              ],
             },
-          },
-        ],
-      },
-      // depthCompare 'always' (vs 'less' above): the per-chunk cube draws
-      // composite back-to-front with OVER blending and must not depth-test
-      // against each other, or a chunk behind an already-drawn chunk is
-      // rejected and its contribution is lost.
-      depthStencil: {
-        depthWriteEnabled: true,
-        depthCompare: 'always',
-        format: this.depthFormat,
-      },
-      primitive: {
-        topology: 'triangle-strip',
-        stripIndexFormat: 'uint16',
-        cullMode: 'back',
-      },
+          ],
+        },
+        fragment: {
+          module: shaderModule,
+          entryPoint: 'fragment_main',
+          targets: [{ format: format, blend }],
+        },
+        // depthCompare 'always' (vs 'less' above): the per-chunk cube draws
+        // composite back-to-front with OVER blending and must not depth-test
+        // against each other, or a chunk behind an already-drawn chunk is
+        // rejected and its contribution is lost.
+        depthStencil: {
+          depthWriteEnabled: true,
+          depthCompare: 'always',
+          format: this.depthFormat,
+        },
+        primitive: {
+          topology: 'triangle-strip',
+          stripIndexFormat: 'uint16',
+          cullMode: 'back',
+        },
+      })
+    this.pipelineChunked = chunkedPipeline({
+      color: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha' },
+      alpha: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha' },
+    })
+    // MIP chunk draws merge by component-wise max (see the pipelineChunkedMip
+    // field doc). WebGPU requires 'one' blend factors with the max operation.
+    this.pipelineChunkedMip = chunkedPipeline({
+      color: { operation: 'max', srcFactor: 'one', dstFactor: 'one' },
+      alpha: { operation: 'max', srcFactor: 'one', dstFactor: 'one' },
     })
 
     this.isReady = true
@@ -800,9 +832,32 @@ export class VolumeRenderer extends NVRenderer {
       )
     }
     const cacheKey = vol.url || vol.name
+    const displayKey = chunkedDisplayKey(vol)
     const existing = cacheKey ? this._texCache.get(cacheKey) : undefined
     if (existing && existing.kind === 'chunked') {
       existing.volume = vol
+      if (existing.displayKey !== displayKey) {
+        // Colormap/window/frame changed after load. Resident chunk textures
+        // bake the old state (the uploader's LUT + orient uniforms are fixed at
+        // creation), so rebuild the uploader and re-stream: evict everything,
+        // then admit chunk 0 with the new state so the volume stays present
+        // while the working set refills — the same drop-and-refill mechanism as
+        // _refreshUnlitChunksForLighting.
+        existing.displayKey = displayKey
+        const newUploader = await createChunkUploaderGPU(
+          device,
+          vol,
+          existing.plan,
+          () => this.gradientAmount > 0,
+        )
+        existing.uploader.dispose()
+        existing.uploader = newUploader
+        existing.manager.remap(new Map(), existing.plan.chunks.length)
+        existing.bindGroups = existing.plan.chunks.map(() => null)
+        const chunk0 = await existing.uploader.uploadChunk(0)
+        if (!chunk0.hasGradient) this._uploadedUnlit = true
+        existing.manager.admit(0, chunk0)
+      }
       return existing
     }
     if (existing) this._destroyTexEntry(existing)
@@ -824,6 +879,7 @@ export class VolumeRenderer extends NVRenderer {
       uploader,
       plan,
       bindGroups: plan.chunks.map(() => null),
+      displayKey,
     }
     entry.manager = new ChunkResidencyManager<VolumeChunkGPU>(
       plan.chunks.length,
@@ -881,6 +937,7 @@ export class VolumeRenderer extends NVRenderer {
     entry.plan = newPlan
     entry.bindGroups = newPlan.chunks.map(() => null)
     entry.volume = vol
+    entry.displayKey = chunkedDisplayKey(vol)
     vol.chunkPlan = newPlan
     // Keep at least one chunk resident for the first post-swap frame; the pump
     // streams the rest from the next working set.
@@ -2372,6 +2429,7 @@ export class VolumeRenderer extends NVRenderer {
     if (
       !entry ||
       !this.pipelineChunked ||
+      !this.pipelineChunkedMip ||
       !this.paramsBuffer ||
       !this.vertexBuffer ||
       !this.indexBuffer ||
@@ -2440,7 +2498,13 @@ export class VolumeRenderer extends NVRenderer {
       volScale,
     )
 
-    pass.setPipeline(this.pipelineChunked)
+    // MIP: merge chunk draws (and the overlay entry's draws over the base) by
+    // component-wise max instead of OVER — matching the shader's own per-layer
+    // MIP rule (depthAwareMix), so the result is the true full-ray maximum
+    // independent of chunk draw order.
+    pass.setPipeline(
+      this.renderMode > 0.5 ? this.pipelineChunkedMip : this.pipelineChunked,
+    )
     pass.setVertexBuffer(0, this.vertexBuffer)
     pass.setIndexBuffer(this.indexBuffer, 'uint16')
 
@@ -2673,12 +2737,15 @@ export class VolumeRenderer extends NVRenderer {
         ...paqdUniforms,
         earlyTermination,
         // clipPlaneOverlay sits at WGSL offset 372 (the f32 immediately after
-        // earlyTermination); the following _pad0: vec3f aligns to 384. These 7
-        // floats advance the byte cursor 372 → 400 (to the next vec4f), unchanged.
+        // earlyTermination); the following _pad0: vec2f aligns to 384 and ends
+        // at 392, and the next vec4f aligns to 400. These 7 floats advance the
+        // byte cursor 372 → 400 (to that vec4f), unchanged.
         this.clipPlaneOverlay ? 1.0 : 0.0,
         // fadeAlpha (lane after clipPlaneOverlay): streaming cross-fade weight.
         fadeAlpha,
-        0,
+        // renderMode (offset 380): 0 = composite (OVER), 1 = maximum-intensity
+        // projection. Occupies what used to be implicit padding, so nothing moves.
+        this.renderMode,
         0,
         0,
         0,
@@ -2848,6 +2915,7 @@ export class VolumeRenderer extends NVRenderer {
     this.samplerNearest = null
     this.pipeline = null
     this.pipelineChunked = null
+    this.pipelineChunkedMip = null
     this.bindLayout = null
     this._bindTexVol = null
     this._bindTexGrad = null

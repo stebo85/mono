@@ -126,6 +126,10 @@ import type { ChunkedVolumeSource } from '@/volume/ChunkedVolumeSource'
 import { chunksOverlappingVoxelBox } from '@/volume/ChunkVisibility'
 import type { ChunkPlan } from '@/volume/chunking'
 import {
+  computeDescriptiveStats,
+  type DescriptiveStats,
+} from '@/volume/descriptives'
+import {
   computeModulationData,
   computeModulationWeights,
 } from '@/volume/modulation'
@@ -145,6 +149,7 @@ import {
   calculateWorldExtents,
   calMinMaxFrame,
   computeVolumeLabelCentroids,
+  getImageDataRAS,
   reorientDrawingToNative,
   volumeTR,
 } from '@/volume/utils'
@@ -1243,6 +1248,21 @@ export default class NiiVue extends EventTarget {
     this.drawScene()
   }
 
+  /**
+   * How the 3D ray-march combines the samples along each ray:
+   * `VOLUME_RENDER_MODE.COMPOSITE` (default, OVER) or
+   * `VOLUME_RENDER_MODE.MAXIMUM` (maximum-intensity projection). 2D slices draw
+   * a single plane and are unaffected.
+   */
+  get volumeRenderMode(): number {
+    return this.model.volume.renderMode
+  }
+  set volumeRenderMode(v: number) {
+    this.model.volume.renderMode = v
+    this.emit('change', { property: 'volumeRenderMode', value: v })
+    this.drawScene()
+  }
+
   get volumeOutlineWidth(): number {
     return this.model.volume.outlineWidth
   }
@@ -1277,6 +1297,55 @@ export default class NiiVue extends EventTarget {
     this.model.volume.isAlphaClipDark = v
     this.emit('change', { property: 'volumeIsAlphaClipDark', value: v })
     this.drawScene()
+  }
+
+  /**
+   * Honour the background volume's per-voxel colormap alpha on 2D slices,
+   * the way the 3D ray-march always has. Default false, because most neuro
+   * colormaps ramp alpha near the low end and would gain a fade they never
+   * had in 2D. Turn it on for a colormap that carries structure in alpha
+   * (constant RGB, ramped A) or to make COLORMAP_TYPE's below-threshold
+   * fade visible on the background in 2D.
+   */
+  get volumeIsColormapAlphaOn2D(): boolean {
+    return this.model.volume.isColormapAlphaOn2D
+  }
+  set volumeIsColormapAlphaOn2D(v: boolean) {
+    this.model.volume.isColormapAlphaOn2D = v
+    this.emit('change', { property: 'volumeIsColormapAlphaOn2D', value: v })
+    this.drawScene()
+  }
+
+  /**
+   * Draw label/atlas volumes as region outlines rather than filled regions.
+   *
+   * `outline` is the neighbour probe distance in the atlas's own voxels: 0 (the
+   * default) fills every region, 1 keeps a one-voxel border, larger values give
+   * a thicker border. Only the interior is dropped, so the parcellation stays
+   * readable over the anatomy underneath. Non-label volumes ignore it.
+   *
+   * Applies to every loaded label volume when `volumeIndex` is omitted, or to
+   * one volume when it is given. It is a per-volume property, so
+   * `setVolume(i, { atlasOutline })` and the load options reach it too.
+   *
+   * ```js
+   * nv1.setAtlasOutline(1)     // outline every atlas
+   * nv1.setAtlasOutline(0, 1)  // fill volume 1 again
+   * ```
+   */
+  setAtlasOutline(outline: number, volumeIndex?: number): void {
+    const val = Number.isFinite(outline) ? Math.max(0, outline) : 0
+    const volumes = this.model.getVolumes()
+    if (volumeIndex === undefined) {
+      for (const vol of volumes) vol.atlasOutline = val
+    } else {
+      if (!this._checkBounds(volumes, volumeIndex, 'Volume')) return
+      volumes[volumeIndex].atlasOutline = val
+    }
+    // The outline is baked by the orient prepass, so the textures must be
+    // rebuilt. Fire-and-forget (this is sync); route a GPU rejection so it
+    // isn't an unhandled promise rejection.
+    this.updateGLVolume().catch((e) => log.error('setAtlasOutline failed', e))
   }
 
   get volumeIsNearestInterpolation(): boolean {
@@ -2796,6 +2865,96 @@ export default class NiiVue extends EventTarget {
     await this.updateGLVolume()
   }
 
+  /**
+   * Region-of-interest statistics for a loaded volume.
+   *
+   * Values are calibrated (`scl_slope`/`scl_inter` applied) and non-finite
+   * voxels are excluded. Every mask must sit on the same RAS grid as the
+   * target volume — overlays are resliced to the background grid, so masks
+   * drawn from the loaded volume list satisfy that by construction, but a mask
+   * on a different grid returns `null` rather than silently wrong numbers.
+   *
+   * @param options.volumeIndex - which volume to measure (default 0, the background)
+   * @param options.masks - volume indices whose non-zero voxels define the region;
+   *   with several, a voxel counts only where ALL of them are non-zero
+   * @param options.isDrawingMask - also require a non-zero voxel in the drawing bitmap
+   * @param options.drawPenValues - when masking by the drawing, restrict to these
+   *   pen values (default: any non-zero voxel)
+   * @returns the statistics, or `null` when the volume has no data or a mask
+   *   does not match the target grid
+   *
+   * @example
+   * const roi = nv1.getDescriptives({ volumeIndex: 0, isDrawingMask: true })
+   * console.log(roi.mean, roi.stdev, roi.volumeML)
+   */
+  getDescriptives(
+    options: {
+      volumeIndex?: number
+      masks?: number[]
+      isDrawingMask?: boolean
+      drawPenValues?: number[]
+    } = {},
+  ): DescriptiveStats | null {
+    const volumes = this.model.getVolumes()
+    const volumeIndex = options.volumeIndex ?? 0
+    if (!this._checkBounds(volumes, volumeIndex, 'Volume')) return null
+    const vol = volumes[volumeIndex]
+    const raw = getImageDataRAS(vol)
+    if (!raw || !vol.dimsRAS || !vol.pixDimsRAS) {
+      log.warn('getDescriptives: volume has no resolvable RAS data')
+      return null
+    }
+    const nVox = raw.length
+    // getImageDataRAS returns unscaled samples; report calibrated intensities.
+    const slope = vol.hdr?.scl_slope || 1
+    const inter = vol.hdr?.scl_inter || 0
+    let values: Float32Array = raw
+    if (slope !== 1 || inter !== 0) {
+      values = new Float32Array(nVox)
+      for (let i = 0; i < nVox; i++) values[i] = raw[i] * slope + inter
+    }
+    // Intersect every requested mask into one inclusion array.
+    let mask: Uint8Array | null = null
+    const requireMask = (): Uint8Array => {
+      if (!mask) mask = new Uint8Array(nVox).fill(1)
+      return mask
+    }
+    for (const maskIndex of options.masks ?? []) {
+      if (!this._checkBounds(volumes, maskIndex, 'Mask volume')) return null
+      const maskData = getImageDataRAS(volumes[maskIndex])
+      if (!maskData || maskData.length !== nVox) {
+        log.warn(
+          `getDescriptives: mask volume ${maskIndex} does not match the target grid`,
+        )
+        return null
+      }
+      const m = requireMask()
+      for (let i = 0; i < nVox; i++) {
+        if (maskData[i] === 0 || Number.isNaN(maskData[i])) m[i] = 0
+      }
+    }
+    if (options.isDrawingMask) {
+      const drawingVol = this.model.drawingVolume
+      const bitmap = drawingVol ? getDrawingBitmap(drawingVol) : null
+      if (!bitmap || bitmap.length !== nVox) {
+        log.warn(
+          'getDescriptives: no drawing, or the drawing does not match the target grid',
+        )
+        return null
+      }
+      const pens = options.drawPenValues
+      const m = requireMask()
+      for (let i = 0; i < nVox; i++) {
+        const v = bitmap[i]
+        const keep = pens ? pens.includes(v) : v !== 0
+        if (!keep) m[i] = 0
+      }
+    }
+    const voxelVolumeMM3 =
+      vol.pixDimsRAS[1] * vol.pixDimsRAS[2] * vol.pixDimsRAS[3]
+    return computeDescriptiveStats(values, voxelVolumeMM3, mask)
+  }
+
   getVolumeAffine(volumeIndex: number): AffineMatrix {
     return NVTransforms.copyAffine(
       this._getVolumeOrThrow(volumeIndex).hdr.affine,
@@ -3397,6 +3556,14 @@ export default class NiiVue extends EventTarget {
   }
 
   /**
+   * Give this instance the whole canvas again, undoing {@link setBounds}.
+   * Equivalent to `setBounds([0, 0, 1, 1])`.
+   */
+  clearBounds(): void {
+    this.setBounds([0, 0, 1, 1])
+  }
+
+  /**
    * Read the canvas-level viewport (virtual camera) shared with sibling instances.
    * The viewport applies a pan + zoom over the entire canvas before each instance's
    * `bounds` are projected to pixels. Identity is `{pan: [0, 0], zoom: 1}`.
@@ -3615,10 +3782,20 @@ export default class NiiVue extends EventTarget {
   ): void {
     const levels = slide.manifest.levels
     if (levels.length === 0) return
+    const pinnedLevel = opts.levelIndex
+    const levelIndex =
+      pinnedLevel !== undefined &&
+      (!Number.isInteger(pinnedLevel) ||
+        !levels.some((level) => level.index === pinnedLevel))
+        ? undefined
+        : pinnedLevel
+    if (pinnedLevel !== undefined && levelIndex === undefined) {
+      log.warn(`setSlidePlane: unknown level index ${pinnedLevel}`)
+    }
     const state: SlidePlaneState = {
       slide,
       pixelToWorld: [...opts.pixelToWorld],
-      levelIndex: opts.levelIndex,
+      levelIndex,
       tilesByLevel: new Map(),
     }
     // Prime the coarsest level so something shows on the first frame before the
@@ -3644,6 +3821,28 @@ export default class NiiVue extends EventTarget {
     this._slidePlaneSlide = slide
     this._slidePlaneOnChange = (): void => this.drawScene()
     slide.addEventListener('change', this._slidePlaneOnChange)
+    this.drawScene()
+  }
+
+  /**
+   * Pin the slide plane's pyramid level (0 = finest), or return to the
+   * camera-driven choice with undefined. Mutates the registered plane in
+   * place, so — unlike re-calling {@link setSlidePlane} — the slide drawing
+   * and vector annotations survive the change. No-op without a plane.
+   */
+  setSlidePlaneLevel(levelIndex?: number): void {
+    if (!this._slidePlane) return
+    if (
+      levelIndex !== undefined &&
+      (!Number.isInteger(levelIndex) ||
+        !this._slidePlane.slide.manifest.levels.some(
+          (level) => level.index === levelIndex,
+        ))
+    ) {
+      log.warn(`setSlidePlaneLevel: unknown level index ${levelIndex}`)
+      return
+    }
+    this._slidePlane.levelIndex = levelIndex
     this.drawScene()
   }
 
@@ -4410,9 +4609,22 @@ export default class NiiVue extends EventTarget {
     }
   }
 
+  /** Clear both completed distance measurements and completed angles. */
   clearMeasurements(): void {
     this.model.completedMeasurements = []
     this.model.completedAngles = []
+    this.drawScene()
+  }
+
+  /** Clear completed angles only, leaving distance measurements in place. */
+  clearAngles(): void {
+    this.model.completedAngles = []
+    this.drawScene()
+  }
+
+  /** Clear completed distance measurements only, leaving angles in place. */
+  clearDistanceMeasurements(): void {
+    this.model.completedMeasurements = []
     this.drawScene()
   }
 

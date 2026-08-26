@@ -54,6 +54,9 @@
       "inputs": [
         "{projectRoot}/e2e/**/*",
         "{projectRoot}/playwright.config.ts",
+        "{projectRoot}/src/**/*",
+        "{projectRoot}/examples/**/*",
+        "{projectRoot}/scripts/**/*",
         "typescript"
       ]
     }

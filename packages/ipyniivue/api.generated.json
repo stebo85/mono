@@ -1,5 +1,5 @@
 {
-  "niivueVersion": "1.0.0-rc.11",
+  "niivueVersion": "1.0.0-rc.12",
   "source": "packages/niivue/src/NVControlBase.ts",
   "className": "NiiVue",
   "properties": [
@@ -1031,6 +1031,17 @@
       "doc": null
     },
     {
+      "jsName": "volumeIsColormapAlphaOn2D",
+      "pyName": "volume_is_colormap_alpha_on_2d",
+      "tsType": "boolean",
+      "pyTraitlet": {
+        "kind": "Bool"
+      },
+      "hasGetter": true,
+      "hasSetter": true,
+      "doc": null
+    },
+    {
       "jsName": "volumeIsNearestInterpolation",
       "pyName": "volume_is_nearest_interpolation",
       "tsType": "boolean",
@@ -1084,6 +1095,17 @@
           "kind": "Float"
         },
         "length": 4
+      },
+      "hasGetter": true,
+      "hasSetter": true,
+      "doc": null
+    },
+    {
+      "jsName": "volumeRenderMode",
+      "pyName": "volume_render_mode",
+      "tsType": "number",
+      "pyTraitlet": {
+        "kind": "Float"
       },
       "hasGetter": true,
       "hasSetter": true,
@@ -1595,6 +1617,16 @@
       "returnsDoc": null
     },
     {
+      "jsName": "clearAngles",
+      "pyName": "clear_angles",
+      "isAsync": false,
+      "returnsValue": false,
+      "params": [],
+      "returns": "void",
+      "doc": "Clear completed angles only, leaving distance measurements in place.",
+      "returnsDoc": null
+    },
+    {
       "jsName": "clearAnnotations",
       "pyName": "clear_annotations",
       "isAsync": false,
@@ -1602,6 +1634,16 @@
       "params": [],
       "returns": "void",
       "doc": null,
+      "returnsDoc": null
+    },
+    {
+      "jsName": "clearBounds",
+      "pyName": "clear_bounds",
+      "isAsync": false,
+      "returnsValue": false,
+      "params": [],
+      "returns": "void",
+      "doc": "Give this instance the whole canvas again, undoing {@link setBounds}.\nEquivalent to `setBounds([0, 0, 1, 1])`.",
       "returnsDoc": null
     },
     {
@@ -1615,13 +1657,23 @@
       "returnsDoc": null
     },
     {
+      "jsName": "clearDistanceMeasurements",
+      "pyName": "clear_distance_measurements",
+      "isAsync": false,
+      "returnsValue": false,
+      "params": [],
+      "returns": "void",
+      "doc": "Clear completed distance measurements only, leaving angles in place.",
+      "returnsDoc": null
+    },
+    {
       "jsName": "clearMeasurements",
       "pyName": "clear_measurements",
       "isAsync": false,
       "returnsValue": false,
       "params": [],
       "returns": "void",
-      "doc": null,
+      "doc": "Clear both completed distance measurements and completed angles.",
       "returnsDoc": null
     },
     {
@@ -1814,6 +1866,23 @@
       "returns": "[number, number, number]",
       "doc": null,
       "returnsDoc": null
+    },
+    {
+      "jsName": "getDescriptives",
+      "pyName": "get_descriptives",
+      "isAsync": false,
+      "returnsValue": true,
+      "params": [
+        {
+          "name": "options",
+          "tsType": "{ volumeIndex?: number | undefined; masks?: number[] | undefined; isDrawingMask?: boolean | undefined; drawPenValues?: number[] | undefined; }",
+          "optional": true,
+          "doc": null
+        }
+      ],
+      "returns": "DescriptiveStats | null",
+      "doc": "Region-of-interest statistics for a loaded volume.\n\nValues are calibrated (`scl_slope`/`scl_inter` applied) and non-finite\nvoxels are excluded. Every mask must sit on the same RAS grid as the\ntarget volume — overlays are resliced to the background grid, so masks\ndrawn from the loaded volume list satisfy that by construction, but a mask\non a different grid returns `null` rather than silently wrong numbers.",
+      "returnsDoc": "the statistics, or `null` when the volume has no data or a mask\ndoes not match the target grid"
     },
     {
       "jsName": "getFrame4D",
@@ -2417,23 +2486,6 @@
       "returnsDoc": null
     },
     {
-      "jsName": "registerOverlayRenderer",
-      "pyName": "register_overlay_renderer",
-      "isAsync": false,
-      "returnsValue": true,
-      "params": [
-        {
-          "name": "renderer",
-          "tsType": "UIKitOverlayRenderer",
-          "optional": false,
-          "doc": null
-        }
-      ],
-      "returns": "() => void",
-      "doc": "Register a privileged overlay renderer (e.g. a",
-      "returnsDoc": null
-    },
-    {
       "jsName": "reinitializeView",
       "pyName": "reinitialize_view",
       "isAsync": true,
@@ -2772,6 +2824,29 @@
       ],
       "returns": "void",
       "doc": "Set (or clear, with an empty string) the free-text label on an annotation by\nid. The text shows above the annotation's stats via the overlay seam.",
+      "returnsDoc": null
+    },
+    {
+      "jsName": "setAtlasOutline",
+      "pyName": "set_atlas_outline",
+      "isAsync": false,
+      "returnsValue": false,
+      "params": [
+        {
+          "name": "outline",
+          "tsType": "number",
+          "optional": false,
+          "doc": null
+        },
+        {
+          "name": "volumeIndex",
+          "tsType": "number | undefined",
+          "optional": true,
+          "doc": null
+        }
+      ],
+      "returns": "void",
+      "doc": "Draw label/atlas volumes as region outlines rather than filled regions.\n\n`outline` is the neighbour probe distance in the atlas's own voxels: 0 (the\ndefault) fills every region, 1 keeps a one-voxel border, larger values give\na thicker border. Only the interior is dropped, so the parcellation stays\nreadable over the anatomy underneath. Non-label volumes ignore it.\n\nApplies to every loaded label volume when `volumeIndex` is omitted, or to\none volume when it is given. It is a per-volume property, so\n`setVolume(i, { atlasOutline })` and the load options reach it too.\n\n```js\nnv1.setAtlasOutline(1)     // outline every atlas\nnv1.setAtlasOutline(0, 1)  // fill volume 1 again\n```",
       "returnsDoc": null
     },
     {
@@ -3262,6 +3337,23 @@
       "returnsDoc": null
     },
     {
+      "jsName": "setSlidePlaneLevel",
+      "pyName": "set_slide_plane_level",
+      "isAsync": false,
+      "returnsValue": false,
+      "params": [
+        {
+          "name": "levelIndex",
+          "tsType": "number | undefined",
+          "optional": true,
+          "doc": null
+        }
+      ],
+      "returns": "void",
+      "doc": "Pin the slide plane's pyramid level (0 = finest), or return to the\ncamera-driven choice with undefined. Mutates the registered plane in\nplace, so — unlike re-calling {@link setSlidePlane} — the slide drawing\nand vector annotations survive the change. No-op without a plane.",
+      "returnsDoc": null
+    },
+    {
       "jsName": "setTractOptions",
       "pyName": "set_tract_options",
       "isAsync": true,
@@ -3460,23 +3552,6 @@
       "returnsDoc": null
     },
     {
-      "jsName": "unregisterOverlayRenderer",
-      "pyName": "unregister_overlay_renderer",
-      "isAsync": false,
-      "returnsValue": false,
-      "params": [
-        {
-          "name": "renderer",
-          "tsType": "UIKitOverlayRenderer",
-          "optional": false,
-          "doc": null
-        }
-      ],
-      "returns": "void",
-      "doc": "Remove a previously registered overlay renderer.",
-      "returnsDoc": null
-    },
-    {
       "jsName": "updateGLVolume",
       "pyName": "update_gl_volume",
       "isAsync": true,
@@ -3545,6 +3620,12 @@
       "jsName": "change",
       "pyName": "change",
       "detailType": "PropertyChangeDetail",
+      "doc": null
+    },
+    {
+      "jsName": "clickToSegment",
+      "pyName": "click_to_segment",
+      "detailType": "ClickToSegmentDetail",
       "doc": null
     },
     {
@@ -3797,8 +3878,16 @@
         "reason": "return value is not JSON-serializable (JS extension context handle)"
       },
       {
+        "jsName": "registerOverlayRenderer",
+        "reason": "argument and return value are not JSON-serializable (JS overlay renderer and disposer function)"
+      },
+      {
         "jsName": "registerVolumeTransform",
         "reason": "argument is not JSON-serializable (volume transform with JS function hooks)"
+      },
+      {
+        "jsName": "unregisterOverlayRenderer",
+        "reason": "argument is not JSON-serializable (JS overlay renderer)"
       },
       {
         "jsName": "useLoader",

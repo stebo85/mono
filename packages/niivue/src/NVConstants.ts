@@ -20,6 +20,33 @@ export enum DRAG_MODE {
   windowing = 9,
 }
 
+/**
+ * How the 3D volume ray-march combines the samples along a ray.
+ *
+ * COMPOSITE is the classic emission-absorption OVER accumulation: nearer
+ * samples occlude farther ones, so the result reads as a solid, depth-ordered
+ * object. MAXIMUM keeps the single brightest sample per ray instead (maximum-
+ * intensity projection) — depth ordering is discarded, which is what makes a
+ * sparse bright structure (vessels in an angiogram, labelled structures in a
+ * fluorescence stack) visible through everything in front of it.
+ *
+ * Applies to the 3D render only; a 2D slice draws one plane, where the two
+ * modes are identical.
+ *
+ * MAXIMUM on a CHUNKED (streamed) volume additionally assumes a black
+ * background. The per-chunk cube draws are merged with a component-wise MAX
+ * blend so the result is independent of chunk draw order, and that max also
+ * applies against whatever the tile was cleared to — so a non-black
+ * `backColor` is itself a lower bound on every pixel of the cube and washes
+ * the projection out. Non-chunked MAXIMUM composites normally and is
+ * unaffected. See `_drawChunkedVolume` in gl/render.ts and the
+ * `pipelineChunkedMip` variant in wgpu/render.ts.
+ */
+export enum VOLUME_RENDER_MODE {
+  COMPOSITE = 0,
+  MAXIMUM = 1,
+}
+
 export enum SHOW_RENDER {
   NEVER = 0,
   ALWAYS = 1,
@@ -188,11 +215,13 @@ export const VOLUME_DEFAULTS: VolumeRenderConfig = {
   alphaShader: 1,
   isBackgroundMasking: false,
   isAlphaClipDark: false,
+  isColormapAlphaOn2D: false,
   isNearestInterpolation: false,
   isV1SliceShader: false,
   matcap: '',
   paqdUniforms: [0.01, 0.5, 0.25, 0.4] as [number, number, number, number],
   transmittanceCutoff: 0.95,
+  renderMode: VOLUME_RENDER_MODE.COMPOSITE,
 }
 
 export const MESH_DEFAULTS: MeshRenderConfig = {

@@ -76,7 +76,11 @@ function decodeViaImageElement(blob: Blob): Promise<DecodedImage> {
     img.onerror = () => {
       settle(() => reject(new Error('Failed to decode image')))
     }
-    img.src = url
+    try {
+      img.src = url
+    } catch (err) {
+      settle(() => reject(err))
+    }
   })
 }
 

@@ -4,6 +4,7 @@ import type { AffineMatrix, NVGlobalCamera, NVImage } from '@/NVTypes'
 import {
   arrayToMat4,
   calculateGlobalVolumeMvp,
+  calculateMvpMatrix2D,
   cart2sphDeg,
   copyAffine,
   createAffineTransformMatrix,
@@ -18,6 +19,7 @@ import {
   slicePlaneEquation,
   unprojectScreen,
   vox2mm,
+  zoomPan2DAbout,
 } from './NVTransforms'
 
 const EPSILON = 1e-5
@@ -718,5 +720,189 @@ describe('rayMarchFirstVisibleMM', () => {
     )
     expect(hit?.[0]).toBeGreaterThanOrEqual(5)
     expect(hit?.[0]).toBeLessThan(5.1)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// zoomPan2DAbout
+// ---------------------------------------------------------------------------
+//
+// These assert against calculateMvpMatrix2D itself rather than restating the
+// algebra, because the bug being fixed (niivue/mono#68) was a compensation that
+// disagreed with the ortho window the renderer actually builds. A test that
+// only re-derived the formula would have passed against the broken code too.
+
+/**
+ * Where a world-mm point lands in clip space through the 2D slice transform,
+ * driven exactly as `NVSliceLayout` drives it: extents and pan permuted into
+ * the tile's [U, V, depth] order, with that orientation's rotations.
+ */
+function projectThroughSlice(
+  mm: readonly number[],
+  pan: readonly number[],
+  extentsMin: readonly number[],
+  extentsMax: readonly number[],
+  axCorSag = 0,
+  isRadiological = false,
+): [number, number] {
+  // IDX_MAP and rotations(), mirrored from NVSliceLayout so this test pins the
+  // transform rather than the layout engine's current wiring to it.
+  const map = [
+    [0, 1, 2],
+    [0, 2, 1],
+    [1, 2, 0],
+  ][axCorSag]
+  const rot = [
+    { azimuth: isRadiological ? 180 : 0, elevation: isRadiological ? -90 : 90 },
+    { azimuth: isRadiological ? 180 : 0, elevation: 0 },
+    { azimuth: isRadiological ? 90 : -90, elevation: 0 },
+  ][axCorSag]
+  const mn = [extentsMin[map[0]], extentsMin[map[1]], extentsMin[map[2]]]
+  const mx = [extentsMax[map[0]], extentsMax[map[1]], extentsMax[map[2]]]
+  const [mvp] = calculateMvpMatrix2D(
+    [0, 0, 100, 100],
+    mn,
+    mx,
+    Infinity,
+    undefined,
+    rot.azimuth,
+    rot.elevation,
+    isRadiological,
+    undefined,
+    undefined,
+    [pan[map[0]], pan[map[1]], pan[3]],
+  )
+  const clip = [0, 0, 0, 0]
+  for (let r = 0; r < 4; r++) {
+    clip[r] =
+      mvp[r] * mm[0] + mvp[4 + r] * mm[1] + mvp[8 + r] * mm[2] + mvp[12 + r]
+  }
+  return [clip[0] / clip[3], clip[1] / clip[3]]
+}
+
+describe('zoomPan2DAbout', () => {
+  // Deliberately NOT centred on the world origin: the previous implementation
+  // measured from the origin, so a centred volume hid half the bug.
+  const extentsMin = [-90, -126, -72]
+  const extentsMax = [90, 90, 108]
+
+  test('anchorHoldsItsScreenPositionAcrossOneZoomStep', () => {
+    const pan = [0, 0, 0, 1]
+    const anchor = [40, -30, 12]
+    const before = projectThroughSlice(anchor, pan, extentsMin, extentsMax)
+    const next = zoomPan2DAbout(pan, 1.1, anchor, extentsMin, extentsMax)
+    const after = projectThroughSlice(
+      anchor,
+      [next[0], next[1], next[2], 1.1],
+      extentsMin,
+      extentsMax,
+    )
+    approx(after[0], before[0])
+    approx(after[1], before[1])
+  })
+
+  test('anchorStillHoldsAfterManyStepsIntoADeepZoom', () => {
+    // The old difference-of-zooms compensation was off by a factor of the new
+    // zoom, so it looked passable at 1.0 and drifted badly by 5x.
+    const anchor = [-55, 60, -20]
+    let pan = [0, 0, 0, 1]
+    const before = projectThroughSlice(anchor, pan, extentsMin, extentsMax)
+    for (let i = 0; i < 20; i++) {
+      const zoom = Math.round(pan[3] * 1.1 * 10) / 10
+      const next = zoomPan2DAbout(pan, zoom, anchor, extentsMin, extentsMax)
+      pan = [next[0], next[1], next[2], zoom]
+    }
+    expect(pan[3]).toBeGreaterThan(4)
+    const after = projectThroughSlice(anchor, pan, extentsMin, extentsMax)
+    approx(after[0], before[0])
+    approx(after[1], before[1])
+  })
+
+  test('anchorHoldsUnderRadiologicalOrientation', () => {
+    const pan = [0, 0, 0, 1]
+    const anchor = [40, -30, 12]
+    const before = projectThroughSlice(
+      anchor,
+      pan,
+      extentsMin,
+      extentsMax,
+      0,
+      true,
+    )
+    const next = zoomPan2DAbout(pan, 2, anchor, extentsMin, extentsMax)
+    const after = projectThroughSlice(
+      anchor,
+      [next[0], next[1], next[2], 2],
+      extentsMin,
+      extentsMax,
+      0,
+      true,
+    )
+    approx(after[0], before[0])
+    approx(after[1], before[1])
+  })
+
+  test('anchorHoldsOnEveryTileFromOneCompensation', () => {
+    // One pan serves all three tiles, so the compensation is only correct if it
+    // holds under each tile's permutation of the world axes.
+    const pan = [-6, 4, 9, 1.3]
+    const anchor = [33, -47, 51]
+    for (const axCorSag of [0, 1, 2]) {
+      const before = projectThroughSlice(
+        anchor,
+        pan,
+        extentsMin,
+        extentsMax,
+        axCorSag,
+      )
+      const next = zoomPan2DAbout(pan, 3.1, anchor, extentsMin, extentsMax)
+      const after = projectThroughSlice(
+        anchor,
+        [next[0], next[1], next[2], 3.1],
+        extentsMin,
+        extentsMax,
+        axCorSag,
+      )
+      approx(after[0], before[0])
+      approx(after[1], before[1])
+    }
+  })
+
+  test('anchorHoldsWhenThePanIsAlreadyNonZero', () => {
+    const pan = [12, -8, 3, 1.6]
+    const anchor = [25, 41, -7]
+    const before = projectThroughSlice(anchor, pan, extentsMin, extentsMax)
+    const next = zoomPan2DAbout(pan, 2.4, anchor, extentsMin, extentsMax)
+    const after = projectThroughSlice(
+      anchor,
+      [next[0], next[1], next[2], 2.4],
+      extentsMin,
+      extentsMax,
+    )
+    approx(after[0], before[0])
+    approx(after[1], before[1])
+  })
+
+  test('unchangedZoomLeavesThePanAlone', () => {
+    const pan = [12, -8, 3, 2]
+    const next = zoomPan2DAbout(pan, 2, [1, 2, 3], extentsMin, extentsMax)
+    approx(next[0], 12)
+    approx(next[1], -8)
+    approx(next[2], 3)
+  })
+
+  test('nonPositiveOrNonFiniteZoomIsRefusedRatherThanPropagated', () => {
+    const pan = [5, 6, 7, 2]
+    for (const bad of [0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
+      const next = zoomPan2DAbout(pan, bad, [1, 2, 3], extentsMin, extentsMax)
+      expect(next).toEqual([5, 6, 7])
+    }
+  })
+
+  test('degenerateExtentsRescaleThePanRatherThanReturningNaN', () => {
+    const flat = [10, 10, 10]
+    const next = zoomPan2DAbout([4, 4, 4, 2], 4, [10, 10, 10], flat, flat)
+    for (const v of next) expect(Number.isFinite(v)).toBe(true)
+    approx(next[0], 2)
   })
 })

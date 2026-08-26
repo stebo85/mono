@@ -162,6 +162,63 @@ export function validateAffine(affine: number[][]): void {
   }
 }
 
+/**
+ * New 2D pan that holds `anchorMM` at the same place on screen while the zoom
+ * changes from `pan[3]` to `newZoom`.
+ *
+ * It lives next to {@link calculateMvpMatrix2D} because it is that function's
+ * inverse and is only correct against its convention: the ortho window is the
+ * volume's mm extents scaled about their CENTRE by `1/zoom`, then shifted by
+ * `-pan`. So the window is centred on `c - pan` with half-width `HW0 / zoom`,
+ * and a world point `m` sits at the normalized offset
+ *
+ *   s = (m - c + pan) * zoom / HW0
+ *
+ * Holding `s` across a zoom step is therefore a RATIO in the zooms, not a
+ * difference, and it is measured from the extent centre rather than from the
+ * world origin:
+ *
+ *   pan' = (zoom / newZoom) * (d + pan) - d,   d = anchorMM - c
+ *
+ * Getting either half wrong still looks like zoom-about-a-point at zoom 1 and
+ * drifts further off the deeper the view is zoomed, which is why this is stated
+ * once here and pinned by a test rather than open-coded at the call site.
+ *
+ * Radiological orientation needs no special case: it negates `s` on the U axis,
+ * and holding `-s` fixed is the same condition as holding `s` fixed.
+ *
+ * @param pan - current `[panX, panY, panZ, zoom]`
+ * @param newZoom - the zoom being applied (must be positive and finite)
+ * @param anchorMM - world-mm point to keep put (typically the crosshair)
+ * @param extentsMin - world-mm minimum of the scene extents
+ * @param extentsMax - world-mm maximum of the scene extents
+ * @returns the new `[panX, panY, panZ]`; unchanged when the zoom does not move
+ */
+export function zoomPan2DAbout(
+  pan: ArrayLike<number>,
+  newZoom: number,
+  anchorMM: ArrayLike<number>,
+  extentsMin: ArrayLike<number>,
+  extentsMax: ArrayLike<number>,
+): [number, number, number] {
+  const current = pan[3] ?? 1
+  const out: [number, number, number] = [pan[0], pan[1], pan[2]]
+  if (!Number.isFinite(newZoom) || newZoom <= 0 || !Number.isFinite(current)) {
+    return out
+  }
+  const ratio = current / newZoom
+  for (let i = 0; i < 3; i++) {
+    // A degenerate axis (no volume, or a single slice) has no centre to speak
+    // of; d falls out to 0 and the pan simply rescales, which is the right
+    // no-op rather than a NaN.
+    const centre = (extentsMin[i] + extentsMax[i]) / 2
+    const d = anchorMM[i] - centre
+    const next = ratio * (d + pan[i]) - d
+    out[i] = Number.isFinite(next) ? next : pan[i]
+  }
+  return out
+}
+
 export function calculateMvpMatrix2D(
   _leftTopWidthHeight: number[],
   mn: number[],

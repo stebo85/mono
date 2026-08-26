@@ -2391,17 +2391,26 @@ export function initInteraction(ctrl: NiiVue): void {
         let zoom = ctrl.model.scene.pan2Dxyzmm[3] * (1.0 + 0.1 * zoomDirection)
         zoom = Math.round(zoom * 10) / 10
         zoom = Math.max(0.1, Math.min(10.0, zoom))
-        const zoomChange = ctrl.model.scene.pan2Dxyzmm[3] - zoom
         if (ctrl.model.interaction.isYoked3DTo2DZoom) {
           ctrl.model.scene.scaleMultiplier = zoom
           emitScaleMultiplierChange(ctrl)
         }
-        ctrl.model.scene.pan2Dxyzmm[3] = zoom
-        // Adjust pan so zoom centers on the crosshair
+        // Pan so the crosshair stays put under the new zoom. The compensation
+        // is NVTransforms' business, not this handler's: the ortho window is
+        // built there and only it knows that holding a point takes a ratio of
+        // the zooms measured from the extent centre.
         const mm = ctrl.model.scene2mm(ctrl.model.scene.crosshairPos)
-        ctrl.model.scene.pan2Dxyzmm[0] += zoomChange * mm[0]
-        ctrl.model.scene.pan2Dxyzmm[1] += zoomChange * mm[1]
-        ctrl.model.scene.pan2Dxyzmm[2] += zoomChange * mm[2]
+        const pan = NVTransforms.zoomPan2DAbout(
+          ctrl.model.scene.pan2Dxyzmm,
+          zoom,
+          mm,
+          ctrl.model.extentsMin,
+          ctrl.model.extentsMax,
+        )
+        ctrl.model.scene.pan2Dxyzmm[3] = zoom
+        ctrl.model.scene.pan2Dxyzmm[0] = pan[0]
+        ctrl.model.scene.pan2Dxyzmm[1] = pan[1]
+        ctrl.model.scene.pan2Dxyzmm[2] = pan[2]
         emitPan2DChange(ctrl)
         ctrl.drawScene()
         return

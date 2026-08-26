@@ -60,6 +60,13 @@ export interface ChunkResidencyHooks<TChunk> {
    */
   prefetch?(chunkIndex: number): void
   /**
+   * Called with a chunk index the queue has given up on because the working
+   * set stopped asking for it. The counterpart to `prefetch`: whatever that
+   * started, this abandons. Optional and best-effort -- the uploader's own
+   * `dispose` still has to release anything left outstanding.
+   */
+  cancel?(chunkIndex: number): void
+  /**
    * Called with a chunk index just after it becomes resident (admitted). Lets
    * the backend invalidate caches that sample this chunk — e.g. a streamed
    * overlay chunk feeding another volume's per-chunk bind group.
@@ -394,6 +401,9 @@ export class ChunkResidencyManager<TChunk> {
   private _dropQueued(chunkIndex: number): void {
     this._uploadQueue.delete(chunkIndex)
     this._staleDropped++
+    // Whatever `prefetch` started for this chunk is now waste: the view stopped
+    // asking before the pump ever reached it.
+    this._hooks.cancel?.(chunkIndex)
   }
 
   /**

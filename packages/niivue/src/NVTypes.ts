@@ -29,6 +29,13 @@ export interface VolumeChunkSourceRequest {
   plan: ChunkPlan
   datatypeCode: number
   bytesPerVoxel: number
+  /**
+   * Fires when the renderer no longer wants this chunk -- the view moved on,
+   * or the volume was disposed. A source that reads over the network should
+   * pass it down so the read is abandoned on the wire rather than discarded on
+   * arrival. Optional: a source that ignores it stays correct, only wasteful.
+   */
+  signal?: AbortSignal
 }
 
 export type VolumeChunkSource = (

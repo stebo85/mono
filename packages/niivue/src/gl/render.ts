@@ -795,6 +795,7 @@ export class VolumeRenderer extends NVRenderer {
         bytesOf: chunkResidentBytes,
         destroy: (c) => destroyVolumeChunksGL(gl, [c]),
         prefetch: (ci) => entry.uploader.prefetchChunk(ci),
+        cancel: (ci) => entry.uploader.cancelChunk(ci),
       },
     )
     const chunk0 = await entry.uploader.uploadChunk(0)
@@ -1307,7 +1308,11 @@ export class VolumeRenderer extends NVRenderer {
             // view's self-driven re-render loop, freezing all streaming until an
             // unrelated redraw (e.g. a drag) re-kicks it.
             entry.manager.failUpload(i)
-            log.error('chunk upload failed', err)
+            // An abort is this renderer's own doing (the view stopped wanting
+            // the chunk, or the uploader was disposed), so it is not a failure
+            // to report.
+            if (!(err instanceof Error && err.name === 'AbortError'))
+              log.error('chunk upload failed', err)
             continue
           }
           admitted = true

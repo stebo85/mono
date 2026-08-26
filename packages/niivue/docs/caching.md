@@ -66,31 +66,68 @@ the fine tiles arrive, instead of flat placeholder quads.
 Neuroglancer's chunk manager is the reference implementation here. Four
 differences matter, roughly in descending order of what a user would feel.
 
-### 2.1 Fetch and decode run on a worker
+### 2.1 Fetch and decode run on a worker (DONE, stage C)
 
-Neuroglancer does fetch, decompress, and dtype conversion on a chunk worker;
-the main thread does little more than GPU upload. We do all of it on the main
-thread: `omeZarrChunkedSource.fetchChunk` calls `readLevelRegion`, which runs
-the whole zarrita path inline, and the upload pump then does its per-frame
-work on that same thread under an 8 ms budget.
+Neuroglancer does fetch, decompress, and dtype conversion on a chunk worker; the
+main thread does little more than GPU upload. We used to do all of it on the main
+thread, and it was the single largest cost in the streaming path.
 
-This is the crawl a user sees while a zoomed-in view streams. Every decode
-competes with the render loop, so interaction stutters exactly when the most
-bricks are arriving, which is exactly when it is most visible. It is item 1 in
-`streaming-todos.md`.
+Stage B measured it rather than assuming it, in case most of the stall turned out
+to be `texSubImage3D` rather than decode. It is not. Section 2.5 has the numbers:
+on a 20 second streaming window the render loop lost 8.6 seconds over a 24 ms
+budget, and 125 ms of that was texture upload. Everything else ran between the
+store read and our assemble loop, which is the zarrita decode.
 
-`src/workers/` already exists and the chunked path does not use it. The shape
-of the fix: a small decode-worker pool, transfer the decoded `Uint8Array` back
-(transferable, not structured-cloned), and keep the existing
-`createSourceChunkLoader` concurrency/retry/dedup wrapper unchanged so the
-residency manager still sees one `VolumeChunkSource` contract.
+Stage C moved it. `fetchOmeZarrChunkedSource` now opens the store on the calling
+thread for its metadata and then puts every chunk read on a small pool of
+workers:
 
-We said we would measure before plumbing, in case most of the stall turned out
-to be `texSubImage3D` rather than decode. It is not. Section 2.5 has the
-numbers: on a 20 second streaming window the render loop lost 8.6 seconds, and
-125 ms of that was texture upload. Whatever is eating the rest runs between the
-store read and our assemble loop, which is the zarrita decode. Stage C is
-justified.
+- `src/workers/omeZarrChunk.worker.ts` opens its OWN view of the store (a zarrita
+  array is not structured-cloneable) through the same `openOmeZarrChunkedSource`
+  the main thread uses, so the worker is not a reimplementation of the read path.
+  It runs store `get`, decompress, dtype convert, and our transpose / zero-pad
+  assemble, then transfers the finished `Uint8Array` back.
+- `src/volume/omeZarrChunkWorkerPool.ts` routes a request by hashing its region
+  (level, texture origin, texture dims) rather than picking the idlest worker.
+  Each worker keeps its own byte LRU, so a revisited brick has to come back to
+  the worker that already holds its bytes. Sizing is half the reported cores,
+  clamped to `[1, 4]`; these reads are network-bound, several are already
+  outstanding per worker, and each extra worker costs another store open and
+  another slice of the byte budget.
+- Timing survives the move. Each worker reports a CUMULATIVE
+  `ChunkTimingSnapshot`; the pool diffs it against what it last merged and folds
+  the delta into a module-level off-thread total, so `mainThreadMs` now reports
+  only what still blocks the render loop and a new `offThreadMs` reports what was
+  moved. `netBusyMs` is a union per recorder, so the merged figure is an upper
+  bound with a pool running and exact with one worker or none.
+- `createSourceChunkLoader` still presents the residency manager with one
+  `VolumeChunkSource` contract and the same concurrency, retry and dedup wrapper,
+  and it now carries the in-flight cancellation stage A left open. A chunk the
+  working set stops asking for is dropped from the queue, and that drop reaches
+  the uploader, the loader, the pool, the worker and finally zarrita's own
+  `signal`, so the read is abandoned on the wire instead of discarded on
+  arrival. Because several chunk indices can share one region, the loader counts
+  waiters and only aborts when the last one withdraws.
+
+A worker failure is not automatically fatal: the caller still holds a main-thread
+source. Only failures a re-run would repeat come back marked final
+(`OmeZarrChunkError` for a missing store or an undecodable region, `AbortError`
+for a cancelled read), and those are rethrown rather than paid for twice. A pool
+that has been disposed reports as an abort too: a read that outlives the volume
+it belongs to must not be "recovered" by fetching the same bytes on the main
+thread for a view that is gone.
+
+Two build details are load-bearing and easy to undo by accident. The module that
+knows about the pool must stay OUTSIDE anything the worker imports, which is why
+`fetchOmeZarrChunkedSource` lives in its own file and the worker imports only the
+pool-free `openOmeZarrChunkedSource`. And zarrita loads its blosc / lz4 / zstd
+codecs through dynamic imports, which would split the worker bundle into chunks
+that an inlined worker has nowhere to fetch from, so `vite.config.lib.ts` sets
+`worker.rollupOptions.output.inlineDynamicImports`. The pool itself is imported
+on demand, so the megabyte-scale inlined worker is only downloaded by a caller
+who actually streams chunks.
+
+Section 2.7 has the result.
 
 ### 2.2 Priority tiers and a queue that is rebuilt every frame
 
@@ -303,6 +340,36 @@ Stage G therefore lands as instrumentation and no policy change. The counters
 stay because they are what proved the point, and because they are the check to
 re-run before anyone proposes a bigger budget.
 
+### 2.7 Measured: stage C removed the stall
+
+The check is deliberately the same one that condemned the main-thread path in
+2.5: HiP-CT (000026, roughly 1 TB, over S3), WebGL2 in Chrome, tab foregrounded,
+streaming with no interaction, rAF gaps accumulated over a 24 ms budget.
+
+| Figure | Stage B (main thread) | Stage C (worker pool) |
+|---|---|---|
+| Main-thread time lost over a 24 ms budget | 8604 ms | none |
+| Worst single frame gap | 1052 ms | none over budget |
+| Streaming work accounted for off-thread | 0 ms | 1898 ms, 100% |
+
+The stall is gone rather than reduced: over the measured window not one frame
+went over budget, against 8.6 seconds of lost frame time before. Every
+millisecond of instrumented streaming work now lands in `offThreadMs`, and the
+`workers` HUD row in the DANDI demo reports the share so a regression that
+silently falls back to the main thread is visible rather than merely slow.
+
+A slice-scrub on the smaller OCT store (000722, 4.5 GB), which is the more
+interactive pattern, agrees: roughly 40 seconds of scrubbing left 2 ms of
+main-thread streaming cost in total and 1 ms over budget across the whole
+session, with 9874 ms accounted for off-thread.
+
+Two caveats worth stating out loud. The GPU upload cannot move and did not: it
+is still on the render thread, and it was already only 1.5 percent of the
+problem. And a worker pool does not reduce the bytes fetched or decoded, it only
+stops them competing with drawing. The amplification measured in 2.5, 15x to 39x
+between bytes delivered and voxels used, is untouched and is what stage D is
+for.
+
 ## 3. What we should say tomorrow
 
 We are not starting from nothing: three tiers on the volume side, two on the
@@ -336,21 +403,22 @@ Two places we can be BETTER than Neuroglancer rather than catching up:
 | A | DONE (`1a9d525d`) Stale-drop + per-frame reprioritization in `ChunkResidencyManager` | small | Pure CPU, shared by both backends, testable without a GPU, fixes a felt problem |
 | B | DONE Per-phase timing (`chunkTimingStats`) plus a main-thread stall monitor in the demo | small | Turned stage C from a guess into a measurement |
 | G | DONE Hit / miss / eviction counters on `ByteLruCache`, exposed as `source.byteCache.stats` | small | Measured (2.6): zero evictions on a 1 TB store, so no budget or policy change was needed |
-| C | Worker pool for chunk fetch + decode | medium | The main-thread stall; `src/workers/` already exists |
+| C | DONE Worker pool for chunk fetch + decode (`omeZarrChunkWorkerPool.ts`, `workers/omeZarrChunk.worker.ts`) | medium | Measured (2.7): the 8.6 s of lost frame time is gone, 100% of streaming work is off-thread |
 | D | Directional prefetch for slice scrolling and zoom | small | One-dimensional prediction, big felt win, no framework needed |
 | E | Decoded-chunk demotion tier under GPU eviction | medium | Makes eviction cheap to undo; sized off the GPU budget |
 | F | Persistent cache (Cache Storage / OPFS) | medium | The differentiator; warm starts across reloads |
 
-Stage A and B are done, and they were the two that make every later stage
-measurable. B changed the order of what follows: G is new, it came straight out
-of the measurement, and it is cheap enough to go alongside D. C is confirmed as
-the big one. The in-flight half of A, an `AbortController` on fetches already
-issued, is still open and is worth folding into C, where the worker pool owns
-the fetch.
+A, B, G and C are done. A and B were the two that make every later stage
+measurable, and B changed the order of what followed: G came straight out of the
+measurement and turned out to need no policy change at all, while C was
+confirmed as the big one and delivered accordingly. The in-flight half of A, an
+`AbortController` on fetches already issued, folded into C as planned: the
+worker pool owns the fetch, so a cancelled read is now aborted on the wire
+rather than merely ignored on arrival.
 
-The recommended order from here is G, C, D, E, F: take the cheap cache-sizing
-win first, then move decode off the render thread, then predict, then soften
-eviction, then persist.
+What remains is D, E, F: predict, then soften eviction, then persist. D is next
+and it is the one that attacks a cost C did not touch, since a worker pool moves
+the decode but does not avoid it.
 
 ## 5. Known gaps not covered above
 

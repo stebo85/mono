@@ -195,6 +195,12 @@ async function createColormapResources(
   }
 }
 
+/** One cached source-byte fetch, with the handle that abandons it. */
+interface ChunkFetch {
+  promise: Promise<Uint8Array>
+  controller: AbortController
+}
+
 /**
  * On-demand chunk uploader for a chunked volume. The renderer keeps one of
  * these per chunked volume and calls `uploadChunk` to stream chunks in across
@@ -210,6 +216,11 @@ export interface ChunkUploaderGPU {
    * serially inside the pump. Bounded and a no-op for in-memory volumes.
    */
   prefetchChunk(index: number): void
+  /**
+   * Abandon the source-byte fetch for `index`. A no-op for in-memory volumes
+   * and for a chunk with nothing outstanding.
+   */
+  cancelChunk(index: number): void
   /** Release the shared uniform/colormap GPU resources. */
   dispose(): void
 }
@@ -369,10 +380,15 @@ export async function createChunkUploaderGPU(
 
   // Cache of in-flight / ready source-byte fetches, keyed by chunk index. Only
   // populated for chunkSource (network-backed) volumes; in-memory extraction is
-  // synchronous and cheap, so it is computed on demand without caching.
-  const fetchCache = new Map<number, Promise<Uint8Array>>()
+  // synchronous and cheap, so it is computed on demand without caching. Each
+  // entry carries the controller that cancels its read, so a chunk the view
+  // stops wanting is abandoned on the wire rather than paid for and dropped.
+  const fetchCache = new Map<number, ChunkFetch>()
 
-  function computeBytes(index: number): Promise<Uint8Array> {
+  function computeBytes(
+    index: number,
+    signal?: AbortSignal,
+  ): Promise<Uint8Array> {
     const desc = plan.chunks[index]
     if (!desc) {
       return Promise.reject(
@@ -389,6 +405,7 @@ export async function createChunkUploaderGPU(
           plan,
           datatypeCode: dt,
           bytesPerVoxel,
+          signal,
         }),
       ).then((r) => bytesFromChunkSource(r, expectedBytes))
     }
@@ -415,21 +432,40 @@ export async function createChunkUploaderGPU(
   function fetchBytes(index: number): Promise<Uint8Array> {
     if (!chunkSource) return computeBytes(index)
     const cached = fetchCache.get(index)
-    if (cached) return cached
-    const p = computeBytes(index)
-    fetchCache.set(index, p)
+    if (cached) return cached.promise
+    const controller = new AbortController()
+    const promise = computeBytes(index, controller.signal)
+    const entry: ChunkFetch = { promise, controller }
+    fetchCache.set(index, entry)
     // Don't cache rejections: drop the entry so a re-queued chunk retries fresh.
-    p.catch(() => {
-      if (fetchCache.get(index) === p) fetchCache.delete(index)
+    promise.catch(() => {
+      if (fetchCache.get(index) === entry) fetchCache.delete(index)
     })
-    return p
+    return promise
   }
 
   function prefetchChunk(index: number): void {
     if (!chunkSource) return
     if (fetchCache.has(index)) return
     if (fetchCache.size >= MAX_PREFETCHED_CHUNKS) return
-    void fetchBytes(index)
+    // The prefetch is speculative, so nobody is awaiting it. Swallow its
+    // rejection here (including the abort a later cancel raises) rather than
+    // leaving an unobserved promise; a real failure resurfaces when the upload
+    // pump asks for the same chunk and re-fetches it.
+    void fetchBytes(index).catch(() => {})
+  }
+
+  /**
+   * Abandon a chunk's source read. Called when the view stops asking for a
+   * chunk it had queued: the bytes are no longer wanted, so the read is
+   * aborted and the prefetch slot freed for one that is. A later request for
+   * the same chunk simply starts a new read.
+   */
+  function cancelChunk(index: number): void {
+    const entry = fetchCache.get(index)
+    if (!entry) return
+    fetchCache.delete(index)
+    entry.controller.abort()
   }
 
   async function uploadChunk(index: number): Promise<VolumeChunkGPU> {
@@ -542,6 +578,7 @@ export async function createChunkUploaderGPU(
   }
 
   function dispose(): void {
+    for (const entry of fetchCache.values()) entry.controller.abort()
     fetchCache.clear()
     if (!orient) return
     orient.uniformBuffer.destroy()
@@ -550,7 +587,7 @@ export async function createChunkUploaderGPU(
     orient.modPlaceholder.destroy()
   }
 
-  return { uploadChunk, prefetchChunk, dispose }
+  return { uploadChunk, prefetchChunk, cancelChunk, dispose }
 }
 
 /** Release all per-chunk GPU textures from a previous build. */

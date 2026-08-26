@@ -139,6 +139,9 @@ async function withRetry<T>(
       return await fn()
     } catch (err) {
       lastErr = err
+      // An abort is the caller saying it no longer wants the bytes. Retrying
+      // it would re-issue a read nobody is waiting for.
+      if (err instanceof Error && err.name === 'AbortError') throw err
       // A refused/dropped connection under load ("Failed to fetch" / TypeError)
       // is transient; a real error (bad range, decode, 404-as-throw) is not.
       const transient =
@@ -170,7 +173,11 @@ export function createSourceChunkLoader(
   // must still fetch once — clamp to >= 1.
   const maxConcurrent = Math.max(1, Math.floor(opts.maxConcurrentLoads) || 1)
   const totalAttempts = Math.max(1, Math.floor(opts.retryAttempts) || 1)
-  const inflight = new Map<string, Promise<Uint8Array>>()
+  // One entry per in-flight REGION, which several chunk requests may share (a
+  // plan swap changes the chunk index but not the region). `waiters` counts
+  // the callers still interested: the underlying read is aborted only when the
+  // last of them gives up, so one cancelled chunk cannot cancel its twin.
+  const inflight = new Map<string, InflightRead>()
   let active = 0
   const waiters: Array<() => void> = []
   const acquire = (): Promise<void> => {
@@ -193,12 +200,18 @@ export function createSourceChunkLoader(
     const levelIndex = request.desc.sourceLevel ?? 0
     const texOrigin = request.desc.texOrigin
     const texDims = request.desc.texDims
+    const signal = request.signal
     // Content key (level + region), stable across plan swaps where the chunk
     // INDEX changes but the fetched region does not.
     const key = `${levelIndex}|${texOrigin.join(',')}|${texDims.join(',')}`
     const cached = inflight.get(key)
-    if (cached) return cached
-    const next = acquire()
+    if (cached) {
+      cached.waiters++
+      joinRead(cached, signal)
+      return cached.promise
+    }
+    const controller = new AbortController()
+    const promise = acquire()
       .then(() =>
         withRetry(
           () =>
@@ -207,23 +220,51 @@ export function createSourceChunkLoader(
               texOrigin,
               texDims,
               bytesPerVoxel: request.bytesPerVoxel,
+              signal: controller.signal,
             }),
           totalAttempts,
         ),
       )
       .finally(() => release())
-    inflight.set(key, next)
+    const entry: InflightRead = { promise, controller, waiters: 1 }
+    inflight.set(key, entry)
+    joinRead(entry, signal)
     // Drop the in-flight entry on settle. Attach cleanup as BOTH handlers of a
-    // .then so the derived promise resolves even when `next` rejects (a brick
-    // that exhausts retries) — a bare `.finally` here would re-raise into an
-    // unobserved promise. Callers still receive the original `next` (and its
-    // rejection); this derived promise is intentionally not returned.
+    // .then so the derived promise resolves even when `promise` rejects (a
+    // brick that exhausts retries) — a bare `.finally` here would re-raise into
+    // an unobserved promise. Callers still receive the original promise (and
+    // its rejection); this derived promise is intentionally not returned.
     const cleanup = (): void => {
-      if (inflight.get(key) === next) inflight.delete(key)
+      if (inflight.get(key) === entry) inflight.delete(key)
     }
-    next.then(cleanup, cleanup)
-    return next
+    promise.then(cleanup, cleanup)
+    return promise
   }
+}
+
+/** One in-flight region read, shared by every caller that asked for it. */
+interface InflightRead {
+  promise: Promise<Uint8Array>
+  controller: AbortController
+  waiters: number
+}
+
+/**
+ * Register one caller's interest in an in-flight read, and abort the read once
+ * every caller has withdrawn. A caller with no signal never withdraws, so a
+ * renderer that supplies none behaves exactly as it did before.
+ */
+function joinRead(entry: InflightRead, signal: AbortSignal | undefined): void {
+  if (!signal) return
+  const withdraw = (): void => {
+    entry.waiters--
+    if (entry.waiters <= 0) entry.controller.abort(signal.reason)
+  }
+  if (signal.aborted) {
+    withdraw()
+    return
+  }
+  signal.addEventListener('abort', withdraw, { once: true })
 }
 
 // --- the manager ------------------------------------------------------------

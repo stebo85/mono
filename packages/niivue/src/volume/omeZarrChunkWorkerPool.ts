@@ -100,7 +100,10 @@ export class OmeZarrChunkWorkerPool {
    * whether that error is worth a main-thread retry.
    */
   async fetchChunk(req: ChunkedVolumeFetch): Promise<Uint8Array> {
-    if (this.disposed) throw new Error('OME-Zarr chunk pool: already disposed')
+    // A read that arrives after dispose belongs to a volume being torn down.
+    // Reporting it as an abort keeps the caller from "recovering" by reading
+    // the same bytes on the main thread for a view that no longer wants them.
+    if (this.disposed) throw abortError('OME-Zarr chunk pool: already disposed')
     const { levelIndex, texOrigin, texDims, bytesPerVoxel, signal } = req
     signal?.throwIfAborted()
     const index = routeChunkToWorker(
@@ -111,7 +114,11 @@ export class OmeZarrChunkWorkerPool {
     const taskId = this.nextTaskId++
     // The cancel reaches the worker's own read, not just its queue: an abort
     // while the bytes are already on the wire is the case worth cancelling.
-    const onAbort = (): void => worker.notify({ cancel: taskId })
+    // Not after dispose: `notify` would re-create the very worker `terminate`
+    // just tore down, to cancel a task that died with it.
+    const onAbort = (): void => {
+      if (!this.disposed) worker.notify({ cancel: taskId })
+    }
     signal?.addEventListener('abort', onAbort, { once: true })
     try {
       const reply = await worker.execute<ChunkReply>({
@@ -122,6 +129,12 @@ export class OmeZarrChunkWorkerPool {
       })
       this.merge(index, reply)
       return reply.bytes
+    } catch (err) {
+      // `terminate` rejects everything outstanding with a plain error. Once
+      // disposed, that is teardown rather than worker failure, so it reports
+      // as an abort for the same reason the guard above does.
+      if (this.disposed) throw abortError('OME-Zarr chunk pool: disposed')
+      throw err
     } finally {
       signal?.removeEventListener('abort', onAbort)
     }
@@ -154,4 +167,14 @@ export class OmeZarrChunkWorkerPool {
     }
     if (reply.cache) this.lastCache[index] = reply.cache
   }
+}
+
+/**
+ * An error the rest of the pipeline treats as "nobody wants this any more":
+ * never retried, never fallen back to the main thread, never logged.
+ */
+function abortError(message: string): Error {
+  const err = new Error(message)
+  err.name = 'AbortError'
+  return err
 }

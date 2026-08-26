@@ -12,30 +12,48 @@ compensation work"; decode and budget plans wait behind them.
 
 ## Move chunk decode off the main thread
 
-- [ ] Decode OME-Zarr chunks in a worker instead of on the main thread.
+- [x] Decode OME-Zarr chunks in a worker instead of on the main thread.
+      DONE (stage C). Full write-up: `docs/caching.md` 2.1 and 2.7.
 
-  `omeZarrChunkedSource.fetchChunk` calls `readLevelRegion`, which runs the
-  whole zarrita path (fetch, decompress, dtype convert, region assemble) on the
-  main thread. The GPU upload pump (`pumpChunkUploads`, both backends) then does
-  its per-frame work on that same thread under a time budget. The result is the
-  crawl a user sees while a zoomed-in view streams: every decode competes with
-  the render loop, so interaction stutters exactly when the most bricks are
-  arriving.
+      `fetchOmeZarrChunkedSource` opens the store on the calling thread for its
+      metadata and puts every chunk read on a pool of workers.
+      `src/workers/omeZarrChunk.worker.ts` opens its own view of the store
+      through the same `openOmeZarrChunkedSource` the main thread uses (a
+      zarrita array is not structured-cloneable) and runs fetch, decompress,
+      dtype convert and the region assemble there, transferring the finished
+      `Uint8Array` back. `src/volume/omeZarrChunkWorkerPool.ts` routes by
+      hashing the region rather than picking the idlest worker, because each
+      worker holds its own byte LRU and a revisited brick must return to the
+      worker that already has its bytes. Pool size is half the reported cores,
+      clamped to `[1, 4]`. `createSourceChunkLoader` is untouched, so the
+      manager still sees one `VolumeChunkSource` contract with the same
+      concurrency, retry and dedup wrapper.
 
-  `src/workers/` already exists but the chunked path does not use it. The shape
-  of the fix: a small pool of decode workers, transfer the decoded
-  `Uint8Array` back (transferable, not structured-cloned), keep the existing
-  `createSourceChunkLoader` concurrency/retry/dedup wrapper unchanged so the
-  manager sees the same `VolumeChunkSource` contract. `maxConcurrentLoads`
-  (default 6) becomes the pool's queue depth rather than a bound on
-  main-thread work.
+      Measured on the same HiP-CT window that condemned the main-thread path:
+      8604 ms of lost frame time over a 24 ms budget became NONE, with 1898 ms
+      of streaming work accounted for off-thread, 100% of it. A 40 second OCT
+      slice-scrub left 2 ms of main-thread streaming cost in total.
 
-  Measured (stage B, see below and `docs/caching.md` section 2.5): streaming
-  HiP-CT from S3 for 20 seconds with no interaction cost the render loop 8604 ms
-  over a 24 ms frame budget, worst single gap 1052 ms, against an idle baseline
-  of 0 ms. Instrumented main-thread work over the same window was 125 ms, all of
-  it texture upload. So the stall is not `texSubImage3D`, and the part a worker
-  cannot move is about 1.5 percent of the problem. The worker is justified.
+      Timing survives the move: each worker reports a cumulative snapshot, the
+      pool diffs it and folds the delta into an off-thread total, so
+      `mainThreadMs` reports only what still blocks the render loop and a new
+      `offThreadMs` reports what was moved. The dandi-demo HUD shows the share
+      as a `workers` row, so a silent fallback to the main thread reads as a
+      number rather than merely as slowness.
+
+      Two build invariants that are easy to undo by accident: the module that
+      knows about the pool must stay OUTSIDE anything the worker imports (hence
+      `fetchOmeZarrChunkedSource.ts` as its own file, with the worker importing
+      only the pool-free `openOmeZarrChunkedSource`), and zarrita's lazily
+      imported codecs need
+      `worker.rollupOptions.output.inlineDynamicImports` in
+      `vite.config.lib.ts` or the inlined worker code-splits into chunks it has
+      nowhere to fetch.
+
+      Not addressed here, by design: the GPU upload stays on the render thread
+      (it cannot move, and it was 1.5 percent of the problem), and a pool moves
+      the decode without avoiding it, so the 15x to 39x byte amplification in
+      `docs/caching.md` 2.5 is stage D's target.
 
 ## Caching and prefetch
 
@@ -53,8 +71,9 @@ Full comparison against Neuroglancer, with the staged plan: **`docs/caching.md`*
       (one frame of slack, because the pump is async). Same discipline `NVSlide`
       has always applied to tiles. `chunkStreamStats` reports a cumulative
       `staleDropped` on both backends so the win is measurable; the dandi-demo
-      HUD shows it. Still open, and folded into the worker work below: an
-      `AbortController` for fetches already in flight.
+      HUD shows it. The in-flight half folded into stage C as planned: the pool
+      forwards an `AbortSignal` to the worker, which aborts the zarrita read on
+      the wire rather than discarding the bytes on arrival.
 
 - [x] Instrument fetch / decode / upload separately, before the worker work
       above. DONE (stage B). `src/volume/chunkTiming.ts` records five spans we

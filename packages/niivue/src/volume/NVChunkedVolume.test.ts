@@ -377,6 +377,68 @@ describe('createSourceChunkLoader', () => {
       process.off('unhandledRejection', onUnhandled)
     }
   })
+
+  test('a cancelled request aborts the source read', async () => {
+    let seen: AbortSignal | undefined
+    const source: ChunkedVolumeSource = {
+      datatypeCode: 4,
+      levels: [{ level: 0, shape: [8, 8, 8], spacing: [1, 1, 1] }],
+      fetchChunk: (r) =>
+        new Promise((_resolve, reject) => {
+          seen = r.signal
+          r.signal?.addEventListener('abort', () =>
+            reject(new DOMException('aborted', 'AbortError')),
+          )
+        }),
+    }
+    const load = createSourceChunkLoader(source, {
+      maxConcurrentLoads: 2,
+      retryAttempts: 3,
+    })
+    const controller = new AbortController()
+    const request = {
+      ...req(0, [0, 0, 0], [1, 1, 1]),
+      signal: controller.signal,
+    }
+    const pending = load(request)
+    await new Promise((r) => setTimeout(r, 0))
+    expect(seen?.aborted).toBe(false)
+    controller.abort()
+    expect(seen?.aborted).toBe(true)
+    // An abort is never retried, so it surfaces on the first attempt.
+    await expect(pending).rejects.toThrow('aborted')
+  })
+
+  test('one cancelled request does not abort a shared read another still wants', async () => {
+    let seen: AbortSignal | undefined
+    let release: (() => void) | undefined
+    const source: ChunkedVolumeSource = {
+      datatypeCode: 4,
+      levels: [{ level: 0, shape: [8, 8, 8], spacing: [1, 1, 1] }],
+      fetchChunk: (r) =>
+        new Promise((resolve) => {
+          seen = r.signal
+          release = () => resolve(new Uint8Array(2))
+        }),
+    }
+    const load = createSourceChunkLoader(source, {
+      maxConcurrentLoads: 2,
+      retryAttempts: 1,
+    })
+    const first = new AbortController()
+    const second = new AbortController()
+    // Same region, two chunk indices — the plan-swap case the dedup exists for.
+    const shared = req(0, [0, 0, 0], [1, 1, 1])
+    const a = load({ ...shared, signal: first.signal })
+    const b = load({ ...shared, chunkIndex: 1, signal: second.signal })
+    await new Promise((r) => setTimeout(r, 0))
+    first.abort()
+    expect(seen?.aborted).toBe(false)
+    release?.()
+    await expect(a).resolves.toHaveLength(2)
+    await expect(b).resolves.toHaveLength(2)
+    second.abort()
+  })
 })
 
 // --- manager: id uniqueness + serialized plan swaps ------------------------

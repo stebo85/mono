@@ -999,6 +999,9 @@ export default class NVGlview {
             md.scene.isClipPlaneCutaway,
             md.volume.paqdUniforms,
             md.volume.transmittanceCutoff,
+            // This tile's background volume, which is not always volumes[0]
+            // (a global3d tile binds its own).
+            vol.opacity ?? 1,
           )
           // Independent hi-res chunked overlay: stream its own working set and
           // draw it as translucent cubes over the base, in the same pass. Uses

@@ -48,6 +48,16 @@ uniform float invGamma;
 // strict no-op and is the default. Mirrors lodOpacityScale in
 // wgpu/volumeShaderLib.ts.
 uniform float lodOpacityScale;
+// The background volume's own \`opacity\`, scaling every background sample's
+// alpha. The 2D slice shader has always honoured it as a plain uniform; here it
+// scales the alpha BEFORE the classification test so a half-opaque volume is a
+// half-dense medium (you see deeper into it) rather than a fully dense one
+// faded at the end, and so opacity 0 removes the background from the depth
+// write and the clip-surface shading as well as from the colour. Overlays do
+// not use it: their opacity is baked into the overlay texture's alpha by the
+// orient pass. 1.0 is the default and a strict no-op. Mirrors backOpacity in
+// wgpu/volumeShaderLib.ts.
+uniform float backOpacity;
 uniform vec4 clipPlaneColor;
 uniform vec4 paqdUniforms;
 uniform sampler2D matcap;
@@ -467,6 +477,11 @@ void main() {
       skipBackground = true;
     }
   }
+  // A fully transparent background contributes no colour, so marching it would
+  // only cost time and still claim the depth buffer and the clip surface.
+  if (backOpacity < (1.0 / 255.0)) {
+    skipBackground = true;
+  }
   // Shared values for all passes. Keep samples on a centered full-volume
   // lattice so adjacent chunks do not reset the ray phase at their seams.
   float origRan = raySamplePhase(origStart, stepSize);
@@ -572,6 +587,9 @@ void main() {
         vec4 colorSample = (cubicFilter > 0.5)
           ? sampleTricubic(volume, volCoord)
           : texture(volume, volCoord);
+        // Before the classification test, so a transparent-enough volume drops
+        // out of the first-hit depth and the AO stencil too, not just the colour.
+        colorSample.a *= backOpacity;
         if (colorSample.a >= 0.01) {
           if (!bgHasHit) {
             bgHasHit = true;

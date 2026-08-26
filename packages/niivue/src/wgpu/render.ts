@@ -250,7 +250,9 @@ type TexCacheEntry = SingleTexEntry | ChunkedTexEntry
 
 // 496 bytes = 124 floats:
 //   16 mvp + 16 norm + 16 matRAS + 4 volScale + 4 rayDir + 4 (gradient/numVol/cutaway/pad)
-//   + 4 clipPlaneColor + 24 clipPlanes + 4 paqd + 1 earlyTermination + 7 _pad0 (vec3 align)
+//   + 4 clipPlaneColor + 24 clipPlanes + 4 paqd + 8 scalars (earlyTermination,
+//     clipPlaneOverlay, fadeAlpha, renderMode, cubicFilter, invGamma,
+//     lodOpacityScale, backOpacity — what used to be 1 + a 7-lane _pad0)
 //   + 4 volumeTexDimsFull + 4 chunkSubOrigin + 4 chunkSubSize
 //   + 4 dataOriginTexFrac + 4 dataSizeTexFrac + 4 rayStepTexVox
 // Still rounds up to the same 512-byte alignedRenderSize (UNIFORM_ALIGNMENT 256),
@@ -2488,6 +2490,7 @@ export class VolumeRenderer extends NVRenderer {
     isClipCutaway = false,
     paqdUniforms: readonly number[] = [0, 0, 0, 0],
     earlyTermination = 0.95,
+    backOpacity = 1,
   ): void {
     if (
       !this.isReady ||
@@ -2515,6 +2518,7 @@ export class VolumeRenderer extends NVRenderer {
         isClipCutaway,
         paqdUniforms,
         earlyTermination,
+        backOpacity,
       )
       return
     }
@@ -2558,6 +2562,11 @@ export class VolumeRenderer extends NVRenderer {
           this.volumeTexture.depthOrArrayLayers,
         ],
       },
+      // Not an overlay layer, never cross-faded, and carrying the base
+      // volume's own opacity.
+      0,
+      1,
+      backOpacity,
     )
 
     pass.setPipeline(this.pipeline)
@@ -2590,6 +2599,7 @@ export class VolumeRenderer extends NVRenderer {
     isClipCutaway: boolean,
     paqdUniforms: readonly number[],
     earlyTermination: number,
+    backOpacity: number,
   ): void {
     this._drawChunkedEntry(
       device,
@@ -2610,6 +2620,7 @@ export class VolumeRenderer extends NVRenderer {
       isClipCutaway,
       paqdUniforms,
       earlyTermination,
+      backOpacity,
     )
   }
 
@@ -2695,7 +2706,10 @@ export class VolumeRenderer extends NVRenderer {
     clipPlanes: number[],
     isClipCutaway: boolean,
     paqdUniforms: readonly number[],
+    // The base volume's own opacity. Left at the neutral 1 by the overlay
+    // entry, whose opacity is already baked into its chunk textures.
     earlyTermination: number,
+    backOpacity = 1,
   ): void {
     if (
       !entry ||
@@ -2884,6 +2898,11 @@ export class VolumeRenderer extends NVRenderer {
           cubicSafe: entry.cubicSafe,
         },
         0,
+        // Full strength: the fine cube in front of this one carries the
+        // cross-fade weight. The floor is base-volume data, so it takes the
+        // base's opacity along with it.
+        1,
+        backOpacity,
       )
       pass.setBindGroup(0, this._floorBindGroup, [floorRenderOffset])
       pass.drawIndexed(this.cube.indices.length)
@@ -2983,6 +3002,7 @@ export class VolumeRenderer extends NVRenderer {
         },
         overlayMode ? 1 : 0,
         fade,
+        backOpacity,
       )
 
       pass.setBindGroup(0, bindGroup, [renderOffset])
@@ -3009,6 +3029,7 @@ export class VolumeRenderer extends NVRenderer {
     chunkUniforms: ChunkUniforms,
     overlayLayerMode = 0,
     fadeAlpha = 1,
+    backOpacity = 1,
   ): void {
     device.queue.writeBuffer(
       paramsBuffer,
@@ -3067,7 +3088,11 @@ export class VolumeRenderer extends NVRenderer {
           chunkUniforms.lodDownsample ?? 1,
           this.lodOpacityCompensation,
         ),
-        0,
+        // backOpacity (offset 396, the last _pad0 lane): the background
+        // volume's own opacity, scaling every background sample's alpha.
+        // Overlays bake theirs into the overlay texture during the orient
+        // pass, so this is the only volume it applies to.
+        backOpacity,
         ...chunkUniforms.volumeTexDimsFull,
         1,
         ...chunkUniforms.chunkSubOrigin,

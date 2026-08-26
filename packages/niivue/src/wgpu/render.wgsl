@@ -369,6 +369,12 @@ fn fragment_main(in: VertexOutput) -> FragmentOutput {
 			skipBackground = true;
 		}
 	}
+	// A fully transparent background contributes no colour, so marching it
+	// would only cost time and still claim the depth buffer and the clip
+	// surface.
+	if (params.backOpacity < (1.0 / 255.0)) {
+		skipBackground = true;
+	}
 	// Shared values for all passes. Keep samples on a centered full-volume
 	// lattice so adjacent chunks do not reset the ray phase at their seams.
 	let origRan = raySamplePhase(origStart, stepSize);
@@ -478,6 +484,9 @@ fn fragment_main(in: VertexOutput) -> FragmentOutput {
 				if (params.cubicFilter > 0.5) {
 					colorSample = sampleTricubic(volume, tex_sampler, volCoord);
 				}
+				// Before the classification test, so a transparent-enough volume drops
+				// out of the first-hit depth and the AO stencil too, not just the colour.
+				colorSample.a *= params.backOpacity;
 				if (colorSample.a >= 0.01) {
 					if (!bgHasHit) {
 						bgHasHit = true;

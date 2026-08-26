@@ -2180,6 +2180,7 @@ export class VolumeRenderer extends NVRenderer {
     isClipCutaway = false,
     paqdUniforms: readonly number[] = [0, 0, 0, 0],
     earlyTermination = 0.95,
+    backOpacity = 1,
   ): void {
     if (!this.isReady || !this.shader || !this.cubeVAO || !this.indexBuffer)
       return
@@ -2322,6 +2323,12 @@ export class VolumeRenderer extends NVRenderer {
       gl.uniform4fv(shader.uniforms.paqdUniforms, paqdUniforms as number[])
     if (shader.uniforms.earlyTermination)
       gl.uniform1f(shader.uniforms.earlyTermination, earlyTermination)
+    // The background volume's own opacity. Overlays bake theirs into the
+    // overlay texture during the orient pass, so this is the only volume it
+    // applies to -- and the only one it was missing from, since the 2D slice
+    // shader has always taken it as a uniform.
+    if (shader.uniforms.backOpacity)
+      gl.uniform1f(shader.uniforms.backOpacity, backOpacity)
 
     // 4. Bind Geometry
     gl.bindVertexArray(this.cubeVAO)
@@ -2725,6 +2732,12 @@ export class VolumeRenderer extends NVRenderer {
       gl.uniform4fv(shader.uniforms.paqdUniforms, paqdUniforms as number[])
     if (shader.uniforms.earlyTermination)
       gl.uniform1f(shader.uniforms.earlyTermination, earlyTermination)
+    // Explicitly neutral, not merely omitted: these cubes share the program
+    // with draw(), so an unset uniform would keep the base volume's opacity
+    // from the previous draw. This layer's own opacity is already baked into
+    // its chunk textures by rebakeChunkedOverlays.
+    if (shader.uniforms.backOpacity)
+      gl.uniform1f(shader.uniforms.backOpacity, 1.0)
 
     gl.bindVertexArray(this.cubeVAO)
     gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, this.indexBuffer)

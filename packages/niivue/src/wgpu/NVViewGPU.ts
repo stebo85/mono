@@ -1298,6 +1298,9 @@ export default class NVView {
             md.scene.isClipPlaneCutaway,
             md.volume.paqdUniforms,
             md.volume.transmittanceCutoff,
+            // This tile's background volume, which is not always volumes[0]
+            // (a global3d tile binds its own).
+            vol.opacity ?? 1,
           )
           // Independent hi-res chunked overlay: stream its own working set and
           // draw it as translucent cubes over the base, in the same pass. Uses
@@ -2771,16 +2774,18 @@ export default class NVView {
         // clipPlaneOverlay must carry the LIVE flag — the pick shader clips its
         // overlay pass with it, and a zero here made picks land on cut-away
         // overlay voxels (WebGL2 sets the same uniform by name in
-        // drawDepthPick). A pick reads geometry, not colour, so gamma is left
-        // neutral rather than mirrored from the scene.
+        // drawDepthPick). A pick reads geometry, not colour, so gamma and
+        // backOpacity are left neutral rather than mirrored from the scene
+        // (and the pick shader never reads backOpacity anyway; a fully
+        // transparent base is already excluded by the opacity gate above).
         const renderParamPadding = [
           md.scene.clipPlaneOverlay ? 1.0 : 0.0,
           1.0, // fadeAlpha: no cross-fade in a pick draw
           0,
           0,
           1.0, // invGamma: neutral
-          0,
-          0,
+          0, // lodOpacityScale: unused by the pick shader
+          1.0, // backOpacity: neutral
         ]
         const identityChunkUniforms = [
           ...volumeTexDimsFull,

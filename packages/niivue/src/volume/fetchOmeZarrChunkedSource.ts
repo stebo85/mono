@@ -23,6 +23,10 @@ import {
   openOmeZarrChunkedSource,
 } from './omeZarrChunkedSource'
 import type { OmeZarrChunkWorkerPool } from './omeZarrChunkWorkerPool'
+import {
+  OME_ZARR_PERSIST_BYTES,
+  type PersistentCacheOptions,
+} from './persistentByteCache'
 
 /**
  * Open a store by URL, adapted for `nv.loadChunkedVolume`, with chunk reads on
@@ -38,13 +42,18 @@ export async function fetchOmeZarrChunkedSource(
 ): Promise<OmeZarrChunkedSource> {
   const cacheBytes = options.cacheBytes ?? OME_ZARR_CHUNK_CACHE_BYTES
   const poolSize = resolveChunkWorkerCount(options)
-  // With a pool running the workers hold the byte cache, and a duplicate here
-  // would only cache what the workers already declined to send twice.
+  // With a pool running the workers hold the caches, and a duplicate here
+  // would only cache what the workers already declined to send twice. The
+  // persistent tier follows the byte cache for the same reason. It would also
+  // need a scope of its own over the shared backing, and nothing routed here
+  // would ever find what the workers wrote.
   const local = await openOmeZarrChunkedSource(url, {
     ...options,
     cacheBytes: poolSize > 0 ? 0 : cacheBytes,
+    persist: poolSize > 0 ? false : options.persist,
   })
   if (poolSize === 0) return local
+  const persistPerWorker = splitPersistBudget(options.persist, poolSize)
   // Imported on demand, not at the top. The pool carries an inlined worker
   // that bundles zarrita and its codecs -- megabytes that only a caller who
   // actually streams chunks should ever download.
@@ -52,13 +61,31 @@ export async function fetchOmeZarrChunkedSource(
   const pool = new OmeZarrChunkWorkerPool(url, options, {
     size: poolSize,
     cacheBytesPerWorker: Math.floor(cacheBytes / poolSize),
+    persistPerWorker,
   })
   return {
     ...local,
     fetchChunk: (req) => readViaPool(pool, local, req),
     byteCacheStats: () => pool.byteCacheStats(),
+    ...(persistPerWorker ? { persistStats: () => pool.persistStats() } : {}),
     dispose: () => pool.dispose(),
   }
+}
+
+/**
+ * One worker's share of the persistent budget, or false when the caller did
+ * not ask for a tier. Splitting rather than handing each worker the whole
+ * number keeps the budget meaning what it says: the bytes on the user's disk,
+ * not that number times the pool size.
+ */
+function splitPersistBudget(
+  persist: boolean | PersistentCacheOptions | undefined,
+  poolSize: number,
+): PersistentCacheOptions | false {
+  if (!persist) return false
+  const options = persist === true ? {} : persist
+  const total = options.maxBytes ?? OME_ZARR_PERSIST_BYTES
+  return { maxBytes: Math.floor(total / poolSize), name: options.name }
 }
 
 /**

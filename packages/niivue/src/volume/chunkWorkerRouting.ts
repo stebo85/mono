@@ -15,6 +15,7 @@ import type {
   OffThreadChunkTiming,
 } from './chunkTiming'
 import type { ByteCacheStats } from './omeZarrChunkedSource'
+import type { PersistentCacheStats } from './persistentByteCache'
 
 const PHASES: readonly ChunkPhase[] = [
   'net',
@@ -110,6 +111,45 @@ export function sumByteCacheStats(
     total.rejected += part.rejected
     total.evicted += part.evicted
     total.evictedBytes += part.evictedBytes
+    total.entries += part.entries
+    total.bytes += part.bytes
+  }
+  return total
+}
+
+/**
+ * Read several per-worker persistent tiers as one. Counts add, as they do for
+ * the byte caches, but note what `bytes` means here: the workers share ONE
+ * backing store and each owns a scope of it, so a worker's byte total covers
+ * only its own scope. Summing them is right precisely because routing is
+ * deterministic -- a brick always returns to the worker that holds it, so the
+ * scopes partition the keys rather than overlapping.
+ */
+export function sumPersistStats(
+  parts: readonly (PersistentCacheStats | null)[],
+  maxBytes: number,
+): PersistentCacheStats {
+  const total: PersistentCacheStats = {
+    hits: 0,
+    misses: 0,
+    writes: 0,
+    rejected: 0,
+    evicted: 0,
+    evictedBytes: 0,
+    errors: 0,
+    entries: 0,
+    bytes: 0,
+    maxBytes,
+  }
+  for (const part of parts) {
+    if (!part) continue
+    total.hits += part.hits
+    total.misses += part.misses
+    total.writes += part.writes
+    total.rejected += part.rejected
+    total.evicted += part.evicted
+    total.evictedBytes += part.evictedBytes
+    total.errors += part.errors
     total.entries += part.entries
     total.bytes += part.bytes
   }

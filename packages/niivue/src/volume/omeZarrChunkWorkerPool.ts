@@ -30,17 +30,23 @@ import {
   chunkTimingDelta,
   routeChunkToWorker,
   sumByteCacheStats,
+  sumPersistStats,
 } from './chunkWorkerRouting'
 import type {
   ByteCacheStats,
   FetchOmeZarrChunkedSourceOptions,
 } from './omeZarrChunkedSource'
+import type {
+  PersistentCacheOptions,
+  PersistentCacheStats,
+} from './persistentByteCache'
 
 /** What one worker returns for one chunk. */
 interface ChunkReply {
   bytes: Uint8Array
   timing: ChunkTimingSnapshot
   cache: ByteCacheStats | null
+  persist: PersistentCacheStats | null
 }
 
 /** Options for {@link OmeZarrChunkWorkerPool}. */
@@ -49,13 +55,21 @@ export interface OmeZarrChunkPoolOptions {
   size: number
   /** Byte budget for EACH worker's store cache. */
   cacheBytesPerWorker: number
+  /**
+   * The persistent tier EACH worker opens, already sized to its share, or
+   * false for no tier at all. The workers share one backing store and are
+   * given a scope apiece; routing is deterministic, so a brick returns to the
+   * worker that holds it and the scopes partition the store.
+   */
+  persistPerWorker: PersistentCacheOptions | false
 }
 
 export class OmeZarrChunkWorkerPool {
   private readonly workers: NVWorker[]
   private readonly lastTiming: (ChunkTimingSnapshot | null)[]
   private readonly lastCache: (ByteCacheStats | null)[]
-  private readonly workerOptions: FetchOmeZarrChunkedSourceOptions
+  private readonly lastPersist: (PersistentCacheStats | null)[]
+  private readonly workerOptions: FetchOmeZarrChunkedSourceOptions[]
   private nextTaskId = 0
   private disposed = false
 
@@ -71,6 +85,7 @@ export class OmeZarrChunkWorkerPool {
     )
     this.lastTiming = new Array(size).fill(null)
     this.lastCache = new Array(size).fill(null)
+    this.lastPersist = new Array(size).fill(null)
     // Rebuild the options the worker needs rather than forwarding whatever
     // came in: `fetchImpl` is a function and would not survive the clone (the
     // caller declines the pool when one is set), and the worker must not build
@@ -79,14 +94,23 @@ export class OmeZarrChunkWorkerPool {
     // `levels` and `ignoreMissingLevels` MUST cross: they decide which
     // datasets get opened, and `levelIndex` is an index into that opened list.
     // Drop them and every request would silently address the wrong level.
-    this.workerOptions = {
+    //
+    // The persistent tier is the one option that differs per worker: each gets
+    // its own scope over the shared backing, plus the full list so a worker
+    // can tell a sibling's keys (leave them) from the leftovers of a
+    // differently sized pool (delete them).
+    const scopes = Array.from({ length: size }, (_, i) => `w${i}/`)
+    this.workerOptions = scopes.map((scope) => ({
       channel: options.channel,
       timepoint: options.timepoint,
       levels: options.levels,
       ignoreMissingLevels: options.ignoreMissingLevels,
       cacheBytes: pool.cacheBytesPerWorker,
+      persist: pool.persistPerWorker
+        ? { ...pool.persistPerWorker, scope, scopes }
+        : false,
       workers: 0,
-    }
+    }))
   }
 
   /** Workers running. */
@@ -124,7 +148,7 @@ export class OmeZarrChunkWorkerPool {
       const reply = await worker.execute<ChunkReply>({
         taskId,
         url: this.url,
-        options: this.workerOptions,
+        options: this.workerOptions[index],
         req: { levelIndex, texOrigin, texDims, bytesPerVoxel },
       })
       this.merge(index, reply)
@@ -151,6 +175,19 @@ export class OmeZarrChunkWorkerPool {
     )
   }
 
+  /**
+   * The pool's persistent tiers, summed, as of each worker's last reply. The
+   * budget reported is the pool's total, so a hit rate here reads against the
+   * same disk a single-threaded run would have used.
+   */
+  persistStats(): PersistentCacheStats {
+    const perWorker = this.pool.persistPerWorker
+    return sumPersistStats(
+      this.lastPersist,
+      (perWorker ? (perWorker.maxBytes ?? 0) : 0) * this.workers.length,
+    )
+  }
+
   /** Terminate every worker and reject whatever is outstanding. */
   dispose(): void {
     if (this.disposed) return
@@ -166,6 +203,7 @@ export class OmeZarrChunkWorkerPool {
       this.lastTiming[index] = reply.timing
     }
     if (reply.cache) this.lastCache[index] = reply.cache
+    if (reply.persist) this.lastPersist[index] = reply.persist
   }
 }
 

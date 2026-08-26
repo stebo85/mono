@@ -246,6 +246,18 @@ export {
   openOmeZarr,
 } from './volume/omeZarrLoader'
 export {
+  clearPersistentByteCaches,
+  OME_ZARR_PERSIST_BYTES,
+  openCacheStorageBacking,
+  openPersistentByteCache,
+  PERSISTENT_CACHE_NAME,
+  PersistentByteCache,
+  type PersistentCacheBacking,
+  type PersistentCacheOptions,
+  type PersistentCacheStats,
+  withPersistentBytes,
+} from './volume/persistentByteCache'
+export {
   createStreamingNVImage,
   type StreamingVolumeSpec,
 } from './volume/streamingVolume'

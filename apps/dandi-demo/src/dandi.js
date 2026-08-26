@@ -137,6 +137,11 @@ const DEFAULT_RESIDENCY_BYTES =
   backend === 'webgpu' ? 8192 * 1024 * 1024 : 1280 * 1024 * 1024
 // Store-level byte cache shared by both panes (raw zarr chunk responses).
 const ZARR_CACHE_BYTES = 512 * 1024 * 1024
+// Disk budget for the cross-session tier. Every other cache here dies with the
+// tab; this one survives it, so a reload of a dataset already visited streams
+// from the local disk instead of S3. It is bounded, LRU, and clearable from the
+// console with `clearPersistentByteCaches()`.
+const ZARR_PERSIST_BYTES = 512 * 1024 * 1024
 const SLIDE_CACHE_BYTES = 192 * 1024 * 1024
 // Rebuilding the slide is cheap but it drops in-flight tiles, so a crosshair
 // DRAG should not rebuild it once per mouse move.
@@ -731,6 +736,21 @@ function decodedTierCost(stats) {
   )}, ${d.evicted} dropped)`
 }
 
+// The persistent tier is the only cache here that outlives the tab. Read the
+// row as a warm-start meter: on a first visit it is all misses and writes, and
+// on a reload of the same dataset the hits are round trips to S3 that never
+// happened. `off` means no Cache Storage -- a non-secure context, or a browser
+// that declined -- not that the tier failed.
+function persistCost() {
+  const p = chunkSource?.persistStats?.()
+  if (!p || p.maxBytes === 0) return 'off'
+  const looks = p.hits + p.misses
+  const rate = looks > 0 ? Math.round((100 * p.hits) / looks) : 0
+  return `${rate}% of ${looks} (${formatBytes(p.bytes)} of ${formatBytes(
+    p.maxBytes,
+  )} on disk, ${p.writes} written)`
+}
+
 function updateVolumeHud() {
   if (!chunkSource || !nv) return
   const def = DATASETS[els.dataset.value]
@@ -779,6 +799,7 @@ function updateVolumeHud() {
     )}</span></div>
     <div class="row"><span class="key">stream cost</span><span>${brickCost()}</span></div>
     <div class="row"><span class="key">byte cache</span><span>${byteCacheCost()}</span></div>
+    <div class="row"><span class="key">disk cache</span><span>${persistCost()}</span></div>
     <div class="row"><span class="key">workers</span><span>${workerCost()}</span></div>
     <div class="row"><span class="key">stalls</span><span>${stallCost()}</span></div>
     <div class="row"><span class="key">window</span><span>${formatValue(
@@ -946,6 +967,7 @@ async function loadDataset() {
   try {
     const source = await fetchOmeZarrChunkedSource(datasetUrl(def), {
       cacheBytes: ZARR_CACHE_BYTES,
+      persist: { maxBytes: ZARR_PERSIST_BYTES },
       ignoreMissingLevels: true,
     })
     // A switch that landed while this one was opening owns the panes now; this

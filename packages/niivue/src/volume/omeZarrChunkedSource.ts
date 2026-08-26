@@ -39,6 +39,14 @@ import {
   omeZarrNiftiDatatype,
   openOmeZarr,
 } from './omeZarrLoader'
+import {
+  OME_ZARR_PERSIST_BYTES,
+  openPersistentByteCache,
+  type PersistentByteCache,
+  type PersistentCacheOptions,
+  type PersistentCacheStats,
+  withPersistentBytes,
+} from './persistentByteCache'
 import { getBitsPerVoxel } from './utils'
 
 /** What a {@link ByteLruCache} has done since it was created or reset. */
@@ -224,6 +232,12 @@ export interface OmeZarrChunkedSource extends ChunkedVolumeSource {
    * read, and this returns the pool's caches summed instead.
    */
   readonly byteCacheStats?: () => ByteCacheStats
+  /**
+   * The persistent tier's counters, when one was opened for this source. Same
+   * arrangement as {@link byteCacheStats}: with the chunk worker pool on, the
+   * caches live on the workers and this sums them.
+   */
+  readonly persistStats?: () => PersistentCacheStats
   /**
    * Release what this source holds open. Terminates the chunk worker pool when
    * one is running; a no-op otherwise. Safe to call more than once.
@@ -458,6 +472,17 @@ export interface FetchOmeZarrChunkedSourceOptions
    * back to this thread.
    */
   workers?: number
+  /**
+   * Keep raw store bytes across sessions, so a reload streams from disk
+   * instead of the network. `true` takes the defaults; an object sizes and
+   * names the cache. Off by default: it writes to the user's disk, which is
+   * theirs to opt into.
+   *
+   * With a pool running, the budget is SPLIT across the workers the same way
+   * `cacheBytes` is, and they share one backing store. Requires a secure
+   * context with Cache Storage; where there is none, this is a no-op.
+   */
+  persist?: boolean | PersistentCacheOptions
 }
 
 /** Default byte budget for {@link fetchOmeZarrChunkedSource}'s store cache. */
@@ -490,17 +515,47 @@ export async function openOmeZarrChunkedSource(
   const base = options.fetchImpl
     ? new zarr.FetchStore(url, { fetch: options.fetchImpl })
     : new zarr.FetchStore(url)
+  // Innermost of the three tiers: below memory, above the network. A read
+  // reaches it only when the byte LRU could not answer, and what it hands back
+  // is what the network would have -- raw, still-compressed store bytes.
+  const persistCache = await openPersistTier(options.persist)
+  const persisted = persistCache
+    ? withPersistentBytes(base, persistCache, url)
+    : base
   const byteCache = cacheBytes > 0 ? new ByteLruCache(cacheBytes) : undefined
   const cached = byteCache
-    ? zarr.withByteCaching(base, { cache: byteCache })
-    : base
+    ? zarr.withByteCaching(persisted, { cache: byteCache })
+    : persisted
   // Outermost, so a byte-cache hit is measured as the fast read it is and the
   // `net` phase answers "how long did it take to get these bytes in hand".
   const store = withChunkTiming(cached)
-  const source = omeZarrChunkedSource(
+  const source: OmeZarrChunkedSource = omeZarrChunkedSource(
     await openOmeZarr(store, options),
     options,
   )
-  if (!byteCache) return source
-  return { ...source, byteCache, byteCacheStats: () => byteCache.stats }
+  const withPersist: OmeZarrChunkedSource = persistCache
+    ? { ...source, persistStats: () => persistCache.stats }
+    : source
+  if (!byteCache) return withPersist
+  return {
+    ...withPersist,
+    byteCache,
+    byteCacheStats: () => byteCache.stats,
+  }
+}
+
+/**
+ * Open the persistent tier a `persist` option asks for, or null. Null covers
+ * both "the caller did not ask" and "this context has no Cache Storage", which
+ * the read path treats identically: no tier, no change in behaviour.
+ */
+function openPersistTier(
+  persist: boolean | PersistentCacheOptions | undefined,
+): Promise<PersistentByteCache | null> {
+  if (!persist) return Promise.resolve(null)
+  const options = persist === true ? {} : persist
+  return openPersistentByteCache({
+    maxBytes: options.maxBytes ?? OME_ZARR_PERSIST_BYTES,
+    name: options.name,
+  })
 }

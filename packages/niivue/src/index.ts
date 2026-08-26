@@ -341,6 +341,18 @@ export {
 } from './volume/omeZarrChunkedSource'
 export type { OmeZarrChunkPoolOptions } from './volume/omeZarrChunkWorkerPool'
 export {
+  clearPersistentByteCaches,
+  OME_ZARR_PERSIST_BYTES,
+  openCacheStorageBacking,
+  openPersistentByteCache,
+  PERSISTENT_CACHE_NAME,
+  PersistentByteCache,
+  type PersistentCacheBacking,
+  type PersistentCacheOptions,
+  type PersistentCacheStats,
+  withPersistentBytes,
+} from './volume/persistentByteCache'
+export {
   defaultOmeZarrLevel,
   fetchOmeZarr,
   loadOmeZarrVolumes,

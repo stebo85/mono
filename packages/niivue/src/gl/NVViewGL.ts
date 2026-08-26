@@ -1695,6 +1695,7 @@ export default class NVGlview {
     inFlight: number
     total: number
     staleDropped: number
+    predicted: number
   } {
     return this.volumeRenderer.chunkStreamStats()
   }

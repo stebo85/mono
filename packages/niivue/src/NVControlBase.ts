@@ -211,6 +211,7 @@ type ViewBackend = {
     inFlight: number
     total: number
     staleDropped: number
+    predicted: number
   }
   rebakeChunkedOverlays: () => void
   /**
@@ -3805,6 +3806,11 @@ export default class NiiVue extends EventTarget {
    * the view moved on before they ran. It climbing during a pan or rotate is the
    * queue working as intended, since that work would otherwise have uploaded
    * bricks for viewports the user had already left.
+   *
+   * `predicted` is also cumulative: source reads started AHEAD of the working
+   * set, from the direction the view is travelling. Those never enter the
+   * upload queue, so they show up here and in the source's byte-cache hit rate
+   * rather than in `resident`.
    */
   chunkStreamStats(): {
     resident: number
@@ -3812,6 +3818,7 @@ export default class NiiVue extends EventTarget {
     inFlight: number
     total: number
     staleDropped: number
+    predicted: number
   } | null {
     return this.view?.chunkStreamStats() ?? null
   }

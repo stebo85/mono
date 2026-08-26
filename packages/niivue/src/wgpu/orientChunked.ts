@@ -214,8 +214,12 @@ export interface ChunkUploaderGPU {
    * Kick off (and cache) the source-byte fetch for `index` ahead of upload, so
    * network-backed fetches for the working set run in parallel instead of
    * serially inside the pump. Bounded and a no-op for in-memory volumes.
+   *
+   * `speculative` marks a read the view has NOT asked for -- a prediction of
+   * where it is going. Those are held to a lower cap so they can only ever use
+   * fetch capacity the working set is leaving idle.
    */
-  prefetchChunk(index: number): void
+  prefetchChunk(index: number, speculative?: boolean): void
   /**
    * Abandon the source-byte fetch for `index`. A no-op for in-memory volumes
    * and for a chunk with nothing outstanding.
@@ -231,6 +235,13 @@ export interface ChunkUploaderGPU {
  * per buffer this caps a uint16 source at roughly half a gigabyte.
  */
 const MAX_PREFETCHED_CHUNKS = 16
+
+/**
+ * Fetch slots reserved for the working set. A speculative (predicted) read may
+ * not grow the outstanding set past `MAX_PREFETCHED_CHUNKS` minus this, so a
+ * guess can never take the slot of a chunk the view can already see.
+ */
+const PREFETCH_SLOTS_RESERVED = 4
 
 function bytesFromChunkSource(
   data: ArrayBuffer | Uint8Array | NonNullable<NVImage['img']>,
@@ -444,10 +455,13 @@ export async function createChunkUploaderGPU(
     return promise
   }
 
-  function prefetchChunk(index: number): void {
+  function prefetchChunk(index: number, speculative = false): void {
     if (!chunkSource) return
     if (fetchCache.has(index)) return
-    if (fetchCache.size >= MAX_PREFETCHED_CHUNKS) return
+    const cap = speculative
+      ? MAX_PREFETCHED_CHUNKS - PREFETCH_SLOTS_RESERVED
+      : MAX_PREFETCHED_CHUNKS
+    if (fetchCache.size >= cap) return
     // The prefetch is speculative, so nobody is awaiting it. Swallow its
     // rejection here (including the abort a later cancel raises) rather than
     // leaving an unobserved promise; a real failure resurfaces when the upload

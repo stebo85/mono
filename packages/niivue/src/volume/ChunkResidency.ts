@@ -317,6 +317,18 @@ export class ChunkResidencyManager<TChunk> {
   }
 
   /**
+   * True while `chunkIndex` is queued for upload or being uploaded — that is,
+   * while something is still on its way to residency. Speculative prefetch
+   * checks this before abandoning a read it started on a guess: once the
+   * working set has claimed the chunk, the read belongs to the pump.
+   */
+  isUploadPending(chunkIndex: number): boolean {
+    return (
+      this._uploadQueue.has(chunkIndex) || this._inFlightUploads.has(chunkIndex)
+    )
+  }
+
+  /**
    * How many queued chunks have been dropped for going unrequested, since this
    * manager was created. Monotonic, and reported by the backends' stream stats:
    * it is the direct measure of how much upload work the old cross-frame FIFO

@@ -755,6 +755,9 @@ function updateVolumeHud() {
         ? `${stats.pending} queued, ${stats.inFlight} in flight, ${stats.staleDropped} stale`
         : '-'
     }</span></div>
+    <div class="row"><span class="key">prefetch</span><span>${
+      stats ? `${stats.predicted} predicted ahead` : '-'
+    }</span></div>
     <div class="row"><span class="key">stream cost</span><span>${brickCost()}</span></div>
     <div class="row"><span class="key">byte cache</span><span>${byteCacheCost()}</span></div>
     <div class="row"><span class="key">workers</span><span>${workerCost()}</span></div>

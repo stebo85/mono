@@ -45,6 +45,7 @@ import {
   type Vec3i,
   warnIfCubicUnsafe,
 } from '@/volume/chunking'
+import { ChunkTravelPredictor } from '@/volume/chunkPrediction'
 import { buildModulationParams } from '@/volume/modulation'
 import {
   chunkedDisplayKey,
@@ -115,6 +116,13 @@ const MAX_CHUNK_UPLOADS_PER_FRAME = 24
  * outstanding-fetch cap so the fetch window stays full as uploads drain it.
  */
 const CHUNK_PREFETCH_WINDOW = 16
+/**
+ * How many predicted chunks a chunked volume may have on speculative fetch at
+ * once. Small on purpose: the prediction is served from whatever fetch slots
+ * the working set left over, so a wrong guess costs a few reads, never a
+ * visible chunk's place in the queue.
+ */
+const CHUNK_PREDICT_WINDOW = 4
 /**
  * Share of the single configured `maxChunkResidencyBytes` given to an
  * independent hi-res overlay's residency manager; the base keeps the rest. In
@@ -202,6 +210,14 @@ interface ChunkedTexEntry {
   displayKey: string
   /** planSupportsCubic(plan), cached: the plan is immutable for the entry's life. */
   cubicSafe: boolean
+  /** Tracks how this volume's working set travels across its chunk grid. */
+  predictor: ChunkTravelPredictor
+  /** Chunk indices this frame's working set asked for, across every tile. */
+  requestedThisFrame: number[]
+  /** Chunks currently on speculative fetch, so a stale guess can be released. */
+  speculative: Set<number>
+  /** Speculative fetches started for this volume, cumulative. */
+  predictedCount: number
 }
 
 type TexCacheEntry = SingleTexEntry | ChunkedTexEntry
@@ -934,6 +950,7 @@ export class VolumeRenderer extends NVRenderer {
         )
         existing.uploader.dispose()
         existing.uploader = newUploader
+        existing.speculative.clear()
         existing.manager.remap(new Map(), existing.plan.chunks.length)
         existing.bindGroups = existing.plan.chunks.map(() => null)
         const chunk0 = await existing.uploader.uploadChunk(0)
@@ -963,6 +980,10 @@ export class VolumeRenderer extends NVRenderer {
       bindGroups: plan.chunks.map(() => null),
       displayKey,
       cubicSafe: planSupportsCubic(plan),
+      predictor: new ChunkTravelPredictor(),
+      requestedThisFrame: [],
+      speculative: new Set(),
+      predictedCount: 0,
     }
     warnIfCubicUnsafe(vol.name, entry.cubicSafe, this.isCubicInterpolation)
     entry.manager = new ChunkResidencyManager<VolumeChunkGPU>(
@@ -1020,6 +1041,11 @@ export class VolumeRenderer extends NVRenderer {
     entry.uploader = newUploader
     entry.manager.remap(oldToNew, newPlan.chunks.length)
     entry.plan = newPlan
+    // A new grid makes the recorded travel meaningless, and the old uploader
+    // took its outstanding speculative reads with it.
+    entry.predictor.reset()
+    entry.requestedThisFrame.length = 0
+    entry.speculative.clear()
     entry.cubicSafe = planSupportsCubic(newPlan)
     warnIfCubicUnsafe(
       entry.volume.name,
@@ -1309,6 +1335,9 @@ export class VolumeRenderer extends NVRenderer {
       entry.manager.requestUpload(ci)
       for (const m of mirrors) m.requestUpload(ci)
     }
+    // Accumulate rather than replace: a multiplanar layout drives this volume
+    // from several tiles per frame, and the union is what travels.
+    for (const ci of capped) entry.requestedThisFrame.push(ci)
   }
 
   /**
@@ -1381,6 +1410,7 @@ export class VolumeRenderer extends NVRenderer {
       entry.manager.requestUpload(ci)
       for (const m of mirrors) m.requestUpload(ci)
     }
+    for (const ci of capped) entry.requestedThisFrame.push(ci)
   }
 
   /**
@@ -1394,7 +1424,64 @@ export class VolumeRenderer extends NVRenderer {
     this._fadeActive = false
     this._refreshUnlitChunksForLighting()
     for (const entry of this._texCache.values()) {
-      if (entry.kind === 'chunked') entry.manager.beginFrame()
+      if (entry.kind !== 'chunked') continue
+      // Predict from the frame that just ended, before its record is cleared.
+      // Here rather than in the pump because the pump is paused mid-drag, and a
+      // drag is exactly when the view is travelling and worth fetching ahead of.
+      this._speculateAhead(entry)
+      entry.requestedThisFrame.length = 0
+      entry.manager.beginFrame()
+    }
+  }
+
+  /**
+   * Fetch ahead of the working set along its direction of travel: ask the
+   * predictor where the last frame's chunks were heading and start source reads
+   * for the answer, releasing the guesses that no longer apply so a wrong turn
+   * cannot hold fetch slots for the rest of the session.
+   *
+   * Speculative only. Nothing here is requested for upload, so the residency
+   * queue and the eviction clock never see it, and the uploader admits these
+   * reads only into fetch slots the working set is not using.
+   */
+  private _speculateAhead(entry: ChunkedTexEntry): void {
+    const predicted = entry.predictor.predict(
+      entry.plan,
+      entry.requestedThisFrame,
+      CHUNK_PREDICT_WINDOW,
+    )
+    if (predicted.length === 0) {
+      // Either the view is settled or this frame said nothing new. Standing
+      // guesses are left alone: dropping them on the first idle frame would
+      // cancel every read a discrete scrub had just started for its next step.
+      return
+    }
+    for (const ci of entry.requestedThisFrame) {
+      // The view arrived at a guess: the read did its job and the chunk is the
+      // working set's now, so drop the claim without cancelling it.
+      entry.speculative.delete(ci)
+    }
+    if (!predicted.some((ci) => entry.speculative.has(ci))) {
+      // Nothing standing is on the new heading, so the view turned. Release the
+      // old guesses; travel that merely continues shares chunks with them and
+      // takes this branch only once its whole flight has been consumed.
+      for (const ci of entry.speculative) {
+        entry.speculative.delete(ci)
+        // Once the working set has claimed a guess the read belongs to the
+        // pump, and cancelling it would abort an upload already under way.
+        if (entry.manager.isUploadPending(ci)) continue
+        entry.uploader.cancelChunk(ci)
+      }
+    }
+    for (const ci of predicted) {
+      // One flight of guesses at a time: new reads start only as the view
+      // consumes the standing ones, so speculation cannot churn per frame.
+      if (entry.speculative.size >= CHUNK_PREDICT_WINDOW) break
+      if (entry.manager.isResident(ci)) continue
+      if (entry.speculative.has(ci)) continue
+      entry.speculative.add(ci)
+      entry.predictedCount++
+      entry.uploader.prefetchChunk(ci, true)
     }
   }
 
@@ -1906,12 +1993,14 @@ export class VolumeRenderer extends NVRenderer {
     inFlight: number
     total: number
     staleDropped: number
+    predicted: number
   } {
     let resident = 0
     let pending = 0
     let inFlight = 0
     let total = 0
     let staleDropped = 0
+    let predicted = 0
     for (const entry of this._texCache.values()) {
       if (entry.kind !== 'chunked') continue
       resident += entry.manager.residentCount
@@ -1919,8 +2008,9 @@ export class VolumeRenderer extends NVRenderer {
       inFlight += entry.manager.inFlightUploadCount
       total += entry.manager.chunkCount
       staleDropped += entry.manager.staleDropCount
+      predicted += entry.predictedCount
     }
-    return { resident, pending, inFlight, total, staleDropped }
+    return { resident, pending, inFlight, total, staleDropped, predicted }
   }
 
   /**

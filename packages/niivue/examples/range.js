@@ -239,9 +239,11 @@ const ZARR_BYTE_CACHE_BYTES = 512 * 1024 * 1024
 // with the Plan control (`budgetPlan`, core `BUDGET_PLANS`). Do not confuse it
 // with the chunk plan, which is the brick list the octree pass produces FROM it:
 //
-//   focus       finest bricks at the crosshair, coarsening outward (the default)
+//   focus       finest bricks at the crosshair, coarsening outward
 //   uniform     ignores the crosshair; the finest level that fits the WHOLE
-//               volume, for a static whole-volume picture
+//               volume, for a static whole-volume picture (this demo's default,
+//               so a source opens showing all of itself rather than a detailed
+//               core in a coarse shell)
 //   interactive same crosshair focus on a smaller brick budget, for smooth
 //               rotate/zoom
 //
@@ -253,9 +255,9 @@ const ZARR_BYTE_CACHE_BYTES = 512 * 1024 * 1024
 // budget is deliberately lower than this, so the LRU keeps the visible bricks
 // and evicts the rest.
 const MULTILOD_BUDGET_BYTES = 2048 * 1024 * 1024
-// Start-up budget plan; ?plan=uniform|interactive|focus preselects one.
+// Start-up budget plan; ?plan=focus|interactive|uniform preselects one.
 const INITIAL_BUDGET_PLAN =
-  new URLSearchParams(location.search).get('plan') ?? 'focus'
+  new URLSearchParams(location.search).get('plan') ?? 'uniform'
 // The core NVChunkedVolume handle for the active OME-Zarr source (null for
 // synthetic). Owns the focus-follow plan swaps; the demo drives its max-detail
 // cap from the Level control and nudges it to re-plan on zoom/layout changes.
@@ -507,8 +509,17 @@ function freshStats() {
     emptySkips: 0,
     fullFileFallbacks: 0,
     failures: 0,
+    cancelled: 0,
     lastRequests: [],
   }
+}
+
+// A read the view stopped wanting. Core aborts superseded bricks on the wire,
+// so this arrives as a DOMException named AbortError from either the fetch or
+// the signal itself; the message check covers a store that throws a plain Error.
+function isAbort(err) {
+  if (!(err instanceof Error)) return false
+  return err.name === 'AbortError' || /abort/i.test(err.message)
 }
 
 function relativeUrl(baseUrl, relative) {
@@ -988,6 +999,17 @@ function createZarrChunkedSource(source) {
         }
         return bytes
       } catch (err) {
+        // An abort is the CANCELLATION path working, not a failure: a re-plan
+        // supersedes the bricks it no longer wants and core aborts them on the
+        // wire. Counting those here made a healthy uniform load read as
+        // "failures 16". They get their own counter instead.
+        if (isAbort(err)) {
+          if (isLiveSerial(source.serial)) {
+            stats.cancelled++
+            recordRequest(source.serial, `CANCEL ${key}`)
+          }
+          throw err
+        }
         // Surface the failure in the HUD/console (the signal we used to spot the
         // L0 request flood) before rethrowing. Retry now lives in core, so this
         // counts failed ATTEMPTS: a transient blip the core loader later retries
@@ -1581,6 +1603,11 @@ function renderHud() {
     stats.failures > 0
       ? `<span class="bad">${stats.failures}</span>`
       : '<span class="ok">0</span>'
+  // Cancellations ride on the failures row rather than one of their own: they
+  // are the same event class (a read that produced no bytes) and the reader
+  // needs to see at a glance which kind it was.
+  const cancelled =
+    stats.cancelled > 0 ? ` (+${stats.cancelled} cancelled)` : ''
   els.hud.innerHTML = `
     <div class="title">${html(source.name)}</div>
     <div class="row"><span class="key">backend</span><span>${backend === 'webgpu' ? 'WebGPU' : 'WebGL2'}</span></div>
@@ -1598,7 +1625,7 @@ function renderHud() {
     <div class="row"><span class="key">empty chunks</span><span>${stats.emptyChunks} absent, ${stats.emptySkips} refetches avoided</span></div>
     <div class="row"><span class="key">resident</span><span>${stream ? `${stream.resident} resident, ${stream.pending} pending, ${stream.inFlight} in flight` : 'pending'}</span></div>
     <div class="row"><span class="key">LOD comp</span><span>${html(lodCompensationSummary())}</span></div>
-    <div class="row"><span class="key">failures</span><span>${failures}</span></div>
+    <div class="row"><span class="key">failures</span><span>${failures}${cancelled}</span></div>
     <div class="row"><span class="key">last requests</span><span>${html(stats.lastRequests.join(' | ') || 'none')}</span></div>
   `
   renderChunkStrip()
@@ -1925,7 +1952,7 @@ async function main() {
   // A ?plan= naming something the control does not offer leaves the markup's
   // default selected, which matches how core degrades an unknown plan name.
   els.plan.value = INITIAL_BUDGET_PLAN
-  if (!els.plan.value) els.plan.value = 'focus'
+  if (!els.plan.value) els.plan.value = 'uniform'
   setDefaultWindowForSelectedSource()
   await refreshLevelControl()
 

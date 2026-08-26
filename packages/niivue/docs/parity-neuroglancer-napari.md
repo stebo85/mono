@@ -4,7 +4,7 @@ Capability comparison of the NiiVue ecosystem against **Neuroglancer** (web,
 WebGL2, client-side chunked decode; large EM/connectomics) and **Napari**
 (Python/Qt desktop, in-memory n-dimensional arrays; analysis + plugins).
 
-*Assessed: 2026-06-30.* This is a **capability** comparison, not an API map. The
+*Assessed: 2026-06-30; section 1 refreshed 2026-08-25 after the caching stages landed.* This is a **capability** comparison, not an API map. The
 relevant work is currently split across two unmerged feature branches, so verdicts
 are attributed to where the code lives:
 
@@ -40,13 +40,16 @@ two branches together show both the server-assisted *and* the pure-client
 |---|---|---|
 | Unified source pipeline (`source → metadata → levels → chunks → fetch/decode/cache`) | partial | Shared low-level `VolumeChunkSource` + `volume/chunking.ts` + residency; per-page metadata loaders, no `Source`/`Adapter` abstraction. |
 | Chunk scheduler w/ explicit request states | partial | Lifecycle implicit via Maps/Sets (`_uploadQueue`/`_inFlightUploads`/`_resident`/`failUpload`/`_evictToFit` in `volume/ChunkResidency.ts`); no state enum. |
-| Stale-request cancellation (`AbortController`) | partial | Present for desktop thumbnails; the volume chunk fetches run uncancelled. |
-| Priority + prefetch (view-centre, visible-first, LRU) | partial | `orderByViewCenter` + visible-first + LRU demotion (`volume/ChunkVisibility.ts`, `ChunkResidency.ts`). Neighborhood prefetch minimal. |
-| Unified memory budgets | partial | GPU residency byte-budget + LRU unified across base+overlays; no CPU-decoded-bytes budget; `NVSlide` has its own bounded ImageBitmap LRU. |
+| Stale-request cancellation (`AbortController`) | present | Volume chunk reads abort on the wire through the worker pool (`omeZarrChunkWorkerPool.ts`), plus stale-drop in `ChunkResidency.ts`. `NVSlide` drops queued tiles at dequeue but does not abort a tile already in flight. *(updated 2026-08-25)*|
+| Priority + prefetch (view-centre, visible-first, LRU) | present | `orderByViewCenter` + visible-first + LRU demotion (`volume/ChunkVisibility.ts`, `ChunkResidency.ts`), plus direction-of-travel prediction on leftover fetch slots (`volume/chunkPrediction.ts`). *(updated 2026-08-25)*|
+| Unified memory budgets | present | GPU residency byte-budget + LRU unified across base+overlays; a CPU decoded-chunk budget sized off the GPU budget (`volume/decodedChunkCache.ts`); a store-byte LRU; an opt-in Cache Storage tier; `NVSlide` has its own bounded ImageBitmap LRU and tile-texture budget. See `caching-architecture.md`. *(updated 2026-08-25)*|
 | Serializable / shareable viewer state | partial | URL params read at init + in-memory camera snapshot; no write-back / shareable-state export. Neuroglancer's URL-state is the reference target. |
 
-Neuroglancer's defining strengths here are the **explicit request-state model with
-cancellation** and **URL-encoded shareable state**; both are NiiVue's weakest spots.
+Neuroglancer's defining strength that remains is **URL-encoded shareable state**.
+Cancellation and prefetch closed in August 2026 (see `caching.md` and
+`caching-architecture.md`); the **explicit request-state model** is still ours to
+match, though our transitions live in maps and sets rather than a state enum by
+choice rather than oversight.
 
 ## 2. Data formats
 

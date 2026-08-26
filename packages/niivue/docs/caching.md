@@ -6,10 +6,15 @@ is ahead of us, and the order we should close the gap. Written for the
 Haehn raised caching and Chris Rorden pointed at Neuroglancer's predictive
 caching.
 
-Companion docs: `high-res-streaming.md` (how the chunked path works),
+**If you want the reference rather than the history, read
+`caching-architecture.md`:** what each tier holds today, how the scheduling
+around them works, a comparison table against Neuroglancer, and the designs we
+tried and rejected. This doc is the record of how we got there.
+
+Companion docs: `caching-architecture.md` (how caching works today),
+`high-res-streaming.md` (how the chunked path works),
 `budget-plans.md` (how a plan chooses which bricks to want),
-`parity-neuroglancer-napari.md` (the wider feature comparison; its section 1
-already grades our scheduler and budgets as partial),
+`parity-neuroglancer-napari.md` (the wider feature comparison),
 `streaming-todos.md` (the open work list this doc feeds).
 
 **Status:** Every stage has landed (A through G, 2026-08-25), and the branch

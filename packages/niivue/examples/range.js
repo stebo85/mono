@@ -72,7 +72,16 @@ let appliedExplodeScale = 1
 // far larger than this still cannot render whole -- richtmyer-meshkov L0 is
 // 8.05 Gvoxel, which needs tens of GB once expanded to RGBA plus its gradient
 // texture -- so they are region-of-interest only.
-const DEFAULT_RESIDENCY_BYTES = 8192 * 1024 * 1024
+//
+// WebGL2 gets a much smaller budget. A WebGL2 3D texture is a single immutable
+// allocation with no sub-allocation or eviction of its own, and this demo was
+// measured holding 1.67 GB across 177 bricks on hoa_heart L0 before the driver
+// started dropping the context. Below the plan budget on purpose: with the GPU
+// budget above it the LRU never evicts, so a refocus (moving the crosshair to
+// the far face of a clipped volume) just piles the new bricks on top of the old
+// ones until the context dies and streaming stops for good.
+const DEFAULT_RESIDENCY_BYTES =
+  backend === 'webgpu' ? 8192 * 1024 * 1024 : 1280 * 1024 * 1024
 const SYNTHETIC_DEFAULT_WINDOW = { min: 24, max: 210 }
 
 // OME-Zarr stores resolve against a local copy first and the public Open SciVis
@@ -199,7 +208,19 @@ const OMEZARR_STORES = {
 // past each brick face; a 3-voxel halo keeps that reach inside resident data so
 // brick boundaries don't show grid-aligned gradient/lighting seams. Without it
 // loadChunkedVolume falls back to the core default [1,1,1] and the seams return.
-const STREAMING_CHUNK_HALO = [3, 3, 3]
+// 3 also covers the tricubic filter's 2-voxel reach (see applyInterp).
+// `?halo=N` overrides it, which is how the halo-vs-filter question is tested:
+// trilinear reaches 1 voxel past a face and cubic reaches 2. `?halo=1` plus
+// cubic is the case core now handles for itself: turning cubic on re-plans
+// every live streamed volume at halo >= 2, and the renderer refuses cubic on
+// any plan that still cannot feed the kernel rather than seaming silently.
+const HALO_PARAM = Number(
+  new URLSearchParams(location.search).get('halo') ?? Number.NaN,
+)
+let streamingChunkHalo =
+  Number.isFinite(HALO_PARAM) && HALO_PARAM >= 0
+    ? [HALO_PARAM, HALO_PARAM, HALO_PARAM]
+    : [3, 3, 3]
 const ZARR_BYTE_CACHE_BYTES = 512 * 1024 * 1024
 
 // --- multi-LOD (crosshair-focused mixed-resolution) -------------------------
@@ -214,11 +235,29 @@ const ZARR_BYTE_CACHE_BYTES = 512 * 1024 * 1024
 // retry all in core.
 // The Level control becomes a max-detail cap (`minLevel`).
 //
-// Cap on brick count (< core MAX_CHUNKS_PER_TILE=1024); the budget pass coarsens
-// until the plan fits. Budget keeps resident VRAM ~this regardless of the level
-// the user picks (kept below DEFAULT_RESIDENCY_BYTES so no planned brick evicts).
-const MULTILOD_MAX_BRICKS = 240
+// WHERE the detail goes is the BUDGET PLAN — the policy half of the API, chosen
+// with the Plan control (`budgetPlan`, core `BUDGET_PLANS`). Do not confuse it
+// with the chunk plan, which is the brick list the octree pass produces FROM it:
+//
+//   focus       finest bricks at the crosshair, coarsening outward
+//   uniform     ignores the crosshair; the finest level that fits the WHOLE
+//               volume, for a static whole-volume picture (this demo's default,
+//               so a source opens showing all of itself rather than a detailed
+//               core in a coarse shell)
+//   interactive same crosshair focus on a smaller brick budget, for smooth
+//               rotate/zoom
+//
+// The plan supplies the brick cap (< core MAX_CHUNKS_PER_TILE=1024); the budget
+// pass coarsens until the plan fits. This demo overrides only the VRAM budget,
+// which is a property of the machine rather than of the use case: it keeps
+// resident VRAM ~this regardless of the level the user picks. On WebGPU it stays
+// below DEFAULT_RESIDENCY_BYTES so no planned brick evicts; on WebGL2 the GPU
+// budget is deliberately lower than this, so the LRU keeps the visible bricks
+// and evicts the rest.
 const MULTILOD_BUDGET_BYTES = 2048 * 1024 * 1024
+// Start-up budget plan; ?plan=focus|interactive|uniform preselects one.
+const INITIAL_BUDGET_PLAN =
+  new URLSearchParams(location.search).get('plan') ?? 'uniform'
 // The core NVChunkedVolume handle for the active OME-Zarr source (null for
 // synthetic). Owns the focus-follow plan swaps; the demo drives its max-detail
 // cap from the Level control and nudges it to re-plan on zoom/layout changes.
@@ -415,6 +454,7 @@ function el(id) {
 const els = {
   source: el('source'),
   level: el('level'),
+  plan: el('plan'),
   layout: el('layout'),
   colormap: el('colormap'),
   window: el('window'),
@@ -422,12 +462,25 @@ const els = {
   zoomVal: el('zoomVal'),
   explode: el('explode'),
   explodeVal: el('explodeVal'),
+  samples: el('samples'),
+  samplesVal: el('samplesVal'),
+  gamma: el('gamma'),
+  gammaVal: el('gammaVal'),
+  lodComp: el('lodComp'),
+  lodCompVal: el('lodCompVal'),
+  lodOpacity: el('lodOpacity'),
+  lodOpacityVal: el('lodOpacityVal'),
+  interp: el('interp'),
   blocks: el('blocks'),
   crosshair: el('crosshair'),
   reload: el('reload'),
   canvas: el('nv-canvas'),
   hud: el('hud'),
   chunkStrip: el('chunkStrip'),
+  loading: el('loading'),
+  loadingLabel: el('loadingLabel'),
+  loadingCount: el('loadingCount'),
+  loadingFill: el('loadingFill'),
   fallback: el('fallback'),
 }
 
@@ -436,6 +489,10 @@ let activeSource = null
 let chunkPlan = null
 let stats = freshStats()
 let pollHandle = 0
+// Streaming badge state (see renderLoading). `since` is when the stream last
+// went from settled to busy, `until` is how long a finished badge lingers, and
+// `label` is the last text pushed into the aria-live region.
+const loadingState = { since: 0, until: 0, label: '', planEpoch: 0 }
 
 function freshStats() {
   return {
@@ -452,8 +509,17 @@ function freshStats() {
     emptySkips: 0,
     fullFileFallbacks: 0,
     failures: 0,
+    cancelled: 0,
     lastRequests: [],
   }
+}
+
+// A read the view stopped wanting. Core aborts superseded bricks on the wire,
+// so this arrives as a DOMException named AbortError from either the fetch or
+// the signal itself; the message check covers a store that throws a plain Error.
+function isAbort(err) {
+  if (!(err instanceof Error)) return false
+  return err.name === 'AbortError' || /abort/i.test(err.message)
 }
 
 function relativeUrl(baseUrl, relative) {
@@ -555,6 +621,9 @@ async function presentLevels(storeDef) {
 // the coarsest by default. Returns the selected level (or null for synthetic).
 async function refreshLevelControl() {
   const store = currentStore()
+  // The synthetic shard is a single-level grid on the legacy streaming path, so
+  // it has no octree for a budget plan to shape.
+  els.plan.disabled = !store
   if (!store) {
     els.level.replaceChildren(new Option('n/a', ''))
     els.level.disabled = true
@@ -892,54 +961,6 @@ async function loadOmezarrSource(storeDef, serial) {
   }
 }
 
-// Build a small in-memory whole-volume from the coarsest present pyramid level
-// of an OME-Zarr source, to use as niivue's base "coarse floor". The 3D render
-// draws this behind any not-yet-resident fine chunk, so a huge level (whose
-// full chunk set can't fit the residency budget) still shows the whole volume
-// immediately instead of rendering blank. Returns null if no coarser level than
-// the active one is available, or on any error (the floor is best-effort).
-async function buildCoarseFloorVolume(source) {
-  // Reuse the coarsest PRESENT level already opened by loadOmezarrSource
-  // (source.levels is finest-first, each carrying a resolved array + spacing),
-  // rather than re-opening from storeDef.levels. That both drops a redundant
-  // metadata fetch per reload AND avoids naming a configured-but-absent level (a
-  // partial fetch-omezarr.ts run): Math.max(...storeDef.levels) could point at a
-  // level that was never downloaded, whose open throws, gets swallowed here, and
-  // silently leaves the far-field blank even though a coarser PRESENT level
-  // exists. levels[last].level is the largest (coarsest) present index.
-  const coarseIndex = source.levels.length - 1
-  const coarse = source.levels[coarseIndex]
-  if (!coarse || coarse.datasetIndex <= source.level) return null // no coarser present level
-  try {
-    // Whole (small) coarse level through the library source, so the floor gets
-    // the same display-space layout (and axis-order transpose) as the bricks.
-    const img = await source.chunkSource.fetchChunk({
-      levelIndex: coarseIndex,
-      texOrigin: [0, 0, 0],
-      texDims: coarse.dims,
-      bytesPerVoxel: source.numBitsPerVoxel / 8,
-    })
-    const win = parseWindow(source.defaultWindow)
-    const floor = createStreamingNVImage({
-      id: `${source.id}:floor`,
-      url: `client-chunk://${source.id}/floor`,
-      shape: coarse.dims,
-      spacing: coarse.spacingUm,
-      datatypeCode: source.datatypeCode,
-      calMin: win.min,
-      calMax: win.max,
-      colormap: els.colormap.value,
-    })
-    // Unlike a streamed volume, the floor renders from CPU data: attach the
-    // decoded voxels to the img:null streaming skeleton (no chunkSource).
-    floor.img = img
-    return floor
-  } catch (err) {
-    console.warn('coarse floor unavailable:', err)
-    return null
-  }
-}
-
 async function loadActiveSource() {
   // Stamp this load with a fresh serial so its fetches/cache can tell whether
   // they are still the active source when they resolve (see isLiveSerial).
@@ -978,6 +999,17 @@ function createZarrChunkedSource(source) {
         }
         return bytes
       } catch (err) {
+        // An abort is the CANCELLATION path working, not a failure: a re-plan
+        // supersedes the bricks it no longer wants and core aborts them on the
+        // wire. Counting those here made a healthy uniform load read as
+        // "failures 16". They get their own counter instead.
+        if (isAbort(err)) {
+          if (isLiveSerial(source.serial)) {
+            stats.cancelled++
+            recordRequest(source.serial, `CANCEL ${key}`)
+          }
+          throw err
+        }
         // Surface the failure in the HUD/console (the signal we used to spot the
         // L0 request flood) before rethrowing. Retry now lives in core, so this
         // counts failed ATTEMPTS: a transient blip the core loader later retries
@@ -1006,6 +1038,11 @@ function selectedLevelIndex(source) {
 
 // Single-level chunk plan for the SYNTHETIC single-shard source (OME-Zarr goes
 // through the core nv.loadChunkedVolume path). Its native grid fits one tile.
+// NOTE: halo 0. The shard is a flat array of exactly-sized chunk payloads and
+// createRangeChunkSource asserts the request matches one chunk's byte count, so
+// there is nowhere to read neighbour voxels from. Brick faces therefore show a
+// trilinear seam on this source, and the renderer declines the cubic filter on
+// it entirely (planSupportsCubic). The OME-Zarr sources have proper halos.
 function createChunkPlan(source) {
   const plan = chunkVolumeGrid(
     source.shape,
@@ -1279,6 +1316,93 @@ function syncZoomControl() {
 // the per-chunk outline boxes, the zoom focus-region box, and the loaded-chunks
 // indicator strip (which sits over a corner tile). All are cleared when the
 // toggle is off so nothing overlays the render.
+function applySampleRate() {
+  const rate = Number(els.samples.value) || 1
+  els.samplesVal.textContent = rate.toFixed(1)
+  if (!nv) return
+  // Pure render-time setting: no re-stream, and the setter already redraws.
+  nv.volumeSampleRate = rate
+}
+
+// Display gamma for the 3D render. The exponent lands on each sample's
+// classified RGB only, never on its alpha, so raising it brightens the image
+// without changing how much any sample occludes what is behind it. It also
+// closes most of the coarse-vs-fine LOD brightness gap: a mean-downsampled
+// brick attenuates the peaks it averaged over, so it classifies darker than the
+// fine data at the same place, and the gamma lifts it back.
+function applyGamma() {
+  const g = Number(els.gamma.value) || 1
+  els.gammaVal.textContent = g.toFixed(2)
+  if (!nv) return
+  // Pure render-time setting: no re-stream, and the setter already redraws.
+  nv.gamma = g
+}
+
+// Per-level brightness compensation for coarse multi-LOD bricks. Downsampling
+// averages voxels, which destroys the correlation between a sample's colour and
+// its opacity; front-to-back compositing weights colour by opacity, so a coarse
+// brick integrates darker than the fine data it replaces. The shader lifts each
+// brick by exponent 1 - c*log2(k) for its linear downsample factor k, on top of
+// the display gamma -- one fixed step per pyramid level, since every level
+// averages the same 2x2x2 neighbourhood. Slide to 0 to see the uncompensated
+// LOD seam.
+//
+// The size of the deficit depends on how much intensity varies inside a fine
+// voxel, so no single coefficient is exact: sparse thin material (hoa_heart)
+// needs about 0.11 per level to null its LOD seam, dense structure
+// (pawpawsaurus) about 0.05, which is why this is a slider and not a constant.
+function applyLodCompensation() {
+  const c = Number(els.lodComp.value)
+  els.lodCompVal.textContent = c.toFixed(3)
+  if (!nv) return
+  // Render-time only: it changes one shader exponent per brick, so there is no
+  // re-stream and the setter already redraws.
+  nv.volumeLodBrightnessCompensation = c
+}
+
+// Per-level OPACITY compensation, the other half of the same problem and OFF by
+// default. The march already raises a coarse sample's alpha to the number of
+// reference steps it stands for, which is exact only for a homogeneous coarse
+// voxel; real ones are not, and since log(1-a) is concave the true transmittance
+// through the fine voxels is LOWER than that approximation, so a coarse brick is
+// too see-through. This scales that exponent by 1 + c*(k-1).
+//
+// It defaults to 0 because simulating the march over this pyramid says the
+// deficit is ~0 wherever structure is dense enough to saturate the ray, and
+// inflating alpha there front-loads accumulation onto the nearer, dimmer samples
+// and makes the accumulated colour worse. Sparse thin material does have a real
+// deficit, but no global scale recovers much of it -- that needs the per-voxel
+// variance mean-downsampling discarded. Slide it up if coarse bricks read as too
+// transparent rather than too dark on YOUR data.
+function applyLodOpacity() {
+  const c = Number(els.lodOpacity.value)
+  els.lodOpacityVal.textContent = c.toFixed(2)
+  if (!nv) return
+  nv.volumeLodOpacityCompensation = c
+}
+
+// Texture reconstruction in the 3D fine march: hardware trilinear (default) or
+// tricubic B-spline. Trilinear is only C0, so band edges carry a blocky texel
+// staircase; the cubic filter is C2 and removes it (it does NOT remove the
+// concentric ringing, which survives a C2 reconstruction unchanged). 8 fetches
+// per sample instead of 1, so pair it with a lower sample rate if fill rate
+// matters. The toggle stays here because a chunked stream is where halo
+// correctness matters; the side-by-side A/B comparison, the benchmark and the
+// figure export live on vox.interp.html.
+//
+// Halo: the OME-Zarr sources stream through nv.loadChunkedVolume, which raises
+// the brick halo to 2 and re-plans when cubic is turned on, so cubic is always
+// fed real neighbour data there. The SYNTHETIC shard source cannot: its plan is
+// halo 0 (createChunkPlan) because the shard server serves exactly one chunk's
+// bytes per request and has no way to stitch neighbours. On that source the
+// renderer declines cubic and logs why, rather than reconstructing from
+// clamp-to-edge data at every brick face.
+function applyInterp() {
+  if (!nv) return
+  // Pure render-time setting: no re-stream, and the setter already redraws.
+  nv.volumeIsCubicInterpolation = els.interp.value === 'cubic'
+}
+
 function applyBlocks() {
   if (!nv) return
   const show = els.blocks.checked
@@ -1299,18 +1423,17 @@ function applyBlocks() {
   nv.drawScene()
 }
 
-// Show or hide the 3D crosshair, and size it to whatever is loaded.
+// Show or hide the 3D crosshair, and size its centre gap to whatever is loaded.
 //
-// The crosshair's thickness and centre gap are absolute MM (they end up as the
-// radius and the endpoint inset of the six cylinders core builds between
-// extentsMin and extentsMax), and the defaults -- 1 mm thick, 10 mm gap -- assume
-// a human-scale volume. This demo's stores span four orders of magnitude: the
-// synthetic shard is ~250 mm across, while the HOA heart's 7.013 um spacing is
-// read as mm and gives a ~46 m scene, where a 1 mm cylinder is far below one
-// pixel and the crosshair simply cannot be seen. Deriving both from the mean
-// scene span keeps it the same apparent size everywhere; the fractions are
-// chosen to reproduce the stock look at human scale.
-const CROSSHAIR_WIDTH_FRACTION = 0.005
+// The gap is an absolute MM inset on the six cylinders core builds between
+// extentsMin and extentsMax, and its 10 mm default assumes a human-scale volume.
+// This demo's stores span four orders of magnitude: the synthetic shard is
+// ~250 mm across, while the HOA heart's 7.013 um spacing is read as mm and gives
+// a ~46 m scene, where a 10 mm gap is far below one pixel and the crosshair
+// closes up. Deriving it from the mean scene span keeps it the same apparent
+// size everywhere; the fraction reproduces the stock look at human scale.
+// crosshairWidth needs no such treatment -- it is canvas pixels, so it already
+// draws the same weight at any scale.
 const CROSSHAIR_GAP_FRACTION = 0.05
 
 function applyCrosshair() {
@@ -1323,7 +1446,6 @@ function applyCrosshair() {
   const span =
     lo && hi ? (hi[0] - lo[0] + (hi[1] - lo[1]) + (hi[2] - lo[2])) / 3 : 0
   if (Number.isFinite(span) && span > 0) {
-    nv.crosshairWidth = span * CROSSHAIR_WIDTH_FRACTION
     nv.crosshairGap = span * CROSSHAIR_GAP_FRACTION
   }
   nv.drawScene()
@@ -1479,6 +1601,11 @@ function renderHud() {
     stats.failures > 0
       ? `<span class="bad">${stats.failures}</span>`
       : '<span class="ok">0</span>'
+  // Cancellations ride on the failures row rather than one of their own: they
+  // are the same event class (a read that produced no bytes) and the reader
+  // needs to see at a glance which kind it was.
+  const cancelled =
+    stats.cancelled > 0 ? ` (+${stats.cancelled} cancelled)` : ''
   els.hud.innerHTML = `
     <div class="title">${html(source.name)}</div>
     <div class="row"><span class="key">backend</span><span>${backend === 'webgpu' ? 'WebGPU' : 'WebGL2'}</span></div>
@@ -1495,10 +1622,96 @@ function renderHud() {
     <div class="row"><span class="key">cache</span><span>${stats.cacheHits} hits, ${formatBytes(stats.cacheBytes)}</span></div>
     <div class="row"><span class="key">empty chunks</span><span>${stats.emptyChunks} absent, ${stats.emptySkips} refetches avoided</span></div>
     <div class="row"><span class="key">resident</span><span>${stream ? `${stream.resident} resident, ${stream.pending} pending, ${stream.inFlight} in flight` : 'pending'}</span></div>
-    <div class="row"><span class="key">failures</span><span>${failures}</span></div>
+    <div class="row"><span class="key">LOD comp</span><span>${html(lodCompensationSummary())}</span></div>
+    <div class="row"><span class="key">failures</span><span>${failures}${cancelled}</span></div>
     <div class="row"><span class="key">last requests</span><span>${html(stats.lastRequests.join(' | ') || 'none')}</span></div>
   `
   renderChunkStrip()
+}
+
+// How long the stream must stay busy before the badge appears, and how long it
+// lingers after settling. Dragging the crosshair replans continuously, and each
+// replan finishes some bricks in a frame or two; without both margins the badge
+// strobes on every twitch, which is worse than not having one.
+const LOADING_SHOW_AFTER_MS = 180
+const LOADING_LINGER_MS = 450
+// A plan swap counts as "refocusing" for this long after it lands. The swap
+// itself is instant; what follows is the fetch of whatever the new plan needs.
+const REFOCUS_WINDOW_MS = 600
+
+// Tell the user the view is BUSY, not broken. At high zoom a refocus can want
+// bricks that take seconds to arrive, and the honest signal for that is a
+// progress badge rather than a viewport that appears to have stalled. Driven
+// off chunkStreamStats (authoritative residency) at the HUD's ~8 Hz poll.
+function renderLoading() {
+  const stream = nv?.chunkStreamStats()
+  const total = stream?.total ?? 0
+  const outstanding = stream ? stream.inFlight + stream.pending : 0
+  const now = performance.now()
+
+  if (outstanding > 0 && total > 0) {
+    if (loadingState.since === 0) loadingState.since = now
+    loadingState.until = now + LOADING_LINGER_MS
+  } else {
+    loadingState.since = 0
+  }
+
+  // Debounced on the way in, lingering on the way out.
+  const settling = loadingState.until > now
+  const busy =
+    loadingState.since !== 0 &&
+    now - loadingState.since >= LOADING_SHOW_AFTER_MS
+  const show = busy || (settling && loadingState.label !== '')
+  els.loading.classList.toggle('busy', show)
+  if (!show) {
+    loadingState.label = ''
+    return
+  }
+
+  // A replan is the demo's own signal that the RELEVANT set just changed, which
+  // is the part a user reads as "why did my zoomed view go soft".
+  const label =
+    now - loadingState.planEpoch < REFOCUS_WINDOW_MS
+      ? 'Refocusing'
+      : 'Loading blocks'
+  // Only touch the live region when the wording actually changes: rewriting it
+  // at 8 Hz would make a screen reader unusable.
+  if (label !== loadingState.label) {
+    loadingState.label = label
+    els.loadingLabel.textContent = label
+  }
+  // Count against what the stream actually asked for, not plan.total: absent
+  // and empty chunks are never fetched and the LRU may evict, so a total-based
+  // bar stalls short of full even once everything relevant is in.
+  const resident = stream ? stream.resident : 0
+  const requested = resident + outstanding
+  els.loadingCount.textContent = `${resident} / ${requested} blocks`
+  els.loadingFill.style.width = `${
+    requested > 0 ? Math.round((resident / requested) * 100) : 0
+  }%`
+}
+
+// One line of nv.lodCompensation(). Both LOD compensation settings are exact
+// no-ops on anything that is not a multi-LOD chunked volume, so the report is
+// the only way to tell "the knob is doing nothing" from "the knob is doing
+// nothing VISIBLE"; the HUD shows the exact exponent/scale each drawn level is
+// handing the shader.
+function lodCompensationSummary() {
+  const report = nv?.lodCompensation()
+  if (!report) return 'pending'
+  if (!report.isActive) return `off (${report.inactiveReason})`
+  const parts = report.levels
+    .filter((l) => l.brickCount > 0 && l.downsample > 1)
+    .map(
+      (l) =>
+        `L${l.level} k${l.downsample.toFixed(1)} x${l.brickCount} g${l.brightnessExponent.toFixed(3)} a${l.opacityScale.toFixed(2)}`,
+    )
+  if (report.floor && report.floor.downsample > 1) {
+    parts.push(
+      `floor k${report.floor.downsample.toFixed(1)} g${report.floor.brightnessExponent.toFixed(3)} a${report.floor.opacityScale.toFixed(2)}`,
+    )
+  }
+  return parts.join(' | ') || 'active, no coarse brick drawn'
 }
 
 function chunkShapeFromPlan(plan) {
@@ -1529,7 +1742,12 @@ function startHudPolling() {
     // out-of-plan keys never inflate a displayed count.
     if (activeCv) {
       const p = activeCv.currentPlan
-      if (p !== chunkPlan) chunkPlan = p
+      if (p !== chunkPlan) {
+        chunkPlan = p
+        // Stamped for the badge: what follows a swap is the fetch of whatever
+        // the new plan asked for, which is the wait worth naming.
+        loadingState.planEpoch = performance.now()
+      }
     }
     // Reconcile the slider/label with the live zoom from any source (wheel moves
     // it with no 'change' event). syncZoomControl is UI-only and never nudges the
@@ -1537,8 +1755,18 @@ function startHudPolling() {
     // replan is issued by the canvas wheel listener in main.
     syncZoomControl()
     renderHud()
+    renderLoading()
     syncExplode()
   }, 120)
+}
+
+// Switch budget plan in place. The pyramid is already open and the plan is pure
+// policy, so core re-folds it (the demo's pinned VRAM budget still wins), swaps
+// the crosshair subscription if the focus changed, and re-plans -- no reload.
+// 'uniform' stops following the crosshair, so the Zoom control no longer
+// retargets the detail; that is the point of the plan, not a bug.
+function applyBudgetPlan() {
+  activeCv?.setBudgetPlan(els.plan.value)
 }
 
 function applyLayout() {
@@ -1599,6 +1827,13 @@ async function runReload(token, options) {
   if (token !== reloadToken) return
   hideFallback()
   stats = freshStats()
+  // Hard-reset the badge: the outgoing source's linger must not carry a stale
+  // "N / M blocks" over the new one's first frames.
+  loadingState.since = 0
+  loadingState.until = 0
+  loadingState.label = ''
+  loadingState.planEpoch = 0
+  els.loading.classList.remove('busy')
   // The fresh volume starts un-exploded; syncExplode re-applies the slider's
   // explode once this load settles.
   appliedExplodeScale = 1
@@ -1643,13 +1878,21 @@ async function runReload(token, options) {
           calMin: win.min,
           calMax: win.max,
           colormap: els.colormap.value,
+          // Policy (where the detail goes, how many bricks it may cost) comes
+          // from the named plan; only the VRAM ceiling is pinned by the demo,
+          // and an individual option wins over the plan by design.
+          budgetPlan: els.plan.value,
           budgetBytes: MULTILOD_BUDGET_BYTES,
-          maxBricks: MULTILOD_MAX_BRICKS,
           // deviceLimit is omitted: core now defaults it from the host's
           // maxTextureDimension3D, which this demo sets to 256 (see the NiiVue
           // construction) -- the same value the explicit option used to pass.
-          halo: STREAMING_CHUNK_HALO,
+          halo: streamingChunkHalo,
           minLevel: loadLevel,
+          // Back the octree with a coarse whole-volume floor (core builds it from
+          // the coarsest present pyramid level) so not-yet-streamed or
+          // under-opaque coarse far-field regions show continuous coarse detail
+          // instead of blank/see-through gaps; ?nofloor disables it for A/B.
+          coarseFloor: !NO_FLOOR,
         },
       )
       if (token !== reloadToken) {
@@ -1687,13 +1930,12 @@ async function runReload(token, options) {
     // The scene extents are only known now, and each source has its own scale, so
     // re-derive the crosshair size for the volume that just landed.
     applyCrosshair()
-    // Back the octree with a coarse whole-volume floor (on by default) so not-yet-
-    // streamed or under-opaque coarse far-field regions show continuous coarse
-    // detail instead of blank/see-through gaps; ?nofloor disables it for A/B.
-    if (activeSource.kind === 'omezarr' && !NO_FLOOR) {
-      const floor = await buildCoarseFloorVolume(activeSource)
-      if (token !== reloadToken) return
-      await nv.setBaseCoarseFloor(floor)
+    // loadChunkedVolume already installed the floor, but it ran while the
+    // outgoing volume was still the base (this reload is additive); re-apply now
+    // that the scene holds only the new one. The built floor is cached, so this
+    // costs no extra fetch. The synthetic path has no pyramid, so it clears.
+    if (activeSource.kind === 'omezarr' && activeCv) {
+      await activeCv.applyCoarseFloor()
     } else {
       await nv.setBaseCoarseFloor(null)
     }
@@ -1705,6 +1947,10 @@ async function runReload(token, options) {
 
 async function main() {
   makeDraggable(els.hud)
+  // A ?plan= naming something the control does not offer leaves the markup's
+  // default selected, which matches how core degrades an unknown plan name.
+  els.plan.value = INITIAL_BUDGET_PLAN
+  if (!els.plan.value) els.plan.value = 'uniform'
   setDefaultWindowForSelectedSource()
   await refreshLevelControl()
 
@@ -1717,6 +1963,13 @@ async function main() {
     maxChunkResidencyBytes: DEFAULT_RESIDENCY_BYTES,
   })
   await nv.attachToCanvas(els.canvas)
+  // Browsers restore a range input's value across a reload, so push the slider's
+  // current position into the fresh instance rather than assuming the default.
+  applySampleRate()
+  applyGamma()
+  applyLodCompensation()
+  applyLodOpacity()
+  applyInterp()
 
   els.source.addEventListener('change', async () => {
     setDefaultWindowForSelectedSource()
@@ -1730,6 +1983,7 @@ async function main() {
       activeCv.setMaxDetail(selectedLevelIndex(activeSource))
     }
   })
+  els.plan.addEventListener('change', applyBudgetPlan)
   els.layout.addEventListener('change', applyLayout)
   els.colormap.addEventListener('change', () => {
     void reloadVolume()
@@ -1741,6 +1995,11 @@ async function main() {
   // live on the resident volume instead of re-streaming.
   els.explode.addEventListener('input', applyExplode)
   els.zoom.addEventListener('input', applyZoom)
+  els.samples.addEventListener('input', applySampleRate)
+  els.gamma.addEventListener('input', applyGamma)
+  els.lodComp.addEventListener('input', applyLodCompensation)
+  els.lodOpacity.addEventListener('input', applyLodOpacity)
+  els.interp.addEventListener('change', applyInterp)
   els.blocks.addEventListener('change', applyBlocks)
   els.crosshair.addEventListener('change', applyCrosshair)
   els.reload.addEventListener('click', () => {
@@ -1766,9 +2025,13 @@ async function main() {
   // the octree re-plan here (event-driven, so no perpetual re-fire); core debounces
   // refocus, and a wheel that only steps the crosshair re-plans an unchanged zoom
   // (cheap no-op). The poll reconciles the slider/label afterward.
-  els.canvas.addEventListener('wheel', () => activeCv?.refocus(), {
-    passive: true,
-  })
+  els.canvas.addEventListener(
+    'wheel',
+    () => {
+      activeCv?.refocus()
+    },
+    { passive: true },
+  )
 
   await reloadVolume({ reloadSource: true })
   startHudPolling()
@@ -1805,6 +2068,16 @@ async function main() {
       // emit locationChange, so this exercises the core setFocus path).
       driveFocus(frac) {
         activeCv?.setFocus(frac)
+      },
+      // Re-stream the same store with a different brick halo. This is the
+      // halo-vs-filter experiment: trilinear reaches 1 voxel past a brick face
+      // and the tricubic filter reaches 2, so a halo of 1 lets a cubic tap land
+      // on clamp-to-edge data at an internal face. Both halos can be captured
+      // in one page load, on one camera, so the two frames differ ONLY in halo.
+      async setHalo(n) {
+        streamingChunkHalo = [n, n, n]
+        await reloadVolume({ reloadSource: true })
+        return streamingChunkHalo
       },
     }
   }

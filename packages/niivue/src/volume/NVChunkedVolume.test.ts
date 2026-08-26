@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 import { mat4 } from 'gl-matrix'
+import { SLICE_TYPE } from '@/NVConstants'
 import type NiiVue from '@/NVControlBase'
 import type { NVImage, VolumeChunkSourceRequest } from '@/NVTypes'
 import type {
@@ -327,6 +328,87 @@ describe('createSourceChunkLoader', () => {
     expect((out as Uint8Array).byteLength).toBe(8)
   })
 
+  test('clamps a non-finite maxConcurrentLoads so the flood cap survives', async () => {
+    // Infinity passes straight through both Math.floor and Math.max, so an
+    // unguarded clamp leaves `active < maxConcurrent` permanently true and the
+    // bound is gone: all 5 would run at once.
+    let active = 0
+    let peak = 0
+    const source: ChunkedVolumeSource = {
+      datatypeCode: 4,
+      levels: [{ level: 0, shape: [64, 64, 64], spacing: [1, 1, 1] }],
+      fetchChunk: async () => {
+        active++
+        peak = Math.max(peak, active)
+        await new Promise((r) => setTimeout(r, 15))
+        active--
+        return new Uint8Array(8)
+      },
+    }
+    const load = createSourceChunkLoader(source, {
+      maxConcurrentLoads: Number.POSITIVE_INFINITY,
+      retryAttempts: 1,
+    })
+    // 5 distinct regions (distinct texOrigin, so no dedup) fired at once.
+    await Promise.all(
+      Array.from({ length: 5 }, (_, i) => load(req(0, [i, 0, 0], [1, 1, 1]))),
+    )
+    // Falls back to the safe floor of 1, not to 'all five at once'.
+    expect(peak).toBe(1)
+  })
+
+  test('clamps a non-finite retryAttempts so retries stay bounded', async () => {
+    // Infinity here is the worse half: withRetry's loop has no end, and once the
+    // backoff 80 * 2 ** i overflows to Infinity the delay never resolves, so the
+    // read hangs for good. Race a timer so a regression fails fast and loudly
+    // rather than stalling the run until the job timeout.
+    let calls = 0
+    const source: ChunkedVolumeSource = {
+      datatypeCode: 4,
+      levels: [{ level: 0, shape: [8, 8, 8], spacing: [1, 1, 1] }],
+      // TypeError is withRetry's 'transient' signal, the one it retries.
+      fetchChunk: async () => {
+        calls++
+        throw new TypeError('Failed to fetch')
+      },
+    }
+    const load = createSourceChunkLoader(source, {
+      maxConcurrentLoads: 2,
+      retryAttempts: Number.POSITIVE_INFINITY,
+    })
+    const outcome = await Promise.race([
+      Promise.resolve(load(req(0, [0, 0, 0], [1, 1, 1]))).then(
+        () => 'resolved',
+        () => 'rejected',
+      ),
+      new Promise((r) => setTimeout(() => r('still retrying'), 500)),
+    ])
+    // Clamped to the floor of 1: one attempt, give up, no unbounded backoff.
+    expect(outcome).toBe('rejected')
+    expect(calls).toBe(1)
+  })
+
+  test('clamps NaN and fractional counts to a usable floor', async () => {
+    let calls = 0
+    const source: ChunkedVolumeSource = {
+      datatypeCode: 4,
+      levels: [{ level: 0, shape: [8, 8, 8], spacing: [1, 1, 1] }],
+      fetchChunk: async () => {
+        calls++
+        return new Uint8Array(8)
+      },
+    }
+    // NaN would make every `active < maxConcurrent` comparison false (nothing
+    // ever starts); 0.5 floors to 0, which is the same deadlock.
+    const load = createSourceChunkLoader(source, {
+      maxConcurrentLoads: Number.NaN,
+      retryAttempts: 0.5,
+    })
+    const out = await load(req(0, [0, 0, 0], [1, 1, 1]))
+    expect(calls).toBe(1)
+    expect((out as Uint8Array).byteLength).toBe(8)
+  })
+
   test('retryAttempts:0 still fetches exactly once', async () => {
     let calls = 0
     const source: ChunkedVolumeSource = {
@@ -376,6 +458,68 @@ describe('createSourceChunkLoader', () => {
       process.off('unhandledRejection', onUnhandled)
     }
   })
+
+  test('a cancelled request aborts the source read', async () => {
+    let seen: AbortSignal | undefined
+    const source: ChunkedVolumeSource = {
+      datatypeCode: 4,
+      levels: [{ level: 0, shape: [8, 8, 8], spacing: [1, 1, 1] }],
+      fetchChunk: (r) =>
+        new Promise((_resolve, reject) => {
+          seen = r.signal
+          r.signal?.addEventListener('abort', () =>
+            reject(new DOMException('aborted', 'AbortError')),
+          )
+        }),
+    }
+    const load = createSourceChunkLoader(source, {
+      maxConcurrentLoads: 2,
+      retryAttempts: 3,
+    })
+    const controller = new AbortController()
+    const request = {
+      ...req(0, [0, 0, 0], [1, 1, 1]),
+      signal: controller.signal,
+    }
+    const pending = load(request)
+    await new Promise((r) => setTimeout(r, 0))
+    expect(seen?.aborted).toBe(false)
+    controller.abort()
+    expect(seen?.aborted).toBe(true)
+    // An abort is never retried, so it surfaces on the first attempt.
+    await expect(pending).rejects.toThrow('aborted')
+  })
+
+  test('one cancelled request does not abort a shared read another still wants', async () => {
+    let seen: AbortSignal | undefined
+    let release: (() => void) | undefined
+    const source: ChunkedVolumeSource = {
+      datatypeCode: 4,
+      levels: [{ level: 0, shape: [8, 8, 8], spacing: [1, 1, 1] }],
+      fetchChunk: (r) =>
+        new Promise((resolve) => {
+          seen = r.signal
+          release = () => resolve(new Uint8Array(2))
+        }),
+    }
+    const load = createSourceChunkLoader(source, {
+      maxConcurrentLoads: 2,
+      retryAttempts: 1,
+    })
+    const first = new AbortController()
+    const second = new AbortController()
+    // Same region, two chunk indices — the plan-swap case the dedup exists for.
+    const shared = req(0, [0, 0, 0], [1, 1, 1])
+    const a = load({ ...shared, signal: first.signal })
+    const b = load({ ...shared, chunkIndex: 1, signal: second.signal })
+    await new Promise((r) => setTimeout(r, 0))
+    first.abort()
+    expect(seen?.aborted).toBe(false)
+    release?.()
+    await expect(a).resolves.toHaveLength(2)
+    await expect(b).resolves.toHaveLength(2)
+    second.abort()
+  })
 })
 
 // --- manager: id uniqueness + serialized plan swaps ------------------------
@@ -396,6 +540,8 @@ function makeHost(
 ): NiiVue {
   return {
     swapVolumeChunkPlan: swap,
+    _registerChunkedVolume: () => {},
+    _unregisterChunkedVolume: () => {},
   } as unknown as NiiVue
 }
 
@@ -423,6 +569,8 @@ describe('NVChunkedVolume deviceLimit default', () => {
     ({
       opts: { maxTextureDimension3D },
       swapVolumeChunkPlan: async () => {},
+      _registerChunkedVolume: () => {},
+      _unregisterChunkedVolume: () => {},
     }) as unknown as NiiVue
 
   test('defaults from the host maxTextureDimension3D option', () => {
@@ -492,5 +640,241 @@ describe('NVChunkedVolume serialized refocus', () => {
     expect(applied).toHaveLength(2)
     // Newest plan applied last, and the handle/GPU agree.
     expect(applied[applied.length - 1]).toBe(mgr.currentPlan)
+  })
+})
+
+// --- manager: automatic coarse floor ---------------------------------------
+
+/**
+ * Host stub that records every floor install. `setBaseCoarseFloor` is the only
+ * host call `applyCoarseFloor` makes, so nothing else needs stubbing.
+ */
+function makeFloorHost(): {
+  host: NiiVue
+  installs: Array<NVImage | null>
+} {
+  const installs: Array<NVImage | null> = []
+  const host = {
+    setBaseCoarseFloor: async (vol: NVImage | null) => {
+      installs.push(vol)
+    },
+    _registerChunkedVolume: () => {},
+    _unregisterChunkedVolume: () => {},
+  } as unknown as NiiVue
+  return { host, installs }
+}
+
+/** mgrSource with a recording fetchChunk that returns correctly-sized bytes. */
+function floorSource(levels: ChunkedVolumeSource['levels']): {
+  source: ChunkedVolumeSource
+  fetches: ChunkedVolumeFetch[]
+} {
+  const fetches: ChunkedVolumeFetch[] = []
+  const source: ChunkedVolumeSource = {
+    datatypeCode: 4, // INT16 -> 2 bytes per voxel
+    levels,
+    fetchChunk: async (r) => {
+      fetches.push(r)
+      const n = r.texDims[0] * r.texDims[1] * r.texDims[2] * r.bytesPerVoxel
+      return new Uint8Array(n)
+    },
+  }
+  return { source, fetches }
+}
+
+describe('NVChunkedVolume coarse floor', () => {
+  test('builds the floor from the coarsest level and installs it', async () => {
+    const { host, installs } = makeFloorHost()
+    const { source, fetches } = floorSource(mgrSource.levels)
+    const mgr = new NVChunkedVolume(host, source, { radius: 16 })
+
+    expect(await mgr.applyCoarseFloor()).toBe(true)
+    // Whole coarsest level, in that level's own grid.
+    expect(fetches).toHaveLength(1)
+    expect(fetches[0].levelIndex).toBe(source.levels.length - 1)
+    expect(fetches[0].texOrigin).toEqual([0, 0, 0])
+    expect(fetches[0].texDims).toEqual([64, 64, 64])
+    expect(fetches[0].bytesPerVoxel).toBe(2)
+
+    expect(installs).toHaveLength(1)
+    const floor = installs[0]
+    expect(floor).not.toBeNull()
+    // CPU voxels on the img:null streaming skeleton, reinterpreted as the
+    // source datatype (INT16), and no chunkSource: the floor is not streamed.
+    expect(floor?.img).toBeInstanceOf(Int16Array)
+    expect(floor?.img?.length).toBe(64 * 64 * 64)
+    expect(floor?.chunkSource).toBeUndefined()
+    expect(floor?.dims?.slice(1, 4)).toEqual([64, 64, 64])
+  })
+
+  test('a repeat apply reuses the built floor instead of re-fetching', async () => {
+    const { host, installs } = makeFloorHost()
+    const { source, fetches } = floorSource(mgrSource.levels)
+    const mgr = new NVChunkedVolume(host, source, { radius: 16 })
+
+    await mgr.applyCoarseFloor()
+    await mgr.applyCoarseFloor()
+    expect(fetches).toHaveLength(1)
+    expect(installs).toHaveLength(2)
+    expect(installs[1]).toBe(installs[0])
+  })
+
+  test('coarseFloor: false neither fetches nor touches the host floor', async () => {
+    const { host, installs } = makeFloorHost()
+    const { source, fetches } = floorSource(mgrSource.levels)
+    const mgr = new NVChunkedVolume(host, source, {
+      radius: 16,
+      coarseFloor: false,
+    })
+
+    expect(await mgr.applyCoarseFloor()).toBe(false)
+    expect(fetches).toHaveLength(0)
+    // An app-supplied floor set via setBaseCoarseFloor must survive.
+    expect(installs).toHaveLength(0)
+  })
+
+  test('an oversized coarsest level CLEARS the floor rather than leaving a stale one', async () => {
+    const { host, installs } = makeFloorHost()
+    // Coarsest level is 1024^3: past both the voxel and the edge cap.
+    const { source, fetches } = floorSource([
+      { level: 0, shape: [4096, 4096, 4096], spacing: [1, 1, 1] },
+      { level: 1, shape: [1024, 1024, 1024], spacing: [4, 4, 4] },
+    ])
+    const mgr = new NVChunkedVolume(host, source, { radius: 16 })
+
+    expect(await mgr.applyCoarseFloor()).toBe(false)
+    expect(fetches).toHaveLength(0)
+    expect(installs).toEqual([null])
+  })
+
+  test('a failed fetch degrades to no floor, not a thrown load', async () => {
+    const { host, installs } = makeFloorHost()
+    const source: ChunkedVolumeSource = {
+      datatypeCode: 4,
+      levels: mgrSource.levels,
+      fetchChunk: async () => {
+        throw new Error('coarse level 404')
+      },
+    }
+    const mgr = new NVChunkedVolume(host, source, { radius: 16 })
+
+    expect(await mgr.applyCoarseFloor()).toBe(false)
+    expect(installs).toEqual([null])
+  })
+})
+
+describe('budget plans', () => {
+  // A pyramid deep enough that the budget pass has somewhere to coarsen TO.
+  const pyramid: ChunkedVolumeSource = {
+    datatypeCode: 4,
+    levels: [512, 256, 128, 64, 32].map((n, i) => ({
+      level: i,
+      shape: [n, n, n] as Vec3i,
+      spacing: [2 ** i, 2 ** i, 2 ** i] as Vec3f,
+    })),
+    fetchChunk: async () => new Uint8Array(),
+  }
+
+  /** Records locationChange subscribe/unsubscribe so leaks are assertable. */
+  function makePlanHost(): { host: NiiVue; listeners: () => number } {
+    let n = 0
+    const host = {
+      swapVolumeChunkPlan: async () => {},
+      _registerChunkedVolume: () => {},
+      _unregisterChunkedVolume: () => {},
+      addVolume: async () => {},
+      sliceType: SLICE_TYPE.MULTIPLANAR,
+      pan2Dxyzmm: [0, 0, 0, 1],
+      getCrosshairPos: () => [0, 0, 0],
+      addEventListener: (t: string) => {
+        if (t === 'locationChange') n++
+      },
+      removeEventListener: (t: string) => {
+        if (t === 'locationChange') n--
+      },
+    } as unknown as NiiVue
+    return { host, listeners: () => n }
+  }
+
+  const levelsOf = (mgr: NVChunkedVolume): number[] => [
+    ...new Set(mgr.currentPlan.chunks.map((c) => c.sourceLevel ?? 0)),
+  ]
+
+  test("'uniform' plans one level everywhere; an 8x smaller budget steps it by 1", () => {
+    const at = (budgetBytes: number): number[] => {
+      const mgr = new NVChunkedVolume(makePlanHost().host, pyramid, {
+        budgetPlan: 'uniform',
+        coarseFloor: false,
+        cellEdge: 64,
+        // High enough that BYTES are the only lever under test.
+        maxBricks: 100000,
+        budgetBytes,
+      })
+      return levelsOf(mgr)
+    }
+    const wide = at(160 * 1024 * 1024)
+    expect(wide).toHaveLength(1)
+    const tight = at(20 * 1024 * 1024)
+    expect(tight).toHaveLength(1)
+    // One eighth the bytes is one octree step: each level is 8x fewer voxels.
+    expect(tight[0]).toBe(wide[0] + 1)
+  })
+
+  test("'focus' on the same source is genuinely mixed-resolution", () => {
+    const mgr = new NVChunkedVolume(makePlanHost().host, pyramid, {
+      budgetPlan: 'focus',
+      coarseFloor: false,
+      cellEdge: 64,
+      radius: 64,
+      budgetBytes: 512 * 1024 * 1024,
+    })
+    expect(levelsOf(mgr).length).toBeGreaterThan(1)
+  })
+
+  test('an individual option still wins over the named plan', () => {
+    const mgr = new NVChunkedVolume(makePlanHost().host, pyramid, {
+      budgetPlan: 'uniform',
+      coarseFloor: false,
+      focus: 'crosshair',
+    })
+    expect(mgr.budgetPlan.focus).toBe('crosshair')
+    // Untouched by the override, so still the preset's.
+    expect(mgr.budgetPlan.radius).toBe('volume')
+  })
+
+  test('focus -> uniform -> focus leaks no crosshair subscription', async () => {
+    const { host, listeners } = makePlanHost()
+    const mgr = new NVChunkedVolume(host, pyramid, {
+      budgetPlan: 'focus',
+      coarseFloor: false,
+    })
+    await mgr.init()
+    expect(listeners()).toBe(1)
+
+    mgr.setBudgetPlan('uniform')
+    expect(mgr.budgetPlan.focus).toBe('none')
+    expect(listeners()).toBe(0)
+    // Idempotent: re-selecting the same plan must not unsubscribe twice.
+    mgr.setBudgetPlan('uniform')
+    expect(listeners()).toBe(0)
+
+    mgr.setBudgetPlan('focus')
+    expect(listeners()).toBe(1)
+    mgr.dispose()
+    expect(listeners()).toBe(0)
+    // A switch after teardown must not resubscribe a disposed manager.
+    mgr.setBudgetPlan('focus')
+    expect(listeners()).toBe(0)
+  })
+
+  test('a plan switch keeps a max-detail cap set in between', () => {
+    const mgr = new NVChunkedVolume(makePlanHost().host, pyramid, {
+      budgetPlan: 'focus',
+      coarseFloor: false,
+      cellEdge: 64,
+    })
+    mgr.setMaxDetail(2)
+    mgr.setBudgetPlan('uniform')
+    expect(Math.min(...levelsOf(mgr))).toBeGreaterThanOrEqual(2)
   })
 })

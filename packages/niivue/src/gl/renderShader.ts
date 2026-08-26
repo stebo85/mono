@@ -3,6 +3,11 @@ import { fragmentPreamble, volumeVertexShader } from './volumeShaderLib'
 export const vertexShader = volumeVertexShader
 
 export const fragmentShader = `${fragmentPreamble}
+// Fine-march iteration ceiling. Sized for the maximum sample rate (4) at the
+// old one-sample-per-voxel budget of 2048 steps; every loop exits on ray length
+// long before this, so the ceiling costs nothing at the common rates.
+const int MAX_FINE_STEPS = 8192;
+
 uniform mat4 normMtx;
 uniform float gradientAmount;
 uniform float numVolumes;  // number of loaded volumes (1 = no overlay, 2+ = has overlay)
@@ -20,6 +25,39 @@ uniform float earlyTermination;
 // Per-brick source-level voxel dims for the ray-step density (multi-LOD). Equals
 // volumeTexDimsFull for single-level/non-chunked draws.
 uniform vec3 rayStepTexVox;
+// Samples per voxel along the ray in the fine march. Values above 1 oversample
+// and converge the ray integral. This does NOT remove concentric "wood grain"
+// banding on smooth structures: measured relative ring contrast is flat from 1
+// to 4, because the banding is in the integrand rather than in how densely the
+// ray samples it. Keep it for integral accuracy, not as an anti-banding knob.
+uniform float rayVoxSampleRate;
+// 0 = hardware trilinear, 1 = tricubic B-spline reconstruction in the background
+// fine pass (mirrored in wgpu/volumeShaderLib.ts + wgpu/render.wgsl). Trilinear is
+// only C0, so its slope creases show as a blocky texel staircase along band edges;
+// the cubic filter is C2 and removes that. It does not touch the wood-grain rings,
+// which survive a C2 reconstruction unchanged.
+uniform float cubicFilter;
+// Display gamma exponent for the classified RGB (alpha untouched, so the ray's
+// occlusion is unchanged). Already inverted on the CPU: the shader does
+// pow(rgb, invGamma), where invGamma = 1 / scene.gamma, so gamma > 1 brightens.
+// 1.0 is a strict no-op. Mirrors invGamma in wgpu/volumeShaderLib.ts.
+uniform float invGamma;
+// Multiplier on this brick's step-size opacity exponent, compensating the fact
+// that a coarse voxel is not homogeneous (so its true transmittance is lower
+// than the homogeneous approximation the step correction assumes). 1.0 is a
+// strict no-op and is the default. Mirrors lodOpacityScale in
+// wgpu/volumeShaderLib.ts.
+uniform float lodOpacityScale;
+// The background volume's own \`opacity\`, scaling every background sample's
+// alpha. The 2D slice shader has always honoured it as a plain uniform; here it
+// scales the alpha BEFORE the classification test so a half-opaque volume is a
+// half-dense medium (you see deeper into it) rather than a fully dense one
+// faded at the end, and so opacity 0 removes the background from the depth
+// write and the clip-surface shading as well as from the colour. Overlays do
+// not use it: their opacity is baked into the overlay texture's alpha by the
+// orient pass. 1.0 is the default and a strict no-op. Mirrors backOpacity in
+// wgpu/volumeShaderLib.ts.
+uniform float backOpacity;
 uniform vec4 clipPlaneColor;
 uniform vec4 paqdUniforms;
 uniform sampler2D matcap;
@@ -76,6 +114,60 @@ vec3 layerShade(sampler3D tex, vec3 p, float amount) {
   return mix(vec3(1.0), mc_rgb, amount);
 }
 
+// Display gamma on a classified colour. ALPHA IS DELIBERATELY UNTOUCHED: gamma
+// is a brightness control, and raising alpha with it would change how much each
+// sample occludes what is behind it (the ray would saturate sooner and the image
+// would get flatter, not brighter). Mirrors applyGamma in wgpu/volumeShaderLib.ts
+// -- keep the two in step.
+vec3 applyGamma(vec3 rgb, float e) {
+  if (e == 1.0) { return rgb; }
+  return pow(max(rgb, vec3(0.0)), vec3(e));
+}
+
+// Tricubic B-spline reconstruction in 8 hardware-trilinear fetches
+// (Sigg & Hadwiger, GPU Gems 2 ch. 20; Ruijters & Thevenaz formulation). The
+// 4x4x4 kernel has non-negative weights only, so each opposed pair of taps
+// collapses into one linear fetch at a weighted offset. Approximating, not
+// interpolating: it smooths by design, which is the point here. Requires the
+// texture to be LINEAR-filtered, which the orient prepass already guarantees.
+//
+// Support reaches 2 texels either side of the sample, so a CHUNKED volume needs
+// a brick halo of at least 2 or brick faces read past their owned data and seam.
+// See VolumeRenderConfig.isCubicInterpolation.
+//
+// coord is already in THIS texture's [0,1] space (post chunkTexCoord).
+vec4 sampleTricubic(sampler3D tex, vec3 coord) {
+  vec3 dims = vec3(textureSize(tex, 0));
+  vec3 grid = coord * dims - 0.5;
+  vec3 idx = floor(grid);
+  vec3 f = grid - idx;
+  vec3 g = 1.0 - f;
+  vec3 w0 = (1.0 / 6.0) * g * g * g;
+  vec3 w1 = 2.0 / 3.0 - 0.5 * f * f * (2.0 - f);
+  vec3 w2 = 2.0 / 3.0 - 0.5 * g * g * (2.0 - g);
+  vec3 w3 = (1.0 / 6.0) * f * f * f;
+  vec3 s0 = w0 + w1;
+  vec3 s1 = w2 + w3;
+  vec3 inv = 1.0 / dims;
+  vec3 h0 = inv * ((w1 / s0) - 0.5 + idx);
+  vec3 h1 = inv * ((w3 / s1) + 1.5 + idx);
+  vec4 c000 = texture(tex, vec3(h0.x, h0.y, h0.z));
+  vec4 c100 = texture(tex, vec3(h1.x, h0.y, h0.z));
+  c000 = mix(c100, c000, s0.x);
+  vec4 c010 = texture(tex, vec3(h0.x, h1.y, h0.z));
+  vec4 c110 = texture(tex, vec3(h1.x, h1.y, h0.z));
+  c010 = mix(c110, c010, s0.x);
+  c000 = mix(c010, c000, s0.y);
+  vec4 c001 = texture(tex, vec3(h0.x, h0.y, h1.z));
+  vec4 c101 = texture(tex, vec3(h1.x, h0.y, h1.z));
+  c001 = mix(c101, c001, s0.x);
+  vec4 c011 = texture(tex, vec3(h0.x, h1.y, h1.z));
+  vec4 c111 = texture(tex, vec3(h1.x, h1.y, h1.z));
+  c011 = mix(c111, c011, s0.x);
+  c001 = mix(c011, c001, s0.y);
+  return mix(c001, c000, s0.z);
+}
+
 struct RayResult {
   vec4 color;
   vec4 firstHit;
@@ -109,7 +201,11 @@ RayResult rayMarchPass(
     vec4 deltaDir, vec4 deltaDirFast,
     float ran, float earlyTermination,
     float clipLo, float clipHi, float clipMode,
-    float shadeAmount, bool mip
+    float shadeAmount,
+    // Display-gamma exponent for this layer's classified colour. Intensity-
+    // derived layers pass invGamma; the drawing layer passes 1.0, because its
+    // colours are categorical label swatches, not brightness.
+    float gammaExp, bool mip
 ) {
     RayResult result;
     result.color = vec4(0.0);
@@ -119,23 +215,29 @@ RayResult rayMarchPass(
     float stepSize = deltaDir.w;
     vec4 samplePos = vec4(start + dir * (stepSize * ran), stepSize * ran);
     vec4 samplePosStart = samplePos;
+    // The skip probes one stride PAST the segment end (see fastLimit in main).
+    float fastLimit = len + deltaDirFast.w;
 
     // Fast pass
     for (int j = 0; j < 1024; j++) {
-        if (samplePos.a > len) { break; }
+        if (samplePos.a > fastLimit) { break; }
         if (clipMode > 0.5 && clipMode < 1.5 && samplePos.a > clipHi) { break; }
         if (clipPassSkip(samplePos.a, clipLo, clipHi, clipMode)) { samplePos += deltaDirFast; continue; }
         float alpha = texture(tex, chunkTexCoord(samplePos.xyz)).a;
         if (alpha >= 0.01) { break; }
         samplePos += deltaDirFast;
     }
-    if (samplePos.a >= len) { return result; }
+    if (samplePos.a > fastLimit) { return result; }
 
     samplePos -= deltaDirFast;
     if (samplePos.a < 0.0) { samplePos = samplePosStart; }
+    // Put the fine march back on the ray's deterministic lattice; the 1.9-voxel
+    // fast stride would otherwise set its phase from the depth of the first hit.
+    float snapped = snapToSampleLattice(samplePos.a, ran, stepSize);
+    samplePos = vec4(start + dir * snapped, snapped);
 
     // Fine pass
-    for (int i = 0; i < 2048; i++) {
+    for (int i = 0; i < MAX_FINE_STEPS; i++) {
         if (samplePos.a > len) { break; }
         if (clipMode > 0.5 && clipMode < 1.5 && samplePos.a > clipHi) { break; }
         if (clipPassSkip(samplePos.a, clipLo, clipHi, clipMode)) { samplePos += deltaDir; continue; }
@@ -145,7 +247,7 @@ RayResult rayMarchPass(
                 result.firstHit = samplePos;
             }
             result.farthest = samplePos.a;
-            vec3 rgb = colorSample.rgb;
+            vec3 rgb = applyGamma(colorSample.rgb, gammaExp);
             if (shadeAmount > 0.0) {
                 // colorSample.rgb is straight (non-premultiplied) here, so
                 // clamping the lit colour to 1.0 keeps the premultiplied
@@ -200,11 +302,13 @@ RayResult rayMarchPaqd(
     float stepSize = deltaDir.w;
     vec4 samplePos = vec4(start + dir * (stepSize * ran), stepSize * ran);
     vec4 samplePosStart = samplePos;
+    // The skip probes one stride PAST the segment end (see fastLimit in main).
+    float fastLimit = len + deltaDirFast.w;
 
     // Fast pass: skip until prob1 > easing threshold t0
     float t0 = paqdUni[0];
     for (int j = 0; j < 1024; j++) {
-        if (samplePos.a > len) { break; }
+        if (samplePos.a > fastLimit) { break; }
         if (clipMode > 0.5 && clipMode < 1.5 && samplePos.a > clipHi) { break; }
         if (clipPassSkip(samplePos.a, clipLo, clipHi, clipMode)) { samplePos += deltaDirFast; continue; }
         // chunkTexCoord remaps into the per-chunk PAQD texture (identity when not chunked).
@@ -213,13 +317,17 @@ RayResult rayMarchPaqd(
         if (raw.b > t0) { break; }
         samplePos += deltaDirFast;
     }
-    if (samplePos.a >= len) { return result; }
+    if (samplePos.a > fastLimit) { return result; }
 
     samplePos -= deltaDirFast;
     if (samplePos.a < 0.0) { samplePos = samplePosStart; }
+    // Put the fine march back on the ray's deterministic lattice; the 1.9-voxel
+    // fast stride would otherwise set its phase from the depth of the first hit.
+    float snapped = snapToSampleLattice(samplePos.a, ran, stepSize);
+    samplePos = vec4(start + dir * snapped, snapped);
 
     // Fine pass: decode and accumulate PAQD colors
-    for (int i = 0; i < 2048; i++) {
+    for (int i = 0; i < MAX_FINE_STEPS; i++) {
         if (samplePos.a > len) { break; }
         if (clipMode > 0.5 && clipMode < 1.5 && samplePos.a > clipHi) { break; }
         if (clipPassSkip(samplePos.a, clipLo, clipHi, clipMode)) { samplePos += deltaDir; continue; }
@@ -312,19 +420,25 @@ void main() {
   vec3 dir = dirVec / len;
   // Step size is per-voxel of this brick's source level (rayStepTexVox); equals
   // volumeTexDimsFull for non-chunked/single-level draws, coarser for multi-LOD
-  // bricks so each steps at its own resolution.
-  vec3 texVox = rayStepTexVox;
+  // bricks so each steps at its own resolution. rayVoxSampleRate subdivides that
+  // step further to keep the march above the reconstruction's Nyquist rate.
+  vec3 texVox = rayStepTexVox * max(rayVoxSampleRate, 1.0);
   float lenVox = length(dirVec * texVox);
   if (lenVox < 0.5) {
     discard;
   }
   // Opacity (step-size) correction: a coarse multi-LOD brick takes fewer samples
   // along the ray, so without this it accumulates less alpha and renders dimmer —
-  // a brightness seam at LOD boundaries. Scale per-sample alpha up to the finest
-  // (common) sampling density. stepRatio == 1 for single-level/non-chunked draws
-  // (volumeTexDimsFull == rayStepTexVox), leaving them identical.
+  // a brightness seam at LOD boundaries. Rescale per-sample alpha to a fixed
+  // reference density, the finest level at one sample per voxel, so brightness is
+  // independent of both the brick's level and rayVoxSampleRate.
   float fineLenVox = length(dirVec * volumeTexDimsFull);
-  float stepRatio = max(1.0, fineLenVox / max(lenVox, 1e-6));
+  // refPerLen converts a ray-length thickness into reference steps (the finest
+  // level at one sample per voxel). A coarse multi-LOD brick owns longer slabs
+  // and needs its alpha scaled up; oversampling owns shorter ones and needs it
+  // scaled down. Both directions are correct, so this is not clamped -- only
+  // guarded away from zero for the pow() below.
+  float refPerLen = max(fineLenVox, 1e-6) / max(len, 1e-6);
   // Save original ray for overlay passes (overlay ignores clip planes)
   vec3 origStart = start;
   float origLen = len;
@@ -363,11 +477,16 @@ void main() {
       skipBackground = true;
     }
   }
+  // A fully transparent background contributes no colour, so marching it would
+  // only cost time and still claim the depth buffer and the clip surface.
+  if (backOpacity < (1.0 / 255.0)) {
+    skipBackground = true;
+  }
   // Shared values for all passes. Keep samples on a centered full-volume
   // lattice so adjacent chunks do not reset the ray phase at their seams.
   float origRan = raySamplePhase(origStart, stepSize);
   float ran = origRan;
-  float stepSizeFast = stepSize * 1.9;
+  float stepSizeFast = stepSize * 1.9 * max(rayVoxSampleRate, 1.0);
   vec4 deltaDirFast = vec4(dir * stepSizeFast, stepSizeFast);
   float localEarlyTermination = chunkedDraw ? 1.0 : earlyTermination;
   // --- Background passes ---
@@ -391,9 +510,18 @@ void main() {
     ran = raySamplePhase(start, stepSize);
     vec4 samplePos = vec4(start + dir * (stepSize * ran), stepSize * ran);
     // --- Background Fast Pass ---
+    // The skip probes one stride PAST the segment end. Without this a chunk
+    // whose only material lies in the last <1 fast stride never registers a
+    // hit, so the whole cube contributes nothing and its exit face draws as a
+    // dark line -- the seam grid at chunk / floor-cube boundaries. Probing past
+    // the face reads halo (or clamp-to-edge) texels, which is safe: it can only
+    // ever cause a false HIT, and the fine march that follows is still clipped
+    // to [0, len], so an over-eager probe costs a few empty samples and changes
+    // no output.
+    float fastLimit = len + stepSizeFast;
     vec4 samplePosStart = samplePos;
     for (int j = 0; j < 1024; j++) {
-      if (samplePos.a > len) { break; }
+      if (samplePos.a > fastLimit) { break; }
       if (cutaway && isClip && samplePos.a >= sampleRange.x && samplePos.a <= sampleRange.y) {
         samplePos += deltaDirFast;
         continue;
@@ -404,7 +532,7 @@ void main() {
       }
       samplePos += deltaDirFast;
     }
-    if (samplePos.a >= len) {
+    if (samplePos.a > fastLimit) {
       // Background fast pass found nothing — use clip plane color as fallback
       if (isClip && !chunkedDraw) {
         float clipAlpha = clipPlaneColorX.a;
@@ -426,16 +554,42 @@ void main() {
       if (samplePos.a < 0.0) {
         samplePos = samplePosStart;
       }
+      // Put the fine march back on the ray's deterministic lattice; the
+      // 1.9-voxel fast stride would otherwise set its phase from the depth of
+      // the first hit.
+      float snappedBg = snapToSampleLattice(samplePos.a, ran, stepSize);
+      samplePos = vec4(start + dir * snappedBg, snappedBg);
       // --- Background Fine Pass ---
+      // Each sample owns the slab [bLo, bHi) it is the midpoint of, clipped to
+      // this brick's segment. The slabs therefore tile [0, len] EXACTLY, so a
+      // brick contributes the optical depth of the ray length it actually owns
+      // no matter where its sample lattice falls. Attributing a fixed stepSize
+      // per sample instead only tiles when neighbouring bricks share a lattice;
+      // at a LOD interface the step-D and step-2D lattices do not nest and the
+      // boundary gains or loses up to ~1.5 fine steps of material -- the bright
+      // and dark seams along level boundaries.
+      float bLo = (snappedBg <= stepSize) ? 0.0 : max(snappedBg - 0.5 * stepSize, 0.0);
       mat3 norm3 = mat3(normMtx);
-      for (int fi = 0; fi < 2048; fi++) {
-        if (samplePos.a > len) { break; }
+      for (int fi = 0; fi < MAX_FINE_STEPS; fi++) {
+        if (bLo >= len) { break; }
+        // Clipped to len, so the final sample covers the trailing sliver past
+        // the last lattice point; it reads into the halo, which exists for it.
+        float bHi = min(samplePos.a + 0.5 * stepSize, len);
+        float slab = max(bHi - bLo, 0.0);
+        bLo = bHi;
         if (cutaway && isClip && samplePos.a >= sampleRange.x && samplePos.a <= sampleRange.y) {
           samplePos += deltaDir;
           continue;
         }
         vec3 volCoord = chunkTexCoord(samplePos.xyz);
-        vec4 colorSample = texture(volume, volCoord);
+        // Fine pass only. The fast skip pass stays trilinear: it only needs a
+        // coarse alpha test, so paying 8 fetches there would be waste.
+        vec4 colorSample = (cubicFilter > 0.5)
+          ? sampleTricubic(volume, volCoord)
+          : texture(volume, volCoord);
+        // Before the classification test, so a transparent-enough volume drops
+        // out of the first-hit depth and the AO stencil too, not just the colour.
+        colorSample.a *= backOpacity;
         if (colorSample.a >= 0.01) {
           if (!bgHasHit) {
             bgHasHit = true;
@@ -448,12 +602,12 @@ void main() {
           float lightingAmount = localGradientAmount;
           vec3 mc_rgb = texture(matcap, uv).rgb * (1.0 + (lightingAmount / 3.0));
           vec3 blendedRGB = mix(vec3(1.0), mc_rgb, lightingAmount);
-          vec3 finalRGB = blendedRGB * colorSample.rgb;
+          vec3 finalRGB = blendedRGB * applyGamma(colorSample.rgb, invGamma);
           // Step-size correction compensates a coarse brick's sparser sampling
           // in an OVER accumulation. A max projection reads each sample
           // independently, so correcting it would brighten coarse bricks
           // instead of matching them.
-          float correctedA = mip ? colorSample.a : (1.0 - pow(1.0 - colorSample.a, stepRatio));
+          float correctedA = mip ? colorSample.a : (1.0 - pow(1.0 - colorSample.a, max(slab * refPerLen * lodOpacityScale, 1e-3)));
           vec4 premultiplied = vec4(finalRGB * correctedA, correctedA);
           if (mip) {
             colAcc = max(colAcc, premultiplied);
@@ -520,7 +674,7 @@ void main() {
   // drag, so a cached gradient would thrash), so lighting comes from the
   // in-shader stencil — per sample, since an overlay stack is translucent.
   if (textureSize(overlay, 0).x > 2) {
-    RayResult result = rayMarchPass(overlay, origStart, dir, origLen, deltaDir, deltaDirFast, origRan, localEarlyTermination, ovClipLo, ovClipHi, ovClipMode, gradientAmount, mip);
+    RayResult result = rayMarchPass(overlay, origStart, dir, origLen, deltaDir, deltaDirFast, origRan, localEarlyTermination, ovClipLo, ovClipHi, ovClipMode, gradientAmount, invGamma, mip);
     depthAwareMix(colAcc, result, backNearest, fragDepth, depthFactor, mip);
   }
   // PAQD pass (raw data with GPU-side LUT lookup + easing)
@@ -530,7 +684,7 @@ void main() {
   }
   // Drawing pass (nearest-neighbor sampling — NEAREST filter set by CPU)
   if (textureSize(drawing, 0).x > 2) {
-    RayResult result = rayMarchPass(drawing, origStart, dir, origLen, deltaDir, deltaDirFast, origRan, localEarlyTermination, ovClipLo, ovClipHi, ovClipMode, 0.0, mip);
+    RayResult result = rayMarchPass(drawing, origStart, dir, origLen, deltaDir, deltaDirFast, origRan, localEarlyTermination, ovClipLo, ovClipHi, ovClipMode, 0.0, 1.0, mip);
     // Matcap lighting at FIRST HIT only (unlike the overlay, which shades every
     // sample): a drawing is a label mask read as an opaque surface, so one
     // shade for the whole ray is both correct and far cheaper. The gradient is

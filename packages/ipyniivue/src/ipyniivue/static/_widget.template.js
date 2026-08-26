@@ -110,12 +110,16 @@ const PROPS_RW = [
   ["volumeIsAlphaClipDark", "volume_is_alpha_clip_dark"],
   ["volumeIsBackgroundMasking", "volume_is_background_masking"],
   ["volumeIsColormapAlphaOn2D", "volume_is_colormap_alpha_on_2d"],
+  ["volumeIsCubicInterpolation", "volume_is_cubic_interpolation"],
   ["volumeIsNearestInterpolation", "volume_is_nearest_interpolation"],
   ["volumeIsV1SliceShader", "volume_is_v1_slice_shader"],
+  ["volumeLodBrightnessCompensation", "volume_lod_brightness_compensation"],
+  ["volumeLodOpacityCompensation", "volume_lod_opacity_compensation"],
   ["volumeMatcap", "volume_matcap"],
   ["volumeOutlineWidth", "volume_outline_width"],
   ["volumePaqdUniforms", "volume_paqd_uniforms"],
   ["volumeRenderMode", "volume_render_mode"],
+  ["volumeSampleRate", "volume_sample_rate"],
   ["volumeTransmittanceCutoff", "volume_transmittance_cutoff"],
 ]
 

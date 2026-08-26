@@ -38,6 +38,7 @@ import {
   chunksCrossingSlice,
   identityChunkSampleTransform,
 } from '@/volume/chunking'
+import type { DecodedChunkStats } from '@/volume/decodedChunkCache'
 import { WGPUBench } from './bench'
 import { ColorbarRenderer } from './colorbar'
 import { CrosshairRenderer } from './crosshair'
@@ -116,6 +117,7 @@ export default class NVView {
   device: GPUDevice | null
   /** Set when the GPU device is lost (e.g. GPU OOM); halts the render loop. */
   private _deviceLost = false
+  private _destroyed = false
   context: GPUCanvasContext | null
   preferredCanvasFormat: GPUTextureFormat
   sampler: GPUSampler | null
@@ -168,6 +170,18 @@ export default class NVView {
    * renderer can append draws to the same render pass. See view/NVOverlayHook.ts.
    */
   overlayDraw: ((frame: UIKitOverlayFrame) => void) | null = null
+
+  /**
+   * GPU-context-recovery hook, wired by the controller. Fires when this view has
+   * become unusable because the GPU dropped its device (typically VRAM
+   * exhaustion) AND a replacement is available. Every GPU object this view
+   * created died with the old device, so the only valid response is a full view
+   * rebuild — which the view cannot do itself. WebGPU has no "restored" event:
+   * a new device is obtained by re-running init, so this fires straight from
+   * `device.lost`. Mirrors the same field on NVViewGL, which defers it to
+   * 'webglcontextrestored'. See NVControlBase._onGpuContextLost.
+   */
+  onContextLost: (() => void) | null = null
   // Reusable scratch buffer for mesh uniform writes — avoids per-call Float32Array allocation
   private _uniformScratch = new Float32Array(mesh.MESH_UNIFORM_SIZE / 4)
   // Narrow public getters for bench.ts to read current render-area size
@@ -774,6 +788,28 @@ export default class NVView {
     // Composite (OVER) vs maximum-intensity projection, for every volume pass this
     // frame (base, overlay, PAQD, drawing, and the independent hi-res overlay cube).
     this.volumeRenderer.renderMode = md.volume.renderMode
+    // Ray samples per voxel in the 3D fine march (anti-aliasing vs fragment cost).
+    this.volumeRenderer.sampleRate = md.volume.sampleRate
+    // Tricubic B-spline reconstruction in the fine march (8 fetches vs 1).
+    this.volumeRenderer.isCubicInterpolation = md.volume.isCubicInterpolation
+    // Display gamma for the classified RGB of every volume sample (alpha, and
+    // therefore occlusion, is untouched).
+    this.volumeRenderer.gamma = md.scene.gamma
+    // Per-level brightness compensation for coarse multi-LOD bricks. Folds into
+    // the same shader exponent as `gamma`, but per chunk, so it is a no-op for
+    // single-level and non-chunked volumes whatever the coefficient.
+    this.volumeRenderer.lodBrightnessCompensation =
+      md.volume.lodBrightnessCompensation
+    // Per-level opacity compensation. Ray-march only: the slice renderer shows
+    // one sample per tile with no accumulation, so there is no aggregated alpha
+    // to correct there.
+    this.volumeRenderer.lodOpacityCompensation =
+      md.volume.lodOpacityCompensation
+    // 2D slice tiles read the same two exponents so a slice and the 3D render
+    // panel agree on brightness.
+    this.sliceRenderer.gamma = md.scene.gamma
+    this.sliceRenderer.lodBrightnessCompensation =
+      md.volume.lodBrightnessCompensation
     markCpuStart()
     // Phase 3d: advance the chunk-residency LRU clock before the tile loop
     // requests this frame's working set, so eviction protects visible chunks.
@@ -925,10 +961,10 @@ export default class NVView {
       screenSlices = fit.screenSlices
       this.screenSlices = screenSlices
     }
-    // Update crosshair geometry based on current model state
-    if (this.crosshairRenderer.isReady) {
-      this.crosshairRenderer.update(md)
-    }
+    // Crosshair geometry is written per tile rather than once per frame: its
+    // radius is a screen weight, so it depends on the tile's mm-per-pixel. Each
+    // tile that draws one claims the next vertex slot.
+    let crosshairSlot = 0
     const ann3DData = md.annotation.isVisibleIn3D
       ? NVAnnotation.buildAnnotation3DRenderData(md)
       : null
@@ -1262,6 +1298,9 @@ export default class NVView {
             md.scene.isClipPlaneCutaway,
             md.volume.paqdUniforms,
             md.volume.transmittanceCutoff,
+            // This tile's background volume, which is not always volumes[0]
+            // (a global3d tile binds its own).
+            vol.opacity ?? 1,
           )
           // Independent hi-res chunked overlay: stream its own working set and
           // draw it as translucent cubes over the base, in the same pass. Uses
@@ -1298,15 +1337,23 @@ export default class NVView {
       // Layer 2a: Crosshairs (skip on all mosaic tiles and global3d tiles)
       const isMosaicTile =
         tile.renderOrientation !== undefined || tile.sliceMM !== undefined
-      if (
+      const chRadiusMM =
         tile.space !== 'global3d' &&
         md.ui.is3DCrosshairVisible &&
         !isMosaicTile &&
-        this.crosshairRenderer.isReady &&
-        this.meshPipelines
-      ) {
+        this.crosshairRenderer.isReady
+          ? NVSliceLayout.crosshairRadiusMM(md, tile)
+          : 0
+      // A zero radius is either crosshairWidth: 0 or a degenerate tile; both
+      // mean there is nothing to draw.
+      const chSlot = crosshairSlot
+      let chDrawn = false
+      if (chRadiusMM > 0 && this.meshPipelines) {
         const pipeline = this.meshPipelines.phong
         if (pipeline) {
+          crosshairSlot++
+          chDrawn = true
+          this.crosshairRenderer.update(md, chRadiusMM, chSlot)
           this.crosshairRenderer.draw(
             device,
             pass,
@@ -1315,6 +1362,7 @@ export default class NVView {
             normalMatrix as Float32Array,
             i,
             tile.axCorSag,
+            chSlot,
           )
         }
       }
@@ -1395,12 +1443,9 @@ export default class NVView {
       const xrayTile = i + screenSlices.length
       if (xrayAlpha > 0 && this.meshXRayPipelines) {
         // Re-draw crosshairs with xray (skip on all mosaic tiles and global3d)
-        if (
-          tile.space !== 'global3d' &&
-          md.ui.is3DCrosshairVisible &&
-          !isMosaicTile &&
-          this.crosshairRenderer.isReady
-        ) {
+        // Same vertex slot as Layer 2a: only the uniforms differ. Gated on that
+        // pass having run, since the slot holds this tile's radius only if it did.
+        if (chDrawn) {
           const xPipeline = this.meshXRayPipelines.phong
           if (xPipeline) {
             this.crosshairRenderer.drawXRay(
@@ -1412,6 +1457,7 @@ export default class NVView {
               xrayTile,
               tile.axCorSag,
               xrayAlpha,
+              chSlot,
             )
           }
         }
@@ -2080,12 +2126,15 @@ export default class NVView {
     // stop driving the render loop once lost.
     void this.device.lost.then((info) => {
       this._deviceLost = true
-      if (info.reason !== 'destroyed') {
-        log.error(
-          `WebGPU device lost (${info.reason}): ${info.message}. Likely GPU ` +
-            'out of memory — reduce maxChunkResidencyBytes or use a coarser level.',
-        )
-      }
+      // 'destroyed' means someone called device.destroy() (deliberate
+      // teardown), and _destroyed covers this view being torn down while the
+      // device died on its own — neither is a failure to rebuild from.
+      if (info.reason === 'destroyed' || this._destroyed) return
+      log.error(
+        `WebGPU device lost (${info.reason}): ${info.message}. Likely GPU ` +
+          'out of memory — reduce maxChunkResidencyBytes or use a coarser level.',
+      )
+      this.onContextLost?.()
     })
     this.context = this.canvas.getContext('webgpu')
     if (!this.context) {
@@ -2200,6 +2249,13 @@ export default class NVView {
       chunkLimit,
       chunkResidencyBytes,
     )
+    // `chunkFadeMs`, when set, overrides how long a freshly-streamed chunk
+    // dissolves in over the coarse floor; 0 disables the fade, so 0 is a
+    // meaningful value and only a negative/NaN setting falls back to the default.
+    const fadeMs = this.options.chunkFadeMs
+    if (typeof fadeMs === 'number' && fadeMs >= 0) {
+      this.volumeRenderer.chunkFadeMs = fadeMs
+    }
     // Storage Buffers
     this.maxGlyphs = 2048 // Increased for legends with many entries
     this.buffers.glyphStorage = this.device.createBuffer({
@@ -2428,12 +2484,19 @@ export default class NVView {
     pending: number
     inFlight: number
     total: number
+    staleDropped: number
+    predicted: number
+    decoded: DecodedChunkStats
   } {
     return this.volumeRenderer.chunkStreamStats()
   }
 
   rebakeChunkedOverlays(): void {
     this.volumeRenderer.rebakeChunkedOverlays()
+  }
+
+  coarseFloorDims(): [number, number, number] | null {
+    return this.volumeRenderer.coarseFloorDims
   }
 
   _getMeshGpu(m: NVMesh): MeshGpuWithShader | null {
@@ -2661,26 +2724,30 @@ export default class NVView {
           }
           return null
         }
-        // With a CPU sampler (app-supplied coarse data), march to the first
-        // window-visible voxel; otherwise land on the bounding-box / clip surface.
-        const hitMM = vol.pickSampler
-          ? NVTransforms.rayMarchFirstVisibleMM(
-              near,
-              far,
-              vol.extentsMin,
-              vol.extentsMax,
-              vol.pickSampler,
-              md.clipPlanes,
-              md.scene.isClipPlaneCutaway,
-            )
-          : NVTransforms.rayBoxEntryMM(
-              near,
-              far,
-              vol.extentsMin,
-              vol.extentsMax,
-              md.clipPlanes,
-              md.scene.isClipPlaneCutaway,
-            )
+        // With a CPU sampler (the streamed volume's coarse floor, or app-supplied
+        // data), march to the first window-visible voxel. Without one — or when
+        // the ray crosses nothing visible — land on the bounding-box / clip
+        // surface, which is what the GPU shader does with its own miss.
+        const hitMM =
+          (vol.pickSampler
+            ? NVTransforms.rayMarchFirstVisibleMM(
+                near,
+                far,
+                vol.extentsMin,
+                vol.extentsMax,
+                vol.pickSampler,
+                md.clipPlanes,
+                md.scene.isClipPlaneCutaway,
+              )
+            : null) ??
+          NVTransforms.rayBoxEntryMM(
+            near,
+            far,
+            vol.extentsMin,
+            vol.extentsMax,
+            md.clipPlanes,
+            md.scene.isClipPlaneCutaway,
+          )
         if (hitMM) return hitMM
       }
     }
@@ -2710,18 +2777,22 @@ export default class NVView {
         ]
         const zeroPaqdUniforms = [0, 0, 0, 0]
         // The 7 floats after earlyTermination: clipPlaneOverlay, fadeAlpha,
-        // renderMode, then _pad0 + implicit struct padding. clipPlaneOverlay
-        // must carry the LIVE flag — the pick shader clips its overlay pass
-        // with it, and a zero here made picks land on cut-away overlay voxels
-        // (WebGL2 sets the same uniform by name in drawDepthPick).
+        // renderMode, cubicFilter, invGamma, then implicit struct padding.
+        // clipPlaneOverlay must carry the LIVE flag — the pick shader clips its
+        // overlay pass with it, and a zero here made picks land on cut-away
+        // overlay voxels (WebGL2 sets the same uniform by name in
+        // drawDepthPick). A pick reads geometry, not colour, so gamma and
+        // backOpacity are left neutral rather than mirrored from the scene
+        // (and the pick shader never reads backOpacity anyway; a fully
+        // transparent base is already excluded by the opacity gate above).
         const renderParamPadding = [
           md.scene.clipPlaneOverlay ? 1.0 : 0.0,
           1.0, // fadeAlpha: no cross-fade in a pick draw
           0,
           0,
-          0,
-          0,
-          0,
+          1.0, // invGamma: neutral
+          0, // lodOpacityScale: unused by the pick shader
+          1.0, // backOpacity: neutral
         ]
         const identityChunkUniforms = [
           ...volumeTexDimsFull,
@@ -2846,6 +2917,9 @@ export default class NVView {
   }
 
   destroy(): void {
+    // Latch teardown so a device-lost promise settling afterwards does not ask
+    // the controller to rebuild a view that is deliberately going away.
+    this._destroyed = true
     // Destroy GPU resources for volumes and remove .gpu structure
     const vols = this.model.getVolumes()
     for (const vol of vols) {

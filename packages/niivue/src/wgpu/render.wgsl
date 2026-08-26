@@ -1,5 +1,10 @@
 // Render-specific functions (preamble is prepended by render.ts from volumeShaderLib)
 
+// Fine-march iteration ceiling. Sized for the maximum sample rate (4) at the old
+// one-sample-per-voxel budget of 2048 steps; every loop exits on ray length long
+// before this, so the ceiling costs nothing at the common rates.
+const MAX_FINE_STEPS: i32 = 8192;
+
 // In-shader layer-gradient tuning constants, used by the overlay and drawing
 // passes (neither has a precomputed gradient texture the way the background
 // does). Shader authoring choices, not runtime uniforms. Offset widens vs
@@ -80,7 +85,12 @@ fn rayMarchPass(
     deltaDir: vec4f, deltaDirFast: vec4f,
     ran: f32, earlyTermination: f32,
     clipLo: f32, clipHi: f32, clipMode: f32,
-    shadeAmount: f32, mip: bool
+    shadeAmount: f32,
+    // Display-gamma exponent for this layer's classified colour. Intensity-
+    // derived layers pass params.invGamma; the drawing layer passes 1.0,
+    // because its colours are categorical label swatches, not brightness.
+    gammaExp: f32,
+    mip: bool
 ) -> RayMarchResult {
     var result: RayMarchResult;
     result.color = vec4f(0.0);
@@ -90,23 +100,29 @@ fn rayMarchPass(
     let stepSize = deltaDir.w;
     var samplePos = vec4f(start + dir * (stepSize * ran), stepSize * ran);
     let samplePosStart = samplePos;
+    // The skip probes one stride PAST the segment end (see fastLimit in main).
+    let fastLimit = len + deltaDirFast.w;
 
     // Fast pass
     for (var j: i32 = 0; j < 1024; j++) {
-        if (samplePos.a > len) { break; }
+        if (samplePos.a > fastLimit) { break; }
         if (clipMode > 0.5 && clipMode < 1.5 && samplePos.a > clipHi) { break; }
         if (clipPassSkip(samplePos.a, clipLo, clipHi, clipMode)) { samplePos += deltaDirFast; continue; }
         let alpha = textureSampleLevel(tex, samp, chunkTexCoord(samplePos.xyz), 0.0).a;
         if (alpha >= 0.01) { break; }
         samplePos += deltaDirFast;
     }
-    if (samplePos.a >= len) { return result; }
+    if (samplePos.a > fastLimit) { return result; }
 
     samplePos -= deltaDirFast;
     if (samplePos.a < 0.0) { samplePos = samplePosStart; }
+    // Put the fine march back on the ray's deterministic lattice; the 1.9-voxel
+    // fast stride would otherwise set its phase from the depth of the first hit.
+    let snapped = snapToSampleLattice(samplePos.a, ran, stepSize);
+    samplePos = vec4f(start + dir * snapped, snapped);
 
     // Fine pass
-    for (var i: i32 = 0; i < 2048; i++) {
+    for (var i: i32 = 0; i < MAX_FINE_STEPS; i++) {
         if (samplePos.a > len) { break; }
         if (clipMode > 0.5 && clipMode < 1.5 && samplePos.a > clipHi) { break; }
         if (clipPassSkip(samplePos.a, clipLo, clipHi, clipMode)) { samplePos += deltaDir; continue; }
@@ -116,7 +132,7 @@ fn rayMarchPass(
                 result.firstHit = samplePos;
             }
             result.farthest = samplePos.a;
-            var rgb = colorSample.rgb;
+            var rgb = applyGamma(colorSample.rgb, gammaExp);
             if (shadeAmount > 0.0) {
                 // colorSample.rgb is straight (non-premultiplied) here, so
                 // clamping the lit colour to 1.0 keeps the premultiplied
@@ -170,11 +186,13 @@ fn rayMarchPaqd(
     let stepSize = deltaDir.w;
     var samplePos = vec4f(start + dir * (stepSize * ran), stepSize * ran);
     let samplePosStart = samplePos;
+    // The skip probes one stride PAST the segment end (see fastLimit in main).
+    let fastLimit = len + deltaDirFast.w;
 
     // Fast pass: skip until prob1 > easing threshold t0
     let t0 = paqdUni[0];
     for (var j: i32 = 0; j < 1024; j++) {
-        if (samplePos.a > len) { break; }
+        if (samplePos.a > fastLimit) { break; }
         if (clipMode > 0.5 && clipMode < 1.5 && samplePos.a > clipHi) { break; }
         if (clipPassSkip(samplePos.a, clipLo, clipHi, clipMode)) { samplePos += deltaDirFast; continue; }
         // chunkTexCoord remaps into the per-chunk PAQD texture (identity when not chunked).
@@ -183,13 +201,17 @@ fn rayMarchPaqd(
         if (raw.b > t0) { break; }
         samplePos += deltaDirFast;
     }
-    if (samplePos.a >= len) { return result; }
+    if (samplePos.a > fastLimit) { return result; }
 
     samplePos -= deltaDirFast;
     if (samplePos.a < 0.0) { samplePos = samplePosStart; }
+    // Put the fine march back on the ray's deterministic lattice; the 1.9-voxel
+    // fast stride would otherwise set its phase from the depth of the first hit.
+    let snapped = snapToSampleLattice(samplePos.a, ran, stepSize);
+    samplePos = vec4f(start + dir * snapped, snapped);
 
     // Fine pass: decode and accumulate PAQD colors
-    for (var i: i32 = 0; i < 2048; i++) {
+    for (var i: i32 = 0; i < MAX_FINE_STEPS; i++) {
         if (samplePos.a > len) { break; }
         if (clipMode > 0.5 && clipMode < 1.5 && samplePos.a > clipHi) { break; }
         if (clipPassSkip(samplePos.a, clipLo, clipHi, clipMode)) { samplePos += deltaDir; continue; }
@@ -287,8 +309,10 @@ fn fragment_main(in: VertexOutput) -> FragmentOutput {
 	// Step size is per-voxel of this brick's source level across the FULL cube
 	// (not the chunk texture, which may include halo). Equals volumeTexDimsFull
 	// for non-chunked/single-level draws; coarser for multi-LOD bricks so each
-	// steps at its own resolution.
-	let texVox = params.rayStepTexVox.xyz;
+	// steps at its own resolution. sampleRate subdivides that step further to
+	// keep the march above the reconstruction's Nyquist rate.
+	let sampleRate = max(params.rayStepTexVox.w, 1.0);
+	let texVox = params.rayStepTexVox.xyz * sampleRate;
 	let lenVox = length(dirVec * texVox);
 	if (lenVox < 0.5) {
 		discard;
@@ -296,12 +320,16 @@ fn fragment_main(in: VertexOutput) -> FragmentOutput {
 	// Opacity (step-size) correction. A coarse multi-LOD brick takes fewer
 	// samples along the ray, so without this it accumulates less alpha and
 	// renders dimmer/more transparent than a fine brick of the same material —
-	// a visible brightness seam at LOD boundaries. Scale per-sample alpha up to
-	// the finest (common) sampling density so brightness is resolution-
-	// independent. stepRatio == 1 for single-level/non-chunked draws
-	// (volumeTexDimsFull == rayStepTexVox), leaving them byte-identical.
+	// a visible brightness seam at LOD boundaries. Rescale per-sample alpha to a
+	// fixed reference density, the finest level at one sample per voxel, so
+	// brightness is independent of both the brick's level and the sample rate.
 	let fineLenVox = length(dirVec * params.volumeTexDimsFull.xyz);
-	let stepRatio = max(1.0, fineLenVox / max(lenVox, 1e-6));
+	// refPerLen converts a ray-length thickness into reference steps (the finest
+	// level at one sample per voxel). A coarse multi-LOD brick owns longer slabs
+	// and needs its alpha scaled up; oversampling owns shorter ones and needs it
+	// scaled down. Both directions are correct, so this is not clamped -- only
+	// guarded away from zero for the pow() below.
+	let refPerLen = max(fineLenVox, 1e-6) / max(len, 1e-6);
 	// Save original ray for overlay passes (overlay ignores clip planes)
 	let origStart = start;
 	let origLen = len;
@@ -341,11 +369,19 @@ fn fragment_main(in: VertexOutput) -> FragmentOutput {
 			skipBackground = true;
 		}
 	}
+	// A fully transparent background contributes no colour, so marching it
+	// would only cost time and still claim the depth buffer and the clip
+	// surface.
+	if (params.backOpacity < (1.0 / 255.0)) {
+		skipBackground = true;
+	}
 	// Shared values for all passes. Keep samples on a centered full-volume
 	// lattice so adjacent chunks do not reset the ray phase at their seams.
 	let origRan = raySamplePhase(origStart, stepSize);
 	var ran = origRan;
-	let stepSizeFast = stepSize * 1.9;
+	// The empty-space skip keeps striding ~1.9 voxels whatever the sample rate,
+	// so oversampling does not also slow the skip and blow the iteration budget.
+	let stepSizeFast = stepSize * 1.9 * sampleRate;
 	let deltaDirFast = vec4f(dir * stepSizeFast, stepSizeFast);
 	let earlyTermination = select(params.earlyTermination, 1.0, chunkedDraw);
 	// --- Background passes ---
@@ -369,9 +405,18 @@ fn fragment_main(in: VertexOutput) -> FragmentOutput {
 		ran = raySamplePhase(start, stepSize);
 		var samplePos = vec4f(start + dir * (stepSize * ran), stepSize * ran);
 		// --- Background Fast Pass ---
+		// The skip probes one stride PAST the segment end. Without this a chunk
+		// whose only material lies in the last <1 fast stride never registers a
+		// hit, so the whole cube contributes nothing and its exit face draws as a
+		// dark line -- the seam grid at chunk / floor-cube boundaries. Probing
+		// past the face reads halo (or clamp-to-edge) texels, which is safe: it
+		// can only ever cause a false HIT, and the fine march that follows is
+		// still clipped to [0, len], so an over-eager probe costs a few empty
+		// samples and changes no output.
+		let fastLimit = len + stepSizeFast;
 		let samplePosStart = samplePos;
 		for (var j: i32 = 0; j < 1024; j++) {
-			if (samplePos.a > len) { break; }
+			if (samplePos.a > fastLimit) { break; }
 			if (cutaway && isClip && samplePos.a >= sampleRange.x && samplePos.a <= sampleRange.y) {
 				samplePos += deltaDirFast;
 				continue;
@@ -382,7 +427,7 @@ fn fragment_main(in: VertexOutput) -> FragmentOutput {
 			}
 			samplePos += deltaDirFast;
 		}
-		if (samplePos.a >= len) {
+		if (samplePos.a > fastLimit) {
 			// Background fast pass found nothing — use clip plane color as fallback
 			if (isClip && !chunkedDraw) {
 				let clipAlpha = clipPlaneColorX.a;
@@ -404,16 +449,44 @@ fn fragment_main(in: VertexOutput) -> FragmentOutput {
 			if (samplePos.a < 0.0) {
 				samplePos = samplePosStart;
 			}
+			// Put the fine march back on the ray's deterministic lattice; the
+			// 1.9-voxel fast stride would otherwise set its phase from the depth
+			// of the first hit.
+			let snappedBg = snapToSampleLattice(samplePos.a, ran, stepSize);
+			samplePos = vec4f(start + dir * snappedBg, snappedBg);
 			// --- Background Fine Pass ---
+			// Each sample owns the slab [bLo, bHi) it is the midpoint of, clipped
+			// to this brick's segment. The slabs therefore tile [0, len] EXACTLY,
+			// so a brick contributes the optical depth of the ray length it
+			// actually owns no matter where its sample lattice falls. Attributing
+			// a fixed stepSize per sample instead only tiles when neighbouring
+			// bricks share a lattice; at a LOD interface the step-D and step-2D
+			// lattices do not nest and the boundary gains or loses up to ~1.5 fine
+			// steps of material -- the bright and dark seams along level boundaries.
+			var bLo = select(max(snappedBg - 0.5 * stepSize, 0.0), 0.0, snappedBg <= stepSize);
 			let norm3 = mat3x3f(params.normMtx[0].xyz, params.normMtx[1].xyz, params.normMtx[2].xyz);
-			for (var fi: i32 = 0; fi < 2048; fi++) {
-				if (samplePos.a > len) { break; }
+			for (var fi: i32 = 0; fi < MAX_FINE_STEPS; fi++) {
+				if (bLo >= len) { break; }
+				// Clipped to len, so the final sample covers the trailing sliver
+				// past the last lattice point; it reads into the halo, which
+				// exists for it.
+				let bHi = min(samplePos.a + 0.5 * stepSize, len);
+				let slab = max(bHi - bLo, 0.0);
+				bLo = bHi;
 				if (cutaway && isClip && samplePos.a >= sampleRange.x && samplePos.a <= sampleRange.y) {
 					samplePos += deltaDir;
 					continue;
 				}
 				let volCoord = chunkTexCoord(samplePos.xyz);
-				let colorSample = textureSampleLevel(volume, tex_sampler, volCoord, 0.0);
+				// Fine pass only. The fast skip pass stays trilinear: it only needs a
+				// coarse alpha test, so paying 8 fetches there would be waste.
+				var colorSample = textureSampleLevel(volume, tex_sampler, volCoord, 0.0);
+				if (params.cubicFilter > 0.5) {
+					colorSample = sampleTricubic(volume, tex_sampler, volCoord);
+				}
+				// Before the classification test, so a transparent-enough volume drops
+				// out of the first-hit depth and the AO stencil too, not just the colour.
+				colorSample.a *= params.backOpacity;
 				if (colorSample.a >= 0.01) {
 					if (!bgHasHit) {
 						bgHasHit = true;
@@ -426,12 +499,12 @@ fn fragment_main(in: VertexOutput) -> FragmentOutput {
 					let lightingAmount = localGradientAmount;
 					let mc_rgb = textureSampleLevel(matcap, tex_sampler, uv, 0.0).rgb * (1.0 + (lightingAmount / 3.0));
 					let blendedRGB = mix(vec3f(1.0), mc_rgb, lightingAmount);
-					let finalRGB = blendedRGB * colorSample.rgb;
+					let finalRGB = blendedRGB * applyGamma(colorSample.rgb, params.invGamma);
 					// Step-size correction compensates a coarse brick's sparser
 					// sampling in an OVER accumulation. A max projection reads
 					// each sample independently, so correcting it would brighten
 					// coarse bricks instead of matching them.
-					let correctedA = select(1.0 - pow(1.0 - colorSample.a, stepRatio), colorSample.a, mip);
+					let correctedA = select(1.0 - pow(1.0 - colorSample.a, max(slab * refPerLen * params.lodOpacityScale, 1e-3)), colorSample.a, mip);
 					let premultiplied = vec4f(finalRGB * correctedA, correctedA);
 					if (mip) {
 						colAcc = max(colAcc, premultiplied);
@@ -502,7 +575,7 @@ fn fragment_main(in: VertexOutput) -> FragmentOutput {
 	// drag, so a cached gradient would thrash), so lighting comes from the
 	// in-shader stencil — per sample, since an overlay stack is translucent.
 	if (textureDimensions(overlay, 0).x > 2) {
-		let result = rayMarchPass(overlay, tex_sampler, origStart, dir, origLen, deltaDir, deltaDirFast, origRan, earlyTermination, ovClipLo, ovClipHi, ovClipMode, params.gradientAmount, mip);
+		let result = rayMarchPass(overlay, tex_sampler, origStart, dir, origLen, deltaDir, deltaDirFast, origRan, earlyTermination, ovClipLo, ovClipHi, ovClipMode, params.gradientAmount, params.invGamma, mip);
 		depthAwareMix(&colAcc, result, backNearest, &fragDepth, depthFactor, mip);
 	}
 	// PAQD pass (raw data with GPU-side LUT lookup + easing)
@@ -512,7 +585,7 @@ fn fragment_main(in: VertexOutput) -> FragmentOutput {
 	}
 	// Drawing pass (nearest-neighbor sampling for ray-march, linear for gradient)
 	if (textureDimensions(drawing, 0).x > 2) {
-		var result = rayMarchPass(drawing, nearest_sampler, origStart, dir, origLen, deltaDir, deltaDirFast, origRan, earlyTermination, ovClipLo, ovClipHi, ovClipMode, 0.0, mip);
+		var result = rayMarchPass(drawing, nearest_sampler, origStart, dir, origLen, deltaDir, deltaDirFast, origRan, earlyTermination, ovClipLo, ovClipHi, ovClipMode, 0.0, 1.0, mip);
 		// Matcap lighting at FIRST HIT only (unlike the overlay, which shades
 		// every sample): a drawing is a label mask read as an opaque surface,
 		// so one shade for the whole ray is both correct and far cheaper.

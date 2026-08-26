@@ -2,18 +2,33 @@ import { mat4, vec3 } from 'gl-matrix'
 import { log } from '@/logger'
 import { SLICE_TYPE } from '@/NVConstants'
 import type NiiVue from '@/NVControlBase'
-import type { NVImage, VolumeChunkSource } from '@/NVTypes'
+import type { NVImage, TypedVoxelArray, VolumeChunkSource } from '@/NVTypes'
+import type {
+  BudgetPlan,
+  BudgetPlanContext,
+  BudgetPlanOptions,
+  BudgetPlanSpec,
+  PlanShapeOptions,
+  ResolvedOptions,
+} from './budgetPlans'
+import { resolveBudgetPlan } from './budgetPlans'
 import type { ChunkedVolumeSource } from './ChunkedVolumeSource'
 import {
   type ChunkPlan,
+  CUBIC_MIN_HALO,
   chunkVolumeMultiLOD,
   type Vec3f,
   type Vec3i,
 } from './chunking'
 import { createStreamingNVImage } from './streamingVolume'
+import { getBitsPerVoxel, getTypedArrayConstructor } from './utils'
 
-/** Options for {@link NiiVue.loadChunkedVolume}. */
-export interface ChunkedVolumeOptions {
+/**
+ * Options for {@link NiiVue.loadChunkedVolume}. The plan-shaping half lives in
+ * {@link BudgetPlanOptions} (`budgetPlan` plus the individual knobs it layers
+ * under); everything here is display state for the streamed volume itself.
+ */
+export interface ChunkedVolumeOptions extends BudgetPlanOptions {
   /** Display window minimum (default 0). */
   calMin?: number
   /** Display window maximum (default 1). */
@@ -27,59 +42,21 @@ export interface ChunkedVolumeOptions {
   /** Display name / id for the volume (default 'chunked volume'). */
   name?: string
   id?: string
-  /**
-   * Focus that drives the octree. `'crosshair'` (default) makes the finest
-   * bricks follow the crosshair (auto-subscribes `locationChange`); a `[x,y,z]`
-   * fraction pins a static focus.
-   */
-  focus?: 'crosshair' | Vec3f
-  /**
-   * Finest-LOD radius in common-grid voxels. `'auto'` (default) derives it from
-   * the view: tight in the 3D render view, the visible-slice box in multiplanar
-   * (shrinking with 2D zoom). A number pins it.
-   */
-  radius?: 'auto' | number
-  /** GPU byte budget for the planned brick set (default 1.5 GB). */
-  budgetBytes?: number
-  /** Max bricks in the plan (default 240; must stay < the renderer's per-tile cap). */
-  maxBricks?: number
-  /** Brick texture edge in level voxels (default 128). */
-  cellEdge?: number
-  /** Per-axis halo in level voxels (default [1,1,1]). */
-  halo?: Vec3i
-  /** LOD falloff factor (default 1 = 2:1-balanced octree). */
-  detail?: number
-  /** Finest level index (max-detail cap; 0 = finest, default 0). */
-  minLevel?: number
-  /**
-   * Max brick texture edge the renderer will upload. Defaults to the host's
-   * configured `maxTextureDimension3D` option (256 when the host does not set
-   * one), so planned bricks never exceed the renderer's tile limit.
-   */
-  deviceLimit?: number
   /** Max concurrent source fetches (default 6; bounds the request flood). */
   maxConcurrentLoads?: number
   /** Retry attempts for a transient fetch failure (default 3, exp backoff). */
   retryAttempts?: number
-  /** Center the 3D render on the crosshair: 'pivot' (orbit about it) or 'none' (default). */
-  renderCentering?: 'pivot' | 'none'
-  /** Debounce for focus-follow rebuilds, ms (default 150). */
-  debounceMs?: number
 }
 
-interface ResolvedOptions {
-  budgetBytes: number
-  maxBricks: number
-  cellEdge: number
-  halo: Vec3i
-  detail: number
-  minLevel: number
-  deviceLimit: number
-  renderCentering: 'pivot' | 'none'
-  debounceMs: number
-}
-
-const DEFAULT_BUDGET_BYTES = 1_500_000_000
+/**
+ * Size guards for the auto-built coarse floor. It is oriented into ONE RGBA
+ * texture, so 256^3 voxels costs ~67 MB — negligible beside the default brick
+ * budget — while the edge cap keeps it inside the 3D texture dimension every
+ * WebGL2/WebGPU device in practice provides. A pyramid whose COARSEST level is
+ * bigger than this gets no floor rather than a multi-second stall on load.
+ */
+const COARSE_FLOOR_MAX_VOXELS = 256 ** 3
+const COARSE_FLOOR_MAX_EDGE = 512
 
 // --- pure helpers (unit-tested; no controller needed) -----------------------
 
@@ -124,17 +101,22 @@ export function mmToVolumeFraction(frac2mm: mat4, mm: Vec3f): Vec3f | null {
   return [clamp01(out[0]), clamp01(out[1]), clamp01(out[2])]
 }
 
-/** Build a crosshair-focused multi-LOD plan for a source at a focus + radius. */
+/**
+ * Build a crosshair-focused multi-LOD plan for a source at a focus + radius.
+ * Takes only the plan-shaping options: the coarse floor is a display backdrop,
+ * not an input to the octree.
+ */
 export function planForFocus(
   source: ChunkedVolumeSource,
   focusFrac: Vec3f,
   radius: number,
-  o: ResolvedOptions,
+  o: PlanShapeOptions,
 ): ChunkPlan {
   const levelDims = source.levels.map((l) => l.shape)
   const center = focusCenterBiased(levelDims[0], focusFrac, o.cellEdge)
   return chunkVolumeMultiLOD(levelDims, { center, radius }, o.deviceLimit, {
     cellEdge: o.cellEdge,
+    gridDims: o.gridDims,
     haloSize: o.halo,
     detail: o.detail,
     minLevel: o.minLevel,
@@ -157,6 +139,9 @@ async function withRetry<T>(
       return await fn()
     } catch (err) {
       lastErr = err
+      // An abort is the caller saying it no longer wants the bytes. Retrying
+      // it would re-issue a read nobody is waiting for.
+      if (err instanceof Error && err.name === 'AbortError') throw err
       // A refused/dropped connection under load ("Failed to fetch" / TypeError)
       // is transient; a real error (bad range, decode, 404-as-throw) is not.
       const transient =
@@ -167,6 +152,25 @@ async function withRetry<T>(
     }
   }
   throw lastErr
+}
+
+/**
+ * Coerce a caller-supplied count option to a finite positive integer.
+ *
+ * Both consumers are safety limits, so every unusable input has to land on a
+ * value that still makes progress and still bounds the work:
+ *  - 0, negative, NaN, fractional: a 0 concurrency cap would deadlock
+ *    acquire() — no slot ever frees, so no fetch ever starts — and 0 attempts
+ *    would fetch nothing at all.
+ *  - Infinity: it survives both Math.floor and Math.max, and would defeat the
+ *    very limit it is asked to impose — an unbounded concurrency cap floods
+ *    the connection pool, and unbounded attempts retry a transient failure
+ *    forever on a backoff that overflows to Infinity (a delay that never
+ *    resolves, hanging that read for good).
+ */
+function positiveIntOption(value: number): number {
+  if (!Number.isFinite(value)) return 1
+  return Math.max(1, Math.floor(value) || 1)
 }
 
 /**
@@ -181,14 +185,14 @@ export function createSourceChunkLoader(
   source: ChunkedVolumeSource,
   opts: { maxConcurrentLoads: number; retryAttempts: number },
 ): VolumeChunkSource {
-  // Clamp at the point the options are consumed. A 0 (or NaN/negative)
-  // concurrency cap would deadlock acquire() — no slot ever frees, so no fetch
-  // ever starts; it must be a positive integer. `totalAttempts` is the number of
-  // fetch tries withRetry makes, so a passed retryAttempts of 0 ('no retries')
-  // must still fetch once — clamp to >= 1.
-  const maxConcurrent = Math.max(1, Math.floor(opts.maxConcurrentLoads) || 1)
-  const totalAttempts = Math.max(1, Math.floor(opts.retryAttempts) || 1)
-  const inflight = new Map<string, Promise<Uint8Array>>()
+  // Clamp at the point the options are consumed; see positiveIntOption.
+  const maxConcurrent = positiveIntOption(opts.maxConcurrentLoads)
+  const totalAttempts = positiveIntOption(opts.retryAttempts)
+  // One entry per in-flight REGION, which several chunk requests may share (a
+  // plan swap changes the chunk index but not the region). `waiters` counts
+  // the callers still interested: the underlying read is aborted only when the
+  // last of them gives up, so one cancelled chunk cannot cancel its twin.
+  const inflight = new Map<string, InflightRead>()
   let active = 0
   const waiters: Array<() => void> = []
   const acquire = (): Promise<void> => {
@@ -211,12 +215,18 @@ export function createSourceChunkLoader(
     const levelIndex = request.desc.sourceLevel ?? 0
     const texOrigin = request.desc.texOrigin
     const texDims = request.desc.texDims
+    const signal = request.signal
     // Content key (level + region), stable across plan swaps where the chunk
     // INDEX changes but the fetched region does not.
     const key = `${levelIndex}|${texOrigin.join(',')}|${texDims.join(',')}`
     const cached = inflight.get(key)
-    if (cached) return cached
-    const next = acquire()
+    if (cached) {
+      cached.waiters++
+      joinRead(cached, signal)
+      return cached.promise
+    }
+    const controller = new AbortController()
+    const promise = acquire()
       .then(() =>
         withRetry(
           () =>
@@ -225,23 +235,51 @@ export function createSourceChunkLoader(
               texOrigin,
               texDims,
               bytesPerVoxel: request.bytesPerVoxel,
+              signal: controller.signal,
             }),
           totalAttempts,
         ),
       )
       .finally(() => release())
-    inflight.set(key, next)
+    const entry: InflightRead = { promise, controller, waiters: 1 }
+    inflight.set(key, entry)
+    joinRead(entry, signal)
     // Drop the in-flight entry on settle. Attach cleanup as BOTH handlers of a
-    // .then so the derived promise resolves even when `next` rejects (a brick
-    // that exhausts retries) — a bare `.finally` here would re-raise into an
-    // unobserved promise. Callers still receive the original `next` (and its
-    // rejection); this derived promise is intentionally not returned.
+    // .then so the derived promise resolves even when `promise` rejects (a
+    // brick that exhausts retries) — a bare `.finally` here would re-raise into
+    // an unobserved promise. Callers still receive the original promise (and
+    // its rejection); this derived promise is intentionally not returned.
     const cleanup = (): void => {
-      if (inflight.get(key) === next) inflight.delete(key)
+      if (inflight.get(key) === entry) inflight.delete(key)
     }
-    next.then(cleanup, cleanup)
-    return next
+    promise.then(cleanup, cleanup)
+    return promise
   }
+}
+
+/** One in-flight region read, shared by every caller that asked for it. */
+interface InflightRead {
+  promise: Promise<Uint8Array>
+  controller: AbortController
+  waiters: number
+}
+
+/**
+ * Register one caller's interest in an in-flight read, and abort the read once
+ * every caller has withdrawn. A caller with no signal never withdraws, so a
+ * renderer that supplies none behaves exactly as it did before.
+ */
+function joinRead(entry: InflightRead, signal: AbortSignal | undefined): void {
+  if (!signal) return
+  const withdraw = (): void => {
+    entry.waiters--
+    if (entry.waiters <= 0) entry.controller.abort(signal.reason)
+  }
+  if (signal.aborted) {
+    withdraw()
+    return
+  }
+  signal.addEventListener('abort', withdraw, { once: true })
 }
 
 // --- the manager ------------------------------------------------------------
@@ -260,8 +298,10 @@ export class NVChunkedVolume {
   private readonly host: NiiVue
   private readonly source: ChunkedVolumeSource
   private readonly o: ResolvedOptions
-  private readonly followCrosshair: boolean
-  private readonly radiusOpt: 'auto' | number
+  /** The options this volume was loaded with; re-folded by {@link setBudgetPlan}. */
+  private readonly loadOptions: ChunkedVolumeOptions
+  private followCrosshair: boolean
+  private subscribedToCrosshair = false
   private readonly onLocationChange: () => void
   private readonly onViewDestroyed: () => void
 
@@ -270,6 +310,11 @@ export class NVChunkedVolume {
   private disposed = false
   private refocusHandle: ReturnType<typeof setTimeout> | null = null
   private swapChain: Promise<void> = Promise.resolve()
+  // Built once, on the first applyCoarseFloor; null once `floorBuilt` is set
+  // means "tried and cannot" (too large, or an unsupported datatype), so a
+  // repeat call does not re-fetch the coarse level.
+  private floorVolume: NVImage | null = null
+  private floorBuilt = false
 
   constructor(
     host: NiiVue,
@@ -281,23 +326,17 @@ export class NVChunkedVolume {
     }
     this.host = host
     this.source = source
-    this.o = {
-      budgetBytes: options.budgetBytes ?? DEFAULT_BUDGET_BYTES,
-      maxBricks: options.maxBricks ?? 240,
-      cellEdge: options.cellEdge ?? 128,
-      halo: options.halo ?? [1, 1, 1],
-      detail: options.detail ?? 1,
-      minLevel: clampLevel(options.minLevel ?? 0, source),
-      deviceLimit: options.deviceLimit ?? hostDeviceLimit(host) ?? 256,
-      renderCentering: options.renderCentering ?? 'none',
-      debounceMs: options.debounceMs ?? 150,
-    }
-    this.radiusOpt = options.radius ?? 'auto'
-    const focus = options.focus ?? 'crosshair'
-    this.followCrosshair = focus === 'crosshair'
-    this.focusFrac = Array.isArray(focus)
-      ? [focus[0], focus[1], focus[2]]
+    this.loadOptions = options
+    // The plan-shaping options are folded by resolveBudgetPlan, so a preset, an
+    // explicit plan, and the individual knobs all land in one place with one
+    // precedence rule (knobs win). Passing no plan reproduces the pre-plan
+    // defaults exactly.
+    this.o = resolveBudgetPlan(options, this.planContext())
+    this.followCrosshair = this.o.focus === 'crosshair'
+    this.focusFrac = Array.isArray(this.o.focus)
+      ? [this.o.focus[0], this.o.focus[1], this.o.focus[2]]
       : [0.5, 0.5, 0.5]
+    host._registerChunkedVolume(this)
     this.onLocationChange = () => this.handleLocationChange()
     // Only self-dispose on a REAL controller teardown. `viewDestroyed` also fires
     // on a transient view recreation (backend switch / init fallback), where the
@@ -331,6 +370,7 @@ export class NVChunkedVolume {
     }
     this.volumeId = volumeId
     this.volume.chunkPlan = this.plan
+    this.volume.pickSampler = this.buildPickSampler()
     this.volume.chunkSource = createSourceChunkLoader(source, {
       maxConcurrentLoads: options.maxConcurrentLoads ?? 6,
       retryAttempts: options.retryAttempts ?? 3,
@@ -344,14 +384,95 @@ export class NVChunkedVolume {
    */
   async init(): Promise<void> {
     await this.host.addVolume(this.volume)
-    if (this.followCrosshair) {
-      this.host.addEventListener('locationChange', this.onLocationChange)
-    }
+    this.syncCrosshairSubscription()
     // Self-dispose if the controller is destroyed without the caller disposing
     // this handle, so the locationChange listener + host reference don't leak
     // (and can't fire against a torn-down view).
     this.host.addEventListener('viewDestroyed', this.onViewDestroyed)
     this.applyRenderCentering()
+    await this.applyCoarseFloor()
+  }
+
+  /**
+   * Install this volume's coarse floor as the host's base floor (fetching and
+   * building it on first call, then reusing it), and return whether a floor is
+   * now installed. Called by {@link init}; call it again after an ADDITIVE
+   * reload has removed the outgoing volume, since the floor belongs to whichever
+   * streamed volume is the base and `init` runs while the old one still is.
+   *
+   * When the `coarseFloor` option is on but no floor can be built, the host's
+   * floor is CLEARED rather than left alone: a floor from a previously loaded
+   * volume would otherwise keep drawing behind this one's bricks, on the wrong
+   * grid. No-op when the option is off, so an app supplying its own floor via
+   * {@link NiiVue.setBaseCoarseFloor} keeps it.
+   */
+  async applyCoarseFloor(): Promise<boolean> {
+    if (!this.o.coarseFloor || this.disposed) return false
+    if (!this.floorBuilt) {
+      this.floorVolume = await this.buildCoarseFloor()
+      this.floorBuilt = true
+    }
+    if (this.disposed) return false
+    await this.host.setBaseCoarseFloor(this.floorVolume)
+    return this.floorVolume !== null
+  }
+
+  /**
+   * Give the depth picker something to sample. A chunked volume has no single
+   * whole-volume texture, so the GPU depth pass cannot see it and the views fall
+   * back to CPU ray math; without a sampler that math can only land on the
+   * bounding box (or the clip surface), which puts the crosshair in mid-air in
+   * front of the tissue and makes a cavity opened by the clip plane unpickable.
+   * The coarse floor is a whole-volume image already in memory, so it is exactly
+   * the right lookup: low resolution, but enough to find the first voxel above
+   * the display window along the ray.
+   *
+   * Installed in the constructor, BEFORE `init` adds the volume — the host takes
+   * a shallow copy on add, so a sampler attached later would never reach the
+   * mounted volume. The floor is therefore resolved lazily (it is fetched after
+   * the add, and may never arrive): until then, and when no floor can be built at
+   * all, this returns 0 everywhere and the views fall back to the box entry.
+   */
+  private buildPickSampler(): (x: number, y: number, z: number) => number {
+    const vol = this.volume
+    let cachedFloor: NVImage | null = null
+    let img: TypedVoxelArray | null = null
+    let dims: Vec3i = [0, 0, 0]
+    let slope = 1
+    let inter = 0
+    return (x: number, y: number, z: number): number => {
+      const floor = this.floorVolume
+      if (!floor?.img) return 0
+      if (floor !== cachedFloor) {
+        cachedFloor = floor
+        img = floor.img
+        dims = [floor.hdr.dims[1], floor.hdr.dims[2], floor.hdr.dims[3]]
+        slope = floor.hdr.scl_slope || 1
+        inter = floor.hdr.scl_inter || 0
+      }
+      const min = vol.extentsMin
+      const max = vol.extentsMax
+      if (!img || !min || !max) return 0
+      // The floor is drawn stretched over the streamed volume's box (both
+      // renderers sample it with the volume's own texture coordinates), so
+      // normalize mm the same way rather than by the coarse level's own extents.
+      // The streaming affine is diag(spacing) in RAS, so the stored voxel order
+      // is already RAS: index straight into the fetched coarse level.
+      const mm = [x, y, z]
+      let idx = 0
+      let stride = 1
+      for (let i = 0; i < 3; i++) {
+        if (dims[i] < 1) return 0
+        const f = (mm[i] - min[i]) / (max[i] - min[i] || 1)
+        if (!(f >= 0 && f <= 1)) return 0
+        idx += Math.min(dims[i] - 1, Math.floor(f * dims[i])) * stride
+        stride *= dims[i]
+      }
+      const value = img[idx] * slope + inter
+      // Read the window live: the app may re-window the volume after load.
+      const calMin = vol.calMin ?? 0
+      return value > calMin ? value - calMin : 0
+    }
   }
 
   /** The volume's stable id (used to target plan swaps). */
@@ -387,6 +508,83 @@ export class NVChunkedVolume {
     this.refocus()
   }
 
+  /** The budget plan currently in force, as resolved values. */
+  get budgetPlan(): BudgetPlan {
+    return {
+      focus: Array.isArray(this.o.focus)
+        ? [this.o.focus[0], this.o.focus[1], this.o.focus[2]]
+        : this.o.focus,
+      radius: this.o.radius,
+      detail: this.o.detail,
+      budgetBytes: this.o.budgetBytes,
+      maxBricks: this.o.maxBricks,
+      targetFrameMs: this.o.targetFrameMs,
+      debounceMs: this.o.debounceMs,
+    }
+  }
+
+  /**
+   * Switch budget plan at runtime, and re-plan (debounced). The plan is folded
+   * back over the options this volume was LOADED with, so any knob the caller
+   * pinned then (a demo's VRAM ceiling, a pinned `radius`) still wins -- the
+   * same precedence `loadChunkedVolume` applied. Switching to or away from a
+   * crosshair focus subscribes/unsubscribes `locationChange` accordingly.
+   *
+   * `minLevel` is deliberately carried over from the CURRENT state rather than
+   * re-read from the load options, so a plan switch does not silently undo a
+   * {@link setMaxDetail} the app made in between.
+   */
+  setBudgetPlan(plan: BudgetPlanSpec): void {
+    if (this.disposed) return
+    const next = resolveBudgetPlan(
+      { ...this.loadOptions, budgetPlan: plan, minLevel: this.o.minLevel },
+      this.planContext(),
+    )
+    // The halo is raise-only (see raiseHaloTo): a plan switch must not undercut
+    // a wider reconstruction kernel that was already streamed for.
+    next.halo = raiseHalo(next.halo, Math.max(...this.o.halo))
+    Object.assign(this.o, next)
+    this.followCrosshair = this.o.focus === 'crosshair'
+    if (Array.isArray(this.o.focus)) {
+      this.focusFrac = [this.o.focus[0], this.o.focus[1], this.o.focus[2]]
+    } else if (!this.followCrosshair) {
+      this.focusFrac = [0.5, 0.5, 0.5]
+    }
+    this.syncCrosshairSubscription()
+    // Adopt the crosshair NOW rather than waiting for the next locationChange,
+    // so switching back to a crosshair plan does not plan around a stale focus.
+    if (this.followCrosshair) this.handleLocationChange()
+    this.refocus()
+  }
+
+  /** The halo the current plan is being built with. */
+  get halo(): Vec3i {
+    return [this.o.halo[0], this.o.halo[1], this.o.halo[2]]
+  }
+
+  /**
+   * Raise the per-axis brick halo to at least `minHalo` and re-plan (debounced),
+   * so the next stream carries enough neighbour data for a wider reconstruction
+   * kernel. Raise-only: it never shrinks an existing halo, so two callers with
+   * different requirements cannot undercut each other. A no-op (and no re-plan)
+   * when the halo already satisfies the request.
+   *
+   * Note that a larger halo makes each brick bigger, so the same GPU budget
+   * buys fewer/coarser bricks -- that is the cost of a seam-free cubic filter.
+   */
+  raiseHaloTo(minHalo: number): void {
+    const next = raiseHalo(this.o.halo, minHalo)
+    if (
+      next[0] === this.o.halo[0] &&
+      next[1] === this.o.halo[1] &&
+      next[2] === this.o.halo[2]
+    ) {
+      return
+    }
+    this.o.halo = next
+    this.refocus()
+  }
+
   /** Streaming residency counters (delegates to the controller). */
   stats(): ReturnType<NiiVue['chunkStreamStats']> {
     return this.host.chunkStreamStats()
@@ -406,14 +604,31 @@ export class NVChunkedVolume {
   dispose(): void {
     if (this.disposed) return
     this.disposed = true
+    this.host._unregisterChunkedVolume(this)
     if (this.refocusHandle) {
       clearTimeout(this.refocusHandle)
       this.refocusHandle = null
     }
-    if (this.followCrosshair) {
+    this.followCrosshair = false
+    this.syncCrosshairSubscription()
+    this.host.removeEventListener('viewDestroyed', this.onViewDestroyed)
+  }
+
+  /**
+   * Add or drop the `locationChange` listener so it is subscribed exactly when
+   * the focus follows the crosshair. Idempotent: `subscribedToCrosshair` tracks
+   * the real state, so repeated calls (init, a plan switch, dispose) can never
+   * double-subscribe or leak a listener.
+   */
+  private syncCrosshairSubscription(): void {
+    const want = this.followCrosshair && !this.disposed
+    if (want === this.subscribedToCrosshair) return
+    this.subscribedToCrosshair = want
+    if (want) {
+      this.host.addEventListener('locationChange', this.onLocationChange)
+    } else {
       this.host.removeEventListener('locationChange', this.onLocationChange)
     }
-    this.host.removeEventListener('viewDestroyed', this.onViewDestroyed)
   }
 
   private handleLocationChange(): void {
@@ -434,6 +649,20 @@ export class NVChunkedVolume {
     this.refocus()
   }
 
+  /**
+   * Host/source facts the budget plan cannot know on its own. The public halo
+   * default stays [1,1,1] (trilinear's requirement, and the cheapest brick);
+   * cubic reads two voxels past a face, so an already-cubic host gets the larger
+   * halo from the FIRST plan rather than a re-stream.
+   */
+  private planContext(): BudgetPlanContext {
+    return {
+      levelCount: this.source.levels.length,
+      minHalo: this.host.volumeIsCubicInterpolation ? CUBIC_MIN_HALO : 0,
+      deviceLimit: hostDeviceLimit(this.host) ?? 256,
+    }
+  }
+
   private buildPlan(): ChunkPlan {
     return planForFocus(
       this.source,
@@ -444,8 +673,15 @@ export class NVChunkedVolume {
   }
 
   private currentRadius(): number {
-    if (typeof this.radiusOpt === 'number') return this.radiusOpt
+    const radius = this.o.radius
+    if (typeof radius === 'number') return radius
     const common = this.source.levels[0].shape
+    // 'volume': a ball that swallows every brick, so nothing is outside the
+    // finest shell and the plan comes back uniform -- the budget/maxBricks pass
+    // then coarsens it as a whole to the finest level that fits.
+    if (radius === 'volume') {
+      return Math.hypot(common[0], common[1], common[2]) / 2
+    }
     // Render view: a finest CORE around the crosshair, roughly one cell in
     // radius. A too-tight radius leaves coarse (mean-downsampled, so thin
     // structure washes out) bricks right at the focus; a full-cell radius keeps
@@ -480,6 +716,63 @@ export class NVChunkedVolume {
     await applied
   }
 
+  /**
+   * Fetch the coarsest pyramid level whole and wrap it as an in-memory NVImage
+   * on the same mm box as the streamed volume, for the renderer to orient into
+   * the single floor texture. Unlike the streamed volume this one carries CPU
+   * voxels (`img`) and no `chunkSource`. Returns null (with a warning) when the
+   * level is too large to upload as one texture, when the datatype has no
+   * per-voxel intensity, or when the fetch fails — a missing floor degrades to
+   * today's behavior, so it must never fail the load.
+   */
+  private async buildCoarseFloor(): Promise<NVImage | null> {
+    const levelIndex = this.source.levels.length - 1
+    const coarse = this.source.levels[levelIndex]
+    const dims: Vec3i = [coarse.shape[0], coarse.shape[1], coarse.shape[2]]
+    const voxels = dims[0] * dims[1] * dims[2]
+    if (
+      voxels > COARSE_FLOOR_MAX_VOXELS ||
+      Math.max(dims[0], dims[1], dims[2]) > COARSE_FLOOR_MAX_EDGE
+    ) {
+      log.warn(
+        `NVChunkedVolume: no coarse floor, coarsest level ${dims.join('x')} exceeds the floor size cap`,
+      )
+      return null
+    }
+    const Ctor = getTypedArrayConstructor(this.source.datatypeCode)
+    if (!Ctor) {
+      log.warn(
+        `NVChunkedVolume: no coarse floor, unsupported datatype ${this.source.datatypeCode}`,
+      )
+      return null
+    }
+    try {
+      const bytesPerVoxel = getBitsPerVoxel(this.source.datatypeCode) / 8
+      const bytes = await this.source.fetchChunk({
+        levelIndex,
+        texOrigin: [0, 0, 0],
+        texDims: dims,
+        bytesPerVoxel,
+      })
+      const floor = createStreamingNVImage({
+        shape: dims,
+        spacing: coarse.spacing,
+        datatypeCode: this.source.datatypeCode,
+        calMin: this.volume.calMin ?? 0,
+        calMax: this.volume.calMax ?? 1,
+        colormap: this.volume.colormap,
+        isTransparentBelowCalMin: this.volume.isTransparentBelowCalMin,
+        name: `${this.volume.name} floor`,
+        id: `${this.volumeId}:floor`,
+      })
+      floor.img = toVoxelView(bytes, Ctor, bytesPerVoxel, voxels)
+      return floor
+    } catch (err) {
+      log.warn('NVChunkedVolume: coarse floor unavailable', err)
+      return null
+    }
+  }
+
   private applyRenderCentering(): void {
     if (this.o.renderCentering !== 'pivot') return
     const min = this.volume.extentsMin
@@ -491,6 +784,34 @@ export class NVChunkedVolume {
       min[2] + this.focusFrac[2] * (max[2] - min[2]),
     )
   }
+}
+
+/**
+ * Reinterpret the coarse level's raw bytes as the source's voxel type. The
+ * fetched `Uint8Array` may be a view into a larger buffer at a byte offset the
+ * wider element type cannot address, which a typed-array view would reject, so
+ * copy in that (rare) case rather than throw.
+ */
+function toVoxelView(
+  bytes: Uint8Array,
+  Ctor: NonNullable<ReturnType<typeof getTypedArrayConstructor>>,
+  bytesPerVoxel: number,
+  voxels: number,
+): TypedVoxelArray {
+  const aligned =
+    bytes.byteOffset % bytesPerVoxel === 0 ? bytes : new Uint8Array(bytes)
+  // `buffer` is typed ArrayBufferLike (it may be a SharedArrayBuffer); every
+  // typed-array constructor accepts either, so narrow for the signature.
+  return new Ctor(aligned.buffer as ArrayBuffer, aligned.byteOffset, voxels)
+}
+
+/** Per-axis max of `halo` and `minHalo`; never shrinks an axis. */
+function raiseHalo(halo: Vec3i, minHalo: number): Vec3i {
+  return [
+    Math.max(halo[0], minHalo),
+    Math.max(halo[1], minHalo),
+    Math.max(halo[2], minHalo),
+  ]
 }
 
 function clampLevel(levelIndex: number, source: ChunkedVolumeSource): number {

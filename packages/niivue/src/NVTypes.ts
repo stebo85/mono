@@ -29,6 +29,13 @@ export interface VolumeChunkSourceRequest {
   plan: ChunkPlan
   datatypeCode: number
   bytesPerVoxel: number
+  /**
+   * Fires when the renderer no longer wants this chunk -- the view moved on,
+   * or the volume was disposed. A source that reads over the network should
+   * pass it down so the read is abandoned on the wire rather than discarded on
+   * arrival. Optional: a source that ignores it stays correct, only wasteful.
+   */
+  signal?: AbortSignal
 }
 
 export type VolumeChunkSource = (
@@ -588,6 +595,15 @@ export type SceneConfig = {
   // (sliceType === RENDER). Each component is in NDC units, so renderPan = [0.5, 0.5]
   // shifts the volume half the viewport right and up. Ignored in 2D / mosaic.
   renderPan: vec2
+  /**
+   * Display gamma for the 3D volume render: each sample's classified RGB is
+   * raised to 1/gamma, so values above 1 brighten and below 1 darken (1 is a
+   * strict no-op). Alpha is deliberately untouched -- gamma is a brightness
+   * control, and raising alpha with it would change how much each sample
+   * occludes what is behind it, flattening the image instead of brightening it.
+   * It also narrows the gap between a coarse LOD brick and a fine one, since
+   * mean-downsampled data classifies darker. 2D slices are unaffected.
+   */
   gamma: number
   backgroundColor: [number, number, number, number]
   clipPlaneColor: number[]
@@ -651,6 +667,12 @@ export type UIConfig = {
   placeholderText: string
   crosshairColor: number[]
   crosshairGap: number
+  /**
+   * Crosshair thickness in canvas pixels, on 2D slice tiles, on the 3D render
+   * tile and on mosaic cross-lines alike. It is a screen weight, so it holds
+   * steady as you zoom and does not depend on the volume's field of view. 0
+   * hides the crosshair.
+   */
   crosshairWidth: number
   fontColor: number[]
   fontScale: number
@@ -688,6 +710,147 @@ export type VolumeRenderConfig = {
   transmittanceCutoff: number
   /** How the 3D ray-march combines samples. VOLUME_RENDER_MODE.COMPOSITE | MAXIMUM */
   renderMode: number
+  /**
+   * Samples per voxel along the ray in the 3D render. Oversampling converges the
+   * ray integral at a proportional fragment cost. Clamped to [1, 4]. NOTE: this
+   * does NOT remove concentric banding on smooth structures -- measured ring
+   * contrast is flat from 1 to 4 -- because that banding is in the integrand,
+   * not the sampling of it. See isCubicInterpolation for the reconstruction-side
+   * knob, which cures a different artifact (the trilinear texel staircase).
+   */
+  sampleRate: number
+  /**
+   * Reconstruct the volume with a tricubic B-spline instead of hardware
+   * trilinear in the 3D ray-march (2D slices are unaffected). Trilinear is only
+   * C0, so band edges show a blocky texel staircase; the cubic filter is C2 and
+   * removes it. Approximating, not interpolating, so it also smooths genuine
+   * fine detail slightly. Costs 8 texture fetches per sample instead of 1
+   * (roughly 1.9x fragment cost at sampleRate 2, or about break-even against
+   * trilinear if sampleRate is dropped to 1 alongside it).
+   *
+   * For a CHUNKED volume the filter reads 2 voxels either side of the sample, so
+   * the brick halo must be at least 2 or brick faces will seam. NVChunkedVolume
+   * defaults to a halo of 1; pass `halo: [2, 2, 2]` (or wider) when enabling this.
+   */
+  isCubicInterpolation: boolean
+  /**
+   * Coefficient for the per-level brightness compensation applied to bricks
+   * fetched from a coarse pyramid level of a multi-LOD chunked volume. 0
+   * disables it; clamped to [0, 1] (useful magnitudes are small -- the default
+   * is 0.08 per pyramid level and 0.2 is already strong).
+   *
+   * WHEN TO REACH FOR IT: coarse bricks look too DARK next to fine ones. If
+   * they look too TRANSPARENT instead, use `lodOpacityCompensation`. Both are
+   * exact no-ops on any volume that is not multi-LOD chunked -- call
+   * `nv.lodCompensation()` to see whether either is doing anything.
+   *
+   * A coarse brick renders DARKER than the fine data it stands in for:
+   * downsampling averages voxels, destroying the correlation between a sample's
+   * colour and its opacity, and front-to-back compositing weights colour by
+   * opacity. Measured on a real OME-Zarr pyramid the deficit reaches 16% by
+   * level 3, which reads as a visible brightness step at a LOD boundary. Each
+   * brick's classified RGB is therefore raised to
+   * `1 - coefficient * log2(k)`, where k is its linear downsample factor (see
+   * `lodGammaExponent`) -- one fixed step per pyramid level, since each level
+   * averages the same 2x2x2 neighbourhood. This multiplies with the display
+   * `scene.gamma` exponent and, like it, leaves alpha untouched, so it changes
+   * brightness without changing occlusion.
+   *
+   * The default is an empirical fit and no single value is exact for all data:
+   * sparse thin material loses more per level than dense structure does. It is
+   * safe to raise, because the per-level form stays gentle at depth rather than
+   * running away. Non-chunked and single-level volumes are unaffected (k is 1
+   * for every draw).
+   */
+  lodBrightnessCompensation: number
+
+  /**
+   * Per-level OPACITY compensation for coarse multi-LOD bricks, applied in the
+   * 3D ray-march. 0 disables it (the default); clamped to [0, 1], the same
+   * range as `lodBrightnessCompensation`.
+   *
+   * WHEN TO REACH FOR IT: coarse bricks look too TRANSPARENT next to fine ones.
+   * If they look too DARK instead, use `lodBrightnessCompensation` -- that is
+   * the one to try first. Both are exact no-ops on any volume that is not
+   * multi-LOD chunked -- call `nv.lodCompensation()` to see whether either is
+   * doing anything.
+   *
+   * The march already raises a coarse sample's alpha to the number of reference
+   * steps it stands for, which is exact only if the coarse voxel is
+   * homogeneous. Where it is not, the brick is systematically too see-through.
+   * This scales that exponent by `1 + coefficient * (k - 1)` (see
+   * `lodOpacityScale`).
+   *
+   * Off by default because it measures WORSE than `lodBrightnessCompensation`
+   * on dense structure: the alpha there is already right, and inflating it
+   * front-loads the march onto nearer, dimmer samples. Turn it up only when
+   * coarse bricks look too transparent rather than too dark. Ray-march only --
+   * a 2D slice tile shows one sample with no accumulation.
+   */
+  lodOpacityCompensation: number
+}
+
+/**
+ * One pyramid level's share of a `LodCompensationReport`. `level` indexes the
+ * multi-LOD pyramid (0 is finest); a level with `downsample` 1 is uncompensated
+ * by definition.
+ */
+export type LodCompensationLevel = {
+  /** Pyramid level index; 0 is the finest (full-resolution) level. */
+  level: number
+  /**
+   * Linear downsample factor versus the finest grid: the geometric mean of the
+   * three per-axis dimension ratios. 1 at the finest level, ~2 one level up.
+   */
+  downsample: number
+  /** Voxel dims of this level's full-volume grid. */
+  levelDims: [number, number, number]
+  /** Bricks in the current plan drawn from this level. */
+  brickCount: number
+  /**
+   * Exponent applied to this level's classified RGB. Below 1 brightens; exactly
+   * 1 means the brightness setting is doing nothing here.
+   */
+  brightnessExponent: number
+  /**
+   * Multiplier on this level's step-size opacity exponent. Above 1 makes it
+   * more opaque; exactly 1 means the opacity setting is doing nothing here.
+   */
+  opacityScale: number
+}
+
+/**
+ * What `NiiVue.lodCompensation()` reports: whether the two LOD compensation
+ * settings are affecting the current scene, and the exact numbers each pyramid
+ * level is sending to the shader. Both settings are silent no-ops on a volume
+ * that is not multi-LOD chunked, so `isActive` plus `inactiveReason` is the
+ * cheap way to tell "correctly configured but the data is uniform" from
+ * "configured against a volume that cannot use it".
+ */
+export type LodCompensationReport = {
+  /**
+   * True when at least one coarse level is present AND at least one of the two
+   * coefficients is non-zero, i.e. some brick is actually being compensated.
+   */
+  isActive: boolean
+  /**
+   * Why nothing is being compensated, in plain words, or null when `isActive`.
+   * e.g. 'no volume is loaded', 'volume 0 is not a chunked volume', 'the
+   * chunked volume has a single resolution level', 'both coefficients are 0'.
+   */
+  inactiveReason: string | null
+  /** Current `volumeLodBrightnessCompensation`. */
+  brightnessCompensation: number
+  /** Current `volumeLodOpacityCompensation`. */
+  opacityCompensation: number
+  /** One entry per pyramid level in the current plan, finest first. */
+  levels: LodCompensationLevel[]
+  /**
+   * The whole-volume coarse floor texture drawn behind the bricks, when one is
+   * installed. It is not a member of the chunk plan, so it is reported apart
+   * from `levels` (its `level` is -1 and `brickCount` is 1).
+   */
+  floor: LodCompensationLevel | null
 }
 
 /** Mesh rendering config: global settings for mesh display */
@@ -880,6 +1043,14 @@ export type NiiVueOptions = {
    * memory.
    */
   maxChunkResidencyBytes?: number
+  /**
+   * Duration, in milliseconds, of the cross-fade a freshly-streamed chunk of a
+   * chunked (tiled) volume dissolves in over its coarse floor, so a level-of-
+   * detail change softens rather than cuts. 0 disables the fade (chunks pop in
+   * at full strength). Only applies where a coarse floor is present; unset
+   * leaves the renderer default.
+   */
+  chunkFadeMs?: number
 
   // Scene
   azimuth?: number
@@ -888,6 +1059,7 @@ export type NiiVueOptions = {
   pan2Dxyzmm?: [number, number, number, number]
   scaleMultiplier?: number
   renderPan?: [number, number]
+  /** Display gamma for the 3D volume render, >1 brightens. See SceneConfig.gamma. */
   gamma?: number
   backgroundColor?: [number, number, number, number]
   clipPlaneColor?: number[]
@@ -923,6 +1095,12 @@ export type NiiVueOptions = {
   placeholderText?: string
   crosshairColor?: number[]
   crosshairGap?: number
+  /**
+   * Crosshair thickness in canvas pixels, on 2D slice tiles, on the 3D render
+   * tile and on mosaic cross-lines alike. It is a screen weight, so it holds
+   * steady as you zoom and does not depend on the volume's field of view. 0
+   * hides the crosshair.
+   */
   crosshairWidth?: number
   fontColor?: number[]
   fontScale?: number
@@ -953,6 +1131,14 @@ export type NiiVueOptions = {
   volumeTransmittanceCutoff?: number
   /** VOLUME_RENDER_MODE.COMPOSITE (default) | MAXIMUM */
   volumeRenderMode?: number
+  /** Samples per voxel along the ray in the 3D render, [1, 4]. See VolumeRenderConfig.sampleRate. */
+  volumeSampleRate?: number
+  /** Tricubic B-spline reconstruction in the 3D ray-march. See VolumeRenderConfig.isCubicInterpolation. */
+  volumeIsCubicInterpolation?: boolean
+  /** Per-level brightness compensation for coarse multi-LOD bricks, [0, 0.2]; 0 disables. See VolumeRenderConfig.lodBrightnessCompensation. */
+  volumeLodBrightnessCompensation?: number
+  /** Per-level opacity compensation for coarse multi-LOD bricks in the 3D ray-march, [0, 1]; 0 disables (default). See VolumeRenderConfig.lodOpacityCompensation. */
+  volumeLodOpacityCompensation?: number
 
   // Mesh (prefixed)
   meshXRay?: number

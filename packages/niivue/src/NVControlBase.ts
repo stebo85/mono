@@ -6,8 +6,17 @@ import { AnnotationUndoStack } from '@/annotation/undoRedo'
 import { ubuntu } from '@/assets/fonts'
 import { cortex } from '@/assets/matcaps'
 import * as NVCmaps from '@/cmap/NVCmaps'
-import { clearCanvasMessage } from '@/control/canvasMessage'
-import { removeInteractionListeners } from '@/control/interactions'
+import {
+  clearCanvasMessage,
+  GRAPHICS_LOST_MESSAGE,
+  GRAPHICS_RECOVERING_MESSAGE,
+  showCanvasMessage,
+} from '@/control/canvasMessage'
+import {
+  type ExplodedBlockPick,
+  pickExplodedBlock,
+  removeInteractionListeners,
+} from '@/control/interactions'
 import { buildLocationMessage } from '@/control/locationTracking'
 import {
   computeBoundsPixelRect,
@@ -39,9 +48,15 @@ import * as NVMesh from '@/mesh/NVMesh'
 import type { WriteOptions } from '@/mesh/writers'
 import {
   DRAG_MODE,
+  GAMMA_RANGE,
+  LOD_BRIGHTNESS_RANGE,
+  LOD_OPACITY_RANGE,
+  lodGammaExponent,
+  lodOpacityScale,
   NUM_CLIP_PLANE,
   SLICE_TYPE,
   sliceTypeDim,
+  VOLUME_DEFAULTS,
 } from '@/NVConstants'
 import * as NVDocument from '@/NVDocument'
 import type {
@@ -64,6 +79,8 @@ import type {
   CustomLayoutTile,
   FocusBox,
   ImageFromUrlOptions,
+  LodCompensationLevel,
+  LodCompensationReport,
   LUT,
   MeasurementScreenLine,
   MeshFromUrlOptions,
@@ -124,7 +141,17 @@ import { validateCustomLayout } from '@/view/NVSliceLayout'
 import type { ExplodedBlockFace } from '@/volume/ChunkExplode'
 import type { ChunkedVolumeSource } from '@/volume/ChunkedVolumeSource'
 import { chunksOverlappingVoxelBox } from '@/volume/ChunkVisibility'
-import type { ChunkPlan } from '@/volume/chunking'
+import {
+  type ChunkPlan,
+  CUBIC_MIN_HALO,
+  dimsDownsample,
+} from '@/volume/chunking'
+import {
+  type ChunkTimingSnapshot,
+  chunkTimingSnapshot,
+  resetChunkTiming as clearChunkTiming,
+} from '@/volume/chunkTiming'
+import type { DecodedChunkStats } from '@/volume/decodedChunkCache'
 import {
   computeDescriptiveStats,
   type DescriptiveStats,
@@ -184,9 +211,19 @@ type ViewBackend = {
     pending: number
     inFlight: number
     total: number
+    staleDropped: number
+    predicted: number
+    decoded: DecodedChunkStats
   }
   rebakeChunkedOverlays: () => void
+  /**
+   * Voxel dims of the whole-volume coarse floor texture, or null when none is
+   * installed. Renderer-owned state (the floor is not a member of
+   * `plan.chunks`), surfaced so `lodCompensation()` can report it.
+   */
+  coarseFloorDims: () => [number, number, number] | null
   overlayDraw: ((frame: UIKitOverlayFrame) => void) | null
+  onContextLost: (() => void) | null
 }
 
 export type { NiiVueOptions }
@@ -218,8 +255,16 @@ type InfrastructureOpts = {
   boundsBorderThickness?: number
   maxTextureDimension3D?: number
   maxChunkResidencyBytes?: number
+  chunkFadeMs?: number
 }
 const DEFAULT_MATCAPS: Record<string, string> = { cortex }
+
+/**
+ * How many times a lost GPU context is automatically rebuilt before giving up.
+ * A scene that genuinely does not fit in VRAM loses the context again as soon as
+ * it re-streams, so an uncapped retry would loop forever.
+ */
+const MAX_CONTEXT_LOSS_RECOVERIES = 2
 
 type EventHandler = ((e: Event) => void) | ((e: Event) => Promise<void>)
 
@@ -334,6 +379,21 @@ export default class NiiVue extends EventTarget {
   /** Set once `destroy()` runs, so an in-flight async op (e.g. a deferred reload)
    *  can detect a torn-down controller and not mutate/upload against it. */
   private _destroyed = false
+  private _contextLossRecoveries = 0
+  /** Live streamed-volume handles, so a setting that changes the required brick
+   *  halo (currently only `volumeIsCubicInterpolation`) can re-plan them. Each
+   *  handle adds itself on construction and removes itself on `dispose()`. */
+  private _chunkedVolumes = new Set<NVChunkedVolume>()
+
+  /** @internal Registration hook for {@link NVChunkedVolume}. */
+  _registerChunkedVolume(chunked: NVChunkedVolume): void {
+    this._chunkedVolumes.add(chunked)
+  }
+
+  /** @internal Deregistration hook for {@link NVChunkedVolume}. */
+  _unregisterChunkedVolume(chunked: NVChunkedVolume): void {
+    this._chunkedVolumes.delete(chunked)
+  }
 
   /**
    * True once {@link destroy} has run. Lets external holders (e.g. an
@@ -474,6 +534,7 @@ export default class NiiVue extends EventTarget {
       boundsBorderThickness: options.boundsBorderThickness ?? 2,
       maxTextureDimension3D: options.maxTextureDimension3D,
       maxChunkResidencyBytes: options.maxChunkResidencyBytes,
+      chunkFadeMs: options.chunkFadeMs,
     }
     // Public properties (controller-level). isDragging defaults false via its
     // backing field; setting it here would run its model-mirroring setter before
@@ -616,6 +677,23 @@ export default class NiiVue extends EventTarget {
   }
 
   /**
+   * Resolve a pointer position over the 3D render onto one exploded brick of a
+   * chunked volume, or null when the point misses every visible brick.
+   *
+   * Pass `event.clientX` / `event.clientY` from a click handler: the hit test
+   * runs here, so no drag needs to be in progress. Pair with
+   * `extractChunkBlock(vol, pick.chunkIndex)` to copy the picked brick out as a
+   * standalone volume, and with `focusBox` (using `explodedMin`/`explodedMax`) to
+   * outline it in place.
+   */
+  pickExplodedBlock(
+    clientX: number,
+    clientY: number,
+  ): ExplodedBlockPick | null {
+    return pickExplodedBlock(this, clientX, clientY)
+  }
+
+  /**
    * Transient world-space box outlined as 12 edges on the 3D render view (e.g. a
    * focused subvolume). `min`/`max` are in the scene's world-mm space. Set null
    * to clear. Not serialized.
@@ -715,12 +793,20 @@ export default class NiiVue extends EventTarget {
     return true
   }
 
+  /**
+   * Display gamma for the 3D volume render. Applied to each sample's classified
+   * RGB, never to its alpha, so brightening the image does not change how much
+   * a ray occludes. Values above 1 brighten, below 1 darken; 1 (the default) is
+   * a strict no-op. Clamped to GAMMA_RANGE.
+   */
   get gamma(): number {
     return this.model.scene.gamma
   }
   set gamma(v: number) {
-    this.model.scene.gamma = v
-    this.emit('change', { property: 'gamma', value: v })
+    this.model.scene.gamma = Number.isFinite(v)
+      ? Math.min(Math.max(v, GAMMA_RANGE[0]), GAMMA_RANGE[1])
+      : 1
+    this.emit('change', { property: 'gamma', value: this.model.scene.gamma })
     this.drawScene()
   }
 
@@ -1260,6 +1346,145 @@ export default class NiiVue extends EventTarget {
   set volumeRenderMode(v: number) {
     this.model.volume.renderMode = v
     this.emit('change', { property: 'volumeRenderMode', value: v })
+    this.drawScene()
+  }
+
+  /**
+   * Samples per voxel along the ray in the 3D render. Higher values converge the
+   * ray integral at a proportional fragment cost. Clamped to [1, 4]. This does
+   * NOT remove concentric banding on smooth structures; for the reconstruction
+   * filter see volumeIsCubicInterpolation.
+   */
+  get volumeSampleRate(): number {
+    return this.model.volume.sampleRate
+  }
+  set volumeSampleRate(v: number) {
+    this.model.volume.sampleRate = Math.min(4, Math.max(1, v))
+    this.emit('change', {
+      property: 'volumeSampleRate',
+      value: this.model.volume.sampleRate,
+    })
+    this.drawScene()
+  }
+
+  /**
+   * Reconstruct the volume with a tricubic B-spline instead of hardware
+   * trilinear in the 3D ray-march, removing the blocky texel staircase that C0
+   * trilinear leaves on band edges. 2D slices are unaffected. Costs 8 fetches
+   * per sample instead of 1. Chunked volumes need a brick halo of at least 2.
+   * See VolumeRenderConfig.isCubicInterpolation.
+   */
+  get volumeIsCubicInterpolation(): boolean {
+    return this.model.volume.isCubicInterpolation
+  }
+  set volumeIsCubicInterpolation(v: boolean) {
+    this.model.volume.isCubicInterpolation = v
+    // The cubic kernel reads two voxels past a brick face, so a streamed volume
+    // planned with the default trilinear halo would reconstruct from
+    // clamp-to-edge data and seam. Re-plan every live streamed volume with the
+    // larger halo; the renderer independently refuses cubic on any plan that
+    // still cannot feed the kernel (a hand-built chunkPlan, say), and warns.
+    if (v) {
+      for (const chunked of this._chunkedVolumes) {
+        chunked.raiseHaloTo(CUBIC_MIN_HALO)
+      }
+    }
+    this.emit('change', {
+      property: 'volumeIsCubicInterpolation',
+      value: v,
+    })
+    this.drawScene()
+  }
+
+  /**
+   * Both LOD compensation settings are exact no-ops unless a multi-LOD chunked
+   * volume is loaded, and nothing on screen says so. Surface that at the moment
+   * the setting is made rather than leaving the caller to wonder. Silent when
+   * no volume is loaded at all: setting these before `loadVolumes` is normal.
+   */
+  private _warnIfLodCompensationInert(property: string, value: number): void {
+    if (value <= 0 || !this.model.volumes.length) return
+    const multiLod = this.model.volumes.some(
+      (v) => (v.chunkPlan?.levelDims?.length ?? 0) > 1,
+    )
+    if (multiLod) return
+    log.warn(
+      `${property} = ${value} has no effect: no loaded volume is a multi-LOD chunked volume. It only changes bricks fetched from a coarse pyramid level. Call lodCompensation() to see what applies.`,
+    )
+  }
+
+  /**
+   * COARSE BRICKS LOOK TOO DARK next to fine ones -> raise this. (Too
+   * TRANSPARENT rather than too dark -> `volumeLodOpacityCompensation`.)
+   *
+   * Coefficient for the per-level brightness compensation applied to coarse
+   * multi-LOD bricks; 0 disables it, clamped to [0, 1]. Useful magnitudes are
+   * small: the default is 0.08 per pyramid level and 0.2 is already strong.
+   *
+   * A coarse brick integrates darker than the fine data it stands in for
+   * (averaging voxels destroys the colour/opacity correlation that front-to-back
+   * compositing weights by), which reads as a brightness step at a LOD boundary.
+   * The correction is one fixed step per pyramid level (`1 - coefficient *
+   * log2(k)`). Empirical: sparse material loses more per level than dense.
+   *
+   * No-op on any volume that is not a multi-LOD chunked volume. Call
+   * `lodCompensation()` to see whether it applies and what each level gets. See
+   * VolumeRenderConfig.lodBrightnessCompensation.
+   */
+  get volumeLodBrightnessCompensation(): number {
+    return this.model.volume.lodBrightnessCompensation
+  }
+  set volumeLodBrightnessCompensation(v: number) {
+    this.model.volume.lodBrightnessCompensation = Number.isFinite(v)
+      ? Math.min(Math.max(v, LOD_BRIGHTNESS_RANGE[0]), LOD_BRIGHTNESS_RANGE[1])
+      : VOLUME_DEFAULTS.lodBrightnessCompensation
+    this._warnIfLodCompensationInert(
+      'volumeLodBrightnessCompensation',
+      this.model.volume.lodBrightnessCompensation,
+    )
+    this.emit('change', {
+      property: 'volumeLodBrightnessCompensation',
+      value: this.model.volume.lodBrightnessCompensation,
+    })
+    this.drawScene()
+  }
+
+  /**
+   * COARSE BRICKS LOOK TOO TRANSPARENT next to fine ones -> raise this. (Too
+   * DARK rather than too transparent -> `volumeLodBrightnessCompensation`,
+   * which is the one to try first.)
+   *
+   * Coefficient for the per-level OPACITY compensation applied to coarse
+   * multi-LOD bricks in the 3D ray-march; 0 disables it (the default), clamped
+   * to [0, 1], the same range as `volumeLodBrightnessCompensation`. The march's
+   * step-size correction assumes a coarse voxel is homogeneous; where it is not,
+   * the brick renders too see-through. This scales that exponent by
+   * `1 + c * (k - 1)`.
+   *
+   * Measured off by default: it makes dense structure worse (the alpha there is
+   * already correct, and inflating it front-loads the march onto nearer, dimmer
+   * samples).
+   *
+   * No-op on any volume that is not a multi-LOD chunked volume, and on 2D slice
+   * tiles (one sample, no accumulation). Call `lodCompensation()` to see whether
+   * it applies and what each level gets. See
+   * VolumeRenderConfig.lodOpacityCompensation.
+   */
+  get volumeLodOpacityCompensation(): number {
+    return this.model.volume.lodOpacityCompensation
+  }
+  set volumeLodOpacityCompensation(v: number) {
+    this.model.volume.lodOpacityCompensation = Number.isFinite(v)
+      ? Math.min(Math.max(v, LOD_OPACITY_RANGE[0]), LOD_OPACITY_RANGE[1])
+      : VOLUME_DEFAULTS.lodOpacityCompensation
+    this._warnIfLodCompensationInert(
+      'volumeLodOpacityCompensation',
+      this.model.volume.lodOpacityCompensation,
+    )
+    this.emit('change', {
+      property: 'volumeLodOpacityCompensation',
+      value: this.model.volume.lodOpacityCompensation,
+    })
     this.drawScene()
   }
 
@@ -3574,18 +3799,158 @@ export default class NiiVue extends EventTarget {
 
   /**
    * Streaming stats across all chunked volumes (base + independent overlay) on
-   * the active backend: `{ resident, pending, inFlight, total }` brick counts.
-   * Returns null before a view is attached. Useful for HUD / debug overlays:
-   * `resident < total` with `pending > 0` for many frames indicates the working
-   * set exceeds the residency budget (thrashing).
+   * the active backend: `{ resident, pending, inFlight, total, staleDropped }`
+   * brick counts. Returns null before a view is attached. Useful for HUD / debug
+   * overlays: `resident < total` with `pending > 0` for many frames indicates the
+   * working set exceeds the residency budget (thrashing).
+   *
+   * `staleDropped` is cumulative, not per frame: queued uploads retired because
+   * the view moved on before they ran. It climbing during a pan or rotate is the
+   * queue working as intended, since that work would otherwise have uploaded
+   * bricks for viewports the user had already left.
+   *
+   * `predicted` is also cumulative: source reads started AHEAD of the working
+   * set, from the direction the view is travelling. Those never enter the
+   * upload queue, so they show up here and in the source's byte-cache hit rate
+   * rather than in `resident`.
+   *
+   * `decoded` is the decoded-chunk tier summed over every chunked volume: the
+   * CPU-side source bytes a brick is demoted to when the GPU evicts it. Its
+   * hits are source reads that skipped the network AND the decode entirely,
+   * costing only a texture upload; `bytes` / `maxBytes` is how full it is.
    */
   chunkStreamStats(): {
     resident: number
     pending: number
     inFlight: number
     total: number
+    staleDropped: number
+    predicted: number
+    decoded: DecodedChunkStats
   } | null {
     return this.view?.chunkStreamStats() ?? null
+  }
+
+  /**
+   * Where a streamed brick's time actually goes: bytes over the wire, the work
+   * of turning them into a texture, and how much of that blocked the render
+   * loop. Returns the process-wide totals since the last
+   * {@link resetChunkTiming} — the recorder is a module-level singleton, so
+   * this aggregates every chunked volume on every instance in the page, not
+   * just this one.
+   *
+   * `mainThreadMs` (assemble + upload + gradient) is the figure that decides
+   * whether a decode worker is worth building, and `netBusyMs` is network wall
+   * clock with overlapping reads counted once. Phase definitions and the
+   * accuracy of each number are in `src/volume/chunkTiming.ts`.
+   */
+  chunkTimingStats(): ChunkTimingSnapshot {
+    return chunkTimingSnapshot()
+  }
+
+  /** Clear {@link chunkTimingStats} to start a fresh measurement window. */
+  resetChunkTiming(): void {
+    clearChunkTiming()
+  }
+
+  /**
+   * What the two LOD compensation settings are actually doing right now.
+   *
+   * `volumeLodBrightnessCompensation` and `volumeLodOpacityCompensation` only
+   * affect bricks fetched from a COARSE level of a multi-LOD chunked volume, so
+   * on an ordinary volume they are exact no-ops with nothing on screen to say
+   * so. This is the way to check: `isActive` answers "is anything being
+   * compensated", `inactiveReason` says why not, and each level reports the
+   * exponent and scale being handed to the shader for its bricks.
+   *
+   * ```js
+   * const report = nv.lodCompensation()
+   * if (!report.isActive) console.log(report.inactiveReason)
+   * for (const each of report.levels) {
+   *   console.log(each.level, each.downsample, each.brickCount, each.brightnessExponent)
+   * }
+   * ```
+   *
+   * Reads the background volume (`volumes[0]`), which is the volume both
+   * settings act on. Cheap enough to call per frame for a debug HUD.
+   */
+  lodCompensation(): LodCompensationReport {
+    const brightness = this.model.volume.lodBrightnessCompensation
+    const opacity = this.model.volume.lodOpacityCompensation
+    const describe = (
+      level: number,
+      levelDims: [number, number, number],
+      brickCount: number,
+      volumeDims: readonly number[],
+    ): LodCompensationLevel => {
+      const downsample = dimsDownsample(
+        [volumeDims[0], volumeDims[1], volumeDims[2]],
+        levelDims,
+      )
+      return {
+        level,
+        downsample,
+        levelDims,
+        brickCount,
+        brightnessExponent: lodGammaExponent(downsample, brightness),
+        opacityScale: lodOpacityScale(downsample, opacity),
+      }
+    }
+
+    const plan = this.model.volumes[0]?.chunkPlan
+    const floorDims = this.view?.coarseFloorDims() ?? null
+    const levels: LodCompensationLevel[] = []
+    let inactiveReason: string | null = null
+    if (!this.model.volumes.length) {
+      inactiveReason = 'no volume is loaded'
+    } else if (!plan) {
+      inactiveReason = 'volume 0 is not a chunked volume'
+    } else if (!plan.levelDims || plan.levelDims.length < 2) {
+      // A single-level plan (chunkVolumeGrid) tiles the finest data only, so
+      // every brick is at downsample 1 and both settings are no-ops.
+      inactiveReason = 'the chunked volume has a single resolution level'
+    } else {
+      const counts = new Map<number, number>()
+      for (const chunk of plan.chunks) {
+        const level = chunk.sourceLevel ?? 0
+        counts.set(level, (counts.get(level) ?? 0) + 1)
+      }
+      for (let level = 0; level < plan.levelDims.length; level++) {
+        const dims = plan.levelDims[level]
+        if (!dims) continue
+        levels.push(
+          describe(
+            level,
+            [dims[0], dims[1], dims[2]],
+            counts.get(level) ?? 0,
+            plan.volumeDims,
+          ),
+        )
+      }
+    }
+
+    const floor =
+      plan && floorDims ? describe(-1, floorDims, 1, plan.volumeDims) : null
+    // Active means some drawn brick is being changed: a coarse level has to be
+    // present AND a coefficient has to be non-zero. The coefficients are checked
+    // first because that is the reason the caller can act on directly.
+    if (!inactiveReason && brightness <= 0 && opacity <= 0) {
+      inactiveReason = 'both coefficients are 0'
+    }
+    const hasCoarse =
+      levels.some((l) => l.brickCount > 0 && l.downsample > 1) ||
+      (floor?.downsample ?? 1) > 1
+    if (!inactiveReason && !hasCoarse) {
+      inactiveReason = 'no coarse brick is currently drawn'
+    }
+    return {
+      isActive: inactiveReason === null,
+      inactiveReason,
+      brightnessCompensation: brightness,
+      opacityCompensation: opacity,
+      levels,
+      floor,
+    }
   }
 
   /**
@@ -3644,7 +4009,14 @@ export default class NiiVue extends EventTarget {
    *
    * ADDITIVE: the streamed volume is ADDED to the scene (via `addVolume`), not
    * swapped for the current volumes. To reload/replace a streamed volume, the
-   * caller removes the previous one first.
+   * caller removes the previous one first. Because the outgoing volume is still
+   * the base while this runs, a reload should call
+   * {@link NVChunkedVolume.applyCoarseFloor} once it has removed it.
+   *
+   * Unless the `coarseFloor` option turns it off, the coarsest pyramid level is
+   * also installed as the base coarse floor (see
+   * {@link NiiVue.setBaseCoarseFloor}), so regions whose bricks are not yet
+   * resident show coarse detail instead of the scene background.
    */
   async loadChunkedVolume(
     source: ChunkedVolumeSource,
@@ -4258,6 +4630,8 @@ export default class NiiVue extends EventTarget {
           // (streaming/fade) keep the last-set value on the same view instance.
           this.view.overlayDraw =
             this._overlayRenderers.length > 0 ? this._dispatchOverlay : null
+          // Same reasoning for the GPU-context-recovery hook.
+          this.view.onContextLost = this._onGpuContextLost
           this.view.render()
         }
       })
@@ -4287,6 +4661,45 @@ export default class NiiVue extends EventTarget {
       this.view.overlayDraw = null
     }
     this.drawScene()
+  }
+
+  /**
+   * Automatic recovery from a lost GPU context (WebGL2 'webglcontextrestored',
+   * or a WebGPU device-lost that isn't our own teardown). Everything the view
+   * owned died with the context, so the view is rebuilt wholesale; volumes and
+   * meshes live on the model and re-upload, and a streamed volume re-plans from
+   * its `chunkPlan` on the next frame.
+   *
+   * Capped: if the cause is that this scene simply does not fit in VRAM, an
+   * uncapped retry would loop lose -> rebuild -> lose forever. After the cap we
+   * leave the message up and stop.
+   */
+  private _onGpuContextLost = (): void => {
+    if (this._destroyed) return
+    // The canvas is captured now because recreateView swaps in a fresh one, and
+    // the overlay is keyed by the canvas it was shown for.
+    const canvas = this.canvas
+    if (this._contextLossRecoveries >= MAX_CONTEXT_LOSS_RECOVERIES) {
+      log.error(
+        `GPU context lost ${this._contextLossRecoveries} times; not rebuilding again.`,
+      )
+      if (canvas) showCanvasMessage(canvas, GRAPHICS_LOST_MESSAGE)
+      return
+    }
+    this._contextLossRecoveries += 1
+    if (canvas) showCanvasMessage(canvas, GRAPHICS_RECOVERING_MESSAGE)
+    void this._recreateView()
+      .then(() => {
+        if (canvas) clearCanvasMessage(canvas)
+        if (this.canvas && this.canvas !== canvas) {
+          clearCanvasMessage(this.canvas)
+        }
+        this.drawScene()
+      })
+      .catch((e) => {
+        log.error(`Failed to rebuild the view after a GPU context loss: ${e}`)
+        if (canvas) showCanvasMessage(canvas, GRAPHICS_LOST_MESSAGE)
+      })
   }
 
   /** Stable dispatcher fanned out to every registered overlay renderer. */

@@ -35,7 +35,37 @@ struct Params {
     // projection. Sits in the implicit padding f32 between fadeAlpha and the
     // 8-byte-aligned _pad0, so struct size and all later offsets are unchanged.
     renderMode: f32,
-    _pad0: vec2f,
+    // 0 = hardware trilinear, 1 = tricubic B-spline reconstruction in the
+    // background fine pass. Occupies what was _pad0's first lane, so the struct
+    // size and every later offset are unchanged.
+    cubicFilter: f32,
+    // Display gamma exponent for the classified RGB (alpha untouched, so the
+    // ray's occlusion is unchanged). Already inverted on the CPU: the shader
+    // does pow(rgb, invGamma), where invGamma = 1 / scene.gamma, so gamma > 1
+    // brightens. 1.0 is a strict no-op. Occupies what was _pad0, so the struct
+    // size and every later offset are unchanged.
+    invGamma: f32,
+    // Multiplier on this brick's step-size opacity exponent, compensating the
+    // fact that a coarse voxel is not homogeneous (so its true transmittance is
+    // lower than the homogeneous approximation the step correction assumes).
+    // 1.0 is a strict no-op and is the default. Occupies the first of the two
+    // implicit padding lanes before the 16-byte-aligned volumeTexDimsFull, so
+    // the struct size and every later offset are unchanged. Mirrors
+    // lodOpacityScale in gl/renderShader.ts.
+    lodOpacityScale: f32,
+    // The background volume's own \`opacity\`, scaling every background sample's
+    // alpha. The 2D slice shader has always honoured it; here it scales the
+    // alpha BEFORE the classification test so a half-opaque volume is a
+    // half-dense medium (you see deeper into it) rather than a fully dense one
+    // faded at the end, and so opacity 0 removes the background from the depth
+    // write and the clip-surface shading as well as from the colour. Overlays
+    // do not use it: their opacity is baked into the overlay texture's alpha by
+    // the orient pass. 1.0 is the default and a strict no-op. Occupies the last
+    // implicit padding lane before the 16-byte-aligned volumeTexDimsFull, so
+    // the struct size and every later offset are unchanged. Mirrors
+    // backOpacity in gl/renderShader.ts. The depth-pick shader shares this
+    // struct but never reads the field: a pick reads geometry, not colour.
+    backOpacity: f32,
     // Tiled-volume fields. Pass-through values for non-chunked volumes:
     //   volumeTexDimsFull = textureDimensions(volume, 0)
     //   chunkSubOrigin    = (0,0,0)
@@ -55,6 +85,12 @@ struct Params {
     // Full-volume voxel dims at this brick's source pyramid level, used only for
     // the ray-march step density so a coarse multi-LOD brick steps at its own
     // resolution. Equals volumeTexDimsFull for single-level/non-chunked draws.
+    // .w carries samples per voxel along the ray in the fine march. Above 1 it
+    // oversamples and converges the ray integral; it does NOT remove concentric
+    // "wood grain" banding on smooth structures (measured ring contrast is flat
+    // from 1 to 4, because the banding is in the integrand, not the sampling of
+    // it). It rides in what was pad, so the struct size and every offset are
+    // unchanged.
     rayStepTexVox: vec4f,
 }
 
@@ -64,6 +100,61 @@ struct Params {
 fn chunkTexCoord(samplePos: vec3f) -> vec3f {
     let chunkLocal = (samplePos - params.chunkSubOrigin.xyz) / params.chunkSubSize.xyz;
     return params.dataOriginTexFrac.xyz + chunkLocal * params.dataSizeTexFrac.xyz;
+}
+
+// Display gamma on a classified colour. ALPHA IS DELIBERATELY UNTOUCHED: gamma
+// is a brightness control, and raising alpha with it would change how much each
+// sample occludes what is behind it (the ray would saturate sooner and the image
+// would get flatter, not brighter). e is params.invGamma, already reciprocated
+// on the CPU. Mirrors applyGamma in gl/renderShader.ts -- keep the two in step.
+fn applyGamma(rgb: vec3f, e: f32) -> vec3f {
+    if (e == 1.0) { return rgb; }
+    return pow(max(rgb, vec3f(0.0)), vec3f(e));
+}
+
+// Tricubic B-spline reconstruction in 8 hardware-trilinear fetches
+// (Sigg & Hadwiger, GPU Gems 2 ch. 20; Ruijters & Thevenaz formulation). The
+// 4x4x4 kernel has non-negative weights only, so each opposed pair of taps
+// collapses into one linear fetch at a weighted offset. Approximating, not
+// interpolating: it smooths by design, which is the point here. Requires a
+// LINEAR-filtered sampler, which tex_sampler is.
+//
+// Support reaches 2 texels either side of the sample, so a CHUNKED volume needs
+// a brick halo of at least 2 or brick faces read past their owned data and seam.
+// See VolumeRenderConfig.isCubicInterpolation. Mirrors sampleTricubic in
+// gl/renderShader.ts -- keep the two in step.
+//
+// coord is already in THIS texture's [0,1] space (post chunkTexCoord).
+fn sampleTricubic(tex: texture_3d<f32>, samp: sampler, coord: vec3f) -> vec4f {
+    let dims = vec3f(textureDimensions(tex, 0));
+    let grid = coord * dims - 0.5;
+    let idx = floor(grid);
+    let f = grid - idx;
+    let g = vec3f(1.0) - f;
+    let w0 = (1.0 / 6.0) * g * g * g;
+    let w1 = vec3f(2.0 / 3.0) - 0.5 * f * f * (vec3f(2.0) - f);
+    let w2 = vec3f(2.0 / 3.0) - 0.5 * g * g * (vec3f(2.0) - g);
+    let w3 = (1.0 / 6.0) * f * f * f;
+    let s0 = w0 + w1;
+    let s1 = w2 + w3;
+    let inv = vec3f(1.0) / dims;
+    let h0 = inv * ((w1 / s0) - 0.5 + idx);
+    let h1 = inv * ((w3 / s1) + 1.5 + idx);
+    var c000 = textureSampleLevel(tex, samp, vec3f(h0.x, h0.y, h0.z), 0.0);
+    let c100 = textureSampleLevel(tex, samp, vec3f(h1.x, h0.y, h0.z), 0.0);
+    c000 = mix(c100, c000, s0.x);
+    var c010 = textureSampleLevel(tex, samp, vec3f(h0.x, h1.y, h0.z), 0.0);
+    let c110 = textureSampleLevel(tex, samp, vec3f(h1.x, h1.y, h0.z), 0.0);
+    c010 = mix(c110, c010, s0.x);
+    c000 = mix(c010, c000, s0.y);
+    var c001 = textureSampleLevel(tex, samp, vec3f(h0.x, h0.y, h1.z), 0.0);
+    let c101 = textureSampleLevel(tex, samp, vec3f(h1.x, h0.y, h1.z), 0.0);
+    c001 = mix(c101, c001, s0.x);
+    var c011 = textureSampleLevel(tex, samp, vec3f(h0.x, h1.y, h1.z), 0.0);
+    let c111 = textureSampleLevel(tex, samp, vec3f(h1.x, h1.y, h1.z), 0.0);
+    c011 = mix(c111, c011, s0.x);
+    c001 = mix(c011, c001, s0.y);
+    return mix(c001, c000, s0.z);
 }
 
 fn rayAxisRange(start: f32, dir: f32, boxMin: f32, boxMax: f32) -> vec2f {
@@ -209,9 +300,22 @@ fn raySamplePhase(startTex: vec3f, stepSize: f32) -> f32 {
     // sample in the nearer chunk so the boundary is not double-counted.
     var phase = floor(grid + 0.5) + 0.5 - grid;
     if (phase <= 0.001) {
-        phase = 1.0;
+        phase += 1.0;
     }
     return clamp(phase, 0.001, 1.0);
+}
+
+// Re-anchor a position handed over by the coarse (fast) pass onto the fine
+// sample lattice. The fast pass strides 1.9 voxels, which is not a whole number
+// of fine steps, so resuming the fine march exactly where the fast pass stopped
+// leaves the fine lattice with a phase set by how many fast steps were taken --
+// floor(depth / 1.9), a sawtooth in depth-to-first-hit. Snapping back to the
+// ray's own phase makes the fine samples land in the same places regardless of
+// where the fast pass stopped, so a chunk's samples do not shift when a
+// neighbouring chunk changes where empty-space skipping ends.
+fn snapToSampleLattice(dist: f32, phase: f32, stepSize: f32) -> f32 {
+    let n = floor(dist / max(stepSize, 1e-8) - phase);
+    return (phase + max(n, 0.0)) * stepSize;
 }
 
 // see if clip plane trims ray sampling range sampleStartEnd.x..y

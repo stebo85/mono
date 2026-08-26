@@ -173,7 +173,7 @@ Tracking which features from the old `niivue` package exist in the new rewrite.
 | Custom gradient texture | ❌ | No `setCustomGradientTexture` / `getGradientTextureData` |
 | MatCap texture | ✅ | `loadMatcap()` / `volumeMatcap` |
 | Maximum-intensity projection | ✅ | `volumeRenderMode = VOLUME_RENDER_MODE.MAXIMUM` (both backends). Not the old `setAdditiveBlend` API — the ray-march combines samples with a component-wise max instead of OVER, and it applies to every volume pass (base, overlay, PAQD, drawing) |
-| Gamma correction | ✅ | `gamma` property |
+| Gamma correction | ✅ | `gamma` property (both backends), applied to the 3D ray-march AND the 2D slice tiles. Scope differs from the old package: the shaders raise the classified RGB to `1/gamma` at draw time (alpha untouched, so `gamma > 1` brightens) instead of baking the exponent into the colormap LUT, so a slider retunes a streaming volume with no re-upload. It reaches intensity-derived layers only (background + colormapped overlay); categorical label colour (the drawing layer, PAQD) and V1 fiber directions are left alone |
 | Volume alpha shader | ✅ | `volumeAlphaShader` |
 
 ## 13. Clip Planes
@@ -535,6 +535,7 @@ per-backend. Design: `docs/tiled-volumes.md`. Demo: `apps/iiif-volumetric-demo`
 | Per-brick multi-LOD plan | ✅ | `chunkVolumeMultiLOD`: heterogeneous `ChunkPlan` with per-brick `sourceLevel`; common-grid (placement) vs level-grid (texture) coordinate split |
 | 2:1 balanced octree | ✅ | Scale-relative refinement (`detail`) + explicit balance post-pass: face-adjacent bricks differ by ≤1 level. Budget pass shrinks `detail`, then raises a floor, then respects `maxBricks` (< `MAX_CHUNKS_PER_TILE`) |
 | Per-brick ray step + opacity correction | ✅ | `rayStepTexVox` uniform + `1 − pow(1−a, stepRatio)`; coarse bricks step at their own density without rendering dimmer. Both backends (`render.wgsl` / `renderShader.ts`) |
+| Per-level LOD brightness/opacity compensation | ✅ | `lodGammaExponent` (colour, default `0.022`) folds into the display-gamma exponent per brick; `lodOpacityScale` (alpha, default `0` — measured worse on dense structure) scales the step-size opacity exponent. Both backends; colour also on 2D slice tiles, opacity is ray-march only. `lodCompensation()` reports whether either applies, why not, and the exact per-level numbers |
 | Mixed-size back-to-front order | ✅ | `chunksBackToFront` BSP clean-plane recursive sort — exact compositing order for mixed brick sizes at any angle (`depthFunc ALWAYS` relies on it); a pairwise comparator left rare mis-ordered opaque bricks as stray bright blocks |
 | In-place plan swap (refocus) | ✅ | `swapChunkedVolumePlan` + residency `remap`: unchanged bricks keep their GPU textures; only changed bricks re-fetch |
 | Focus box / per-brick LOD boxes | ✅ | `nv.focusBox` (single AABB) and `nv.lodBoxes` (set, e.g. coloured per level) drawn on 3D render tiles, both backends |

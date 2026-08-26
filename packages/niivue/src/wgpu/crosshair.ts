@@ -8,6 +8,7 @@ import {
   buildVertexData,
   calculateCrosshairSegments,
   getCylinderIndices,
+  MAX_CROSSHAIR_TILES,
   packColor,
   shouldCullCylinder,
   VERTS_PER_CYLINDER,
@@ -24,6 +25,19 @@ export type CrosshairResources = {
   alignedMeshSize: number
 }
 
+// One cylinder's vertices for one tile. A multiple of 4, as WebGPU requires of
+// a setVertexBuffer offset.
+const CROSSHAIR_SLOT_BYTES = VERTS_PER_CYLINDER * BYTES_PER_VERTEX
+
+/** Byte offset of a crosshair vertex slot, clamped to the allocated range. */
+function crosshairSlotOffset(slot: number): number {
+  const clamped = Math.min(
+    Math.max(0, Math.trunc(slot)),
+    MAX_CROSSHAIR_TILES - 1,
+  )
+  return clamped * CROSSHAIR_SLOT_BYTES
+}
+
 export class CrosshairRenderer extends NVRenderer {
   private device: GPUDevice | null = null
   private cylinders: CrosshairResources[] = []
@@ -37,9 +51,12 @@ export class CrosshairRenderer extends NVRenderer {
 
     // Create 6 cylinders (2 per axis: X-, X+, Y-, Y+, Z-, Z+)
     for (let i = 0; i < 6; i++) {
-      // Create vertex buffer with COPY_DST for dynamic updates
+      // Create vertex buffer with COPY_DST for dynamic updates. One slot per
+      // distinct crosshair thickness the frame can need: queue writes do not
+      // take effect between draws in a submitted pass, so a per-tile radius has
+      // to live in its own region rather than overwrite a shared one.
       const vertexBuffer = device.createBuffer({
-        size: VERTS_PER_CYLINDER * BYTES_PER_VERTEX,
+        size: CROSSHAIR_SLOT_BYTES * MAX_CROSSHAIR_TILES,
         usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
       })
 
@@ -85,11 +102,19 @@ export class CrosshairRenderer extends NVRenderer {
     this.isReady = true
   }
 
-  update(model: NVModel): void {
+  /**
+   * Write the six cylinders at `radiusMM` -- the world radius that renders
+   * `ui.crosshairWidth` canvas pixels thick on the tile about to be drawn (see
+   * `crosshairRadiusMM`) -- into vertex slot `slot`. Pass the same `slot` to
+   * `draw`/`drawXRay` for that tile. Slots exist because every write here lands
+   * before the frame's submit, so tiles cannot take turns with one region.
+   */
+  update(model: NVModel, radiusMM: number, slot = 0): void {
     if (!this.device || !this.isReady) return
 
     const { extentsMin, extentsMax, scene, ui } = model
-    const radius = ui.crosshairWidth
+    const radius = radiusMM
+    const offset = crosshairSlotOffset(slot)
     const colorPacked = packColor(ui.crosshairColor)
     const segments = calculateCrosshairSegments(
       extentsMin,
@@ -111,7 +136,7 @@ export class CrosshairRenderer extends NVRenderer {
       const vertexData = buildVertexData(start, end, radius, colorPacked)
       this.device.queue.writeBuffer(
         this.cylinders[i].vertexBuffer,
-        0,
+        offset,
         vertexData,
       )
     }
@@ -129,9 +154,11 @@ export class CrosshairRenderer extends NVRenderer {
     normalMatrix: Float32Array | number[],
     tileIndex: number,
     sliceType: number,
+    slot = 0,
   ): void {
     if (!this.isReady) return
     const crosshairs = this.cylinders
+    const vertexOffset = crosshairSlotOffset(slot)
     const s = this._uniformScratch
     s.set(mvpMatrix as ArrayLike<number>, 0)
     s.set(normalMatrix as ArrayLike<number>, 16)
@@ -144,7 +171,7 @@ export class CrosshairRenderer extends NVRenderer {
       const dynamicOffset = Math.trunc(tileIndex * cyl.alignedMeshSize)
       device.queue.writeBuffer(cyl.uniformBuffer, dynamicOffset, s)
       pass.setBindGroup(0, cyl.bindGroup, [dynamicOffset])
-      pass.setVertexBuffer(0, cyl.vertexBuffer)
+      pass.setVertexBuffer(0, cyl.vertexBuffer, vertexOffset)
       pass.setIndexBuffer(cyl.indexBuffer, 'uint32')
       pass.drawIndexed(cyl.indexCount)
     }
@@ -159,9 +186,11 @@ export class CrosshairRenderer extends NVRenderer {
     tileIndex: number,
     sliceType: number,
     xrayAlpha: number,
+    slot = 0,
   ): void {
     if (!this.isReady) return
     const crosshairs = this.cylinders
+    const vertexOffset = crosshairSlotOffset(slot)
     const s = this._uniformScratch
     s.set(mvpMatrix as ArrayLike<number>, 0)
     s.set(normalMatrix as ArrayLike<number>, 16)
@@ -174,7 +203,7 @@ export class CrosshairRenderer extends NVRenderer {
       device.queue.writeBuffer(cyl.uniformBuffer, dynamicOffset, s)
       pass.setPipeline(xrayPipeline)
       pass.setBindGroup(0, cyl.bindGroup, [dynamicOffset])
-      pass.setVertexBuffer(0, cyl.vertexBuffer)
+      pass.setVertexBuffer(0, cyl.vertexBuffer, vertexOffset)
       pass.setIndexBuffer(cyl.indexBuffer, 'uint32')
       pass.drawIndexed(cyl.indexCount)
     }

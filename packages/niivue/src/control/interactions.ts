@@ -596,8 +596,11 @@ function strokeSample(ctrl: NiiVue, vol: NVImage): Float32Array | null {
 function explodedPickRay(
   ctrl: NiiVue,
   vol: NVImage,
+  hitOverride?: ViewHitTest | null,
 ): { origin: [number, number, number]; dir: [number, number, number] } | null {
-  const hit = ctrl.activeTileHit
+  // Defaults to the tile the pointer went down on (every drag-driven pick), but
+  // a caller that hit-tested its own point passes it in — see pickExplodedBlock.
+  const hit = hitOverride ?? ctrl.activeTileHit
   if (!hit || !vol.chunkPlan) return null
   const tile = ctrl.view?.screenSlices[hit.tileIndex]
   const ltwh = tile?.leftTopWidthHeight
@@ -639,9 +642,13 @@ function explodedPickRay(
 // ray (explodedPickRay), CPU-ray-casts the exploded chunk AABBs restricted to the
 // clip-visible set, and returns the entered voxel plus a visible-tissue predicate.
 // Null if the ray misses every block or there is no drawing volume.
-function pickExplodedDraw(ctrl: NiiVue, vol: NVImage): ExplodedDrawPick | null {
+function pickExplodedDraw(
+  ctrl: NiiVue,
+  vol: NVImage,
+  hitOverride?: ViewHitTest | null,
+): ExplodedDrawPick | null {
   const plan = vol.chunkPlan
-  const ray = explodedPickRay(ctrl, vol)
+  const ray = explodedPickRay(ctrl, vol, hitOverride)
   if (!plan || !ray) return null
   const near = ray.origin
   const [dx, dy, dz] = ray.dir
@@ -661,10 +668,6 @@ function pickExplodedDraw(ctrl: NiiVue, vol: NVImage): ExplodedDrawPick | null {
   const data = strokeSample(ctrl, vol)
   const dimX = (vol.dimsRAS as number[])[1]
   const dimXY = dimX * (vol.dimsRAS as number[])[2]
-  const sample = data
-    ? (x: number, y: number, z: number): number =>
-        data[x + y * dimX + z * dimXY]
-    : undefined
   // The window cal_min/cal_max are in display units; convert to the raw scale
   // getImageDataRAS returns. The first faintly-non-zero voxel is near-transparent
   // ("cloud"), so threshold a short way up the window so the paint lands on the
@@ -673,7 +676,26 @@ function pickExplodedDraw(ctrl: NiiVue, vol: NVImage): ExplodedDrawPick | null {
   const sclInter = vol.hdr?.scl_inter || 0
   const winLo = (vol.calMin - sclInter) / sclSlope
   const winHi = (vol.calMax - sclInter) / sclSlope
-  const threshold = winLo + 0.15 * (winHi - winLo)
+  let threshold = winLo + 0.15 * (winHi - winLo)
+  let sample: ((x: number, y: number, z: number) => number) | undefined
+  const base = vol.pickSampler
+  if (data) {
+    sample = (x: number, y: number, z: number): number =>
+      data[x + y * dimX + z * dimXY]
+  } else if (base) {
+    // A STREAMED volume has no CPU `img` -- its voxels live in GPU brick
+    // textures -- so fall back to the volume's own mm-space `pickSampler` (the
+    // resident coarse floor NVChunkedVolume installs). It already returns a
+    // WINDOW-VISIBLE value, so its threshold is 0 rather than a fraction of the
+    // window. Same wrapping the 3D depth pick uses (NVViewGPU/NVViewGL), so a
+    // click lands on the same voxel whether the volume is resident or streamed.
+    const matRAS = vol.matRAS as mat4
+    sample = (x: number, y: number, z: number): number => {
+      const mm = NVTransforms.vox2mm(null, [x, y, z], matRAS)
+      return base(mm[0], mm[1], mm[2])
+    }
+    threshold = 0
+  }
   const picked = pickExplodedVoxel(
     plan,
     vol.matRAS as Float32Array,
@@ -2366,20 +2388,30 @@ export function initInteraction(ctrl: NiiVue): void {
         ctrl.model.interaction.secondaryDragMode === DRAG_MODE.slicer3D
       if (isPanZoomMode) {
         const zoomDirection = evt.deltaY < 0 ? 1 : -1
-        let zoom = ctrl.model.scene.pan2Dxyzmm[3] * (1.0 + 0.1 * zoomDirection)
-        zoom = Math.round(zoom * 10) / 10
-        zoom = Math.max(0.1, Math.min(10.0, zoom))
-        const zoomChange = ctrl.model.scene.pan2Dxyzmm[3] - zoom
+        const zoom = NVTransforms.stepZoom2D(
+          ctrl.model.scene.pan2Dxyzmm[3],
+          zoomDirection,
+        )
         if (ctrl.model.interaction.isYoked3DTo2DZoom) {
           ctrl.model.scene.scaleMultiplier = zoom
           emitScaleMultiplierChange(ctrl)
         }
-        ctrl.model.scene.pan2Dxyzmm[3] = zoom
-        // Adjust pan so zoom centers on the crosshair
+        // Pan so the crosshair stays put under the new zoom. The compensation
+        // is NVTransforms' business, not this handler's: the ortho window is
+        // built there and only it knows that holding a point takes a ratio of
+        // the zooms measured from the extent centre.
         const mm = ctrl.model.scene2mm(ctrl.model.scene.crosshairPos)
-        ctrl.model.scene.pan2Dxyzmm[0] += zoomChange * mm[0]
-        ctrl.model.scene.pan2Dxyzmm[1] += zoomChange * mm[1]
-        ctrl.model.scene.pan2Dxyzmm[2] += zoomChange * mm[2]
+        const pan = NVTransforms.zoomPan2DAbout(
+          ctrl.model.scene.pan2Dxyzmm,
+          zoom,
+          mm,
+          ctrl.model.extentsMin,
+          ctrl.model.extentsMax,
+        )
+        ctrl.model.scene.pan2Dxyzmm[3] = zoom
+        ctrl.model.scene.pan2Dxyzmm[0] = pan[0]
+        ctrl.model.scene.pan2Dxyzmm[1] = pan[1]
+        ctrl.model.scene.pan2Dxyzmm[2] = pan[2]
         emitPan2DChange(ctrl)
         ctrl.drawScene()
         return
@@ -2670,4 +2702,86 @@ export function hitTest(
   y: number,
 ): ViewHitTest | null {
   return ctrl.view?.hitTest(x, y) ?? null
+}
+
+/** What {@link pickExplodedBlock} resolves a click on an exploded brick to. */
+export interface ExplodedBlockPick {
+  /** Index into `ctrl.volumes` of the volume that owns the brick. */
+  volumeIndex: number
+  /** Index into `vol.chunkPlan.chunks`. */
+  chunkIndex: number
+  /** Brick data region in the volume's RAS voxel grid (excludes halo). */
+  voxelOrigin: [number, number, number]
+  voxelDims: [number, number, number]
+  /** The visible-tissue voxel the ray landed on, in RAS voxel coords. */
+  voxel: [number, number, number]
+  /** That voxel in UN-EXPLODED (anatomical) mm. */
+  mm: [number, number, number]
+  /**
+   * The brick's mm bounding box where it is DRAWN, i.e. with the explode offset
+   * applied. Feed straight to `ctrl.focusBox` to outline the picked brick.
+   */
+  explodedMin: [number, number, number]
+  explodedMax: [number, number, number]
+}
+
+/**
+ * Resolve a pointer position over the 3D render onto one exploded brick.
+ *
+ * The exploded view is a render-time per-brick translation, so GPU depth picking
+ * (which ray-marches the un-exploded texture) cannot see it. This runs the same
+ * CPU pick the 3D pen and the vector-face pick use: unproject the point to a
+ * world ray, cast it against the bricks' EXPLODED bounding boxes restricted to
+ * the clip-visible set, then march into the winning brick's data so the hit lands
+ * on the first visible voxel rather than the brick's empty bounding-box face.
+ *
+ * Takes CLIENT coordinates (`event.clientX/clientY`) and does its own hit test,
+ * so it is safe to call from a plain click handler without a drag in progress.
+ *
+ * Returns null when the point is not over a render tile, no loaded volume is a
+ * chunked volume with explode enabled, or the ray misses every visible brick.
+ */
+export function pickExplodedBlock(
+  ctrl: NiiVue,
+  clientX: number,
+  clientY: number,
+): ExplodedBlockPick | null {
+  const px = clientToBoundsPixel(ctrl, clientX, clientY)
+  if (!px) return null
+  const hit = ctrl.view?.hitTest(px[0], px[1]) ?? null
+  if (!hit?.isRender) return null
+  const volumes = ctrl.volumes ?? []
+  for (let volumeIndex = 0; volumeIndex < volumes.length; volumeIndex++) {
+    const vol = volumes[volumeIndex]
+    const plan = vol?.chunkPlan
+    if (!plan || !chunkExplodeEnabled(vol.chunkExplode)) continue
+    const picked = pickExplodedDraw(ctrl, vol, hit)
+    if (!picked) continue
+    const desc = plan.chunks[picked.chunkIndex]
+    if (!desc) continue
+    const aabb = explodedChunkAABB(
+      plan,
+      vol.matRAS as Float32Array,
+      vol.chunkExplode,
+      picked.chunkIndex,
+    )
+    if (!aabb) continue
+    const m = vol.matRAS as ArrayLike<number>
+    const [vx, vy, vz] = picked.voxel
+    return {
+      volumeIndex,
+      chunkIndex: picked.chunkIndex,
+      voxelOrigin: [...desc.voxelOrigin],
+      voxelDims: [...desc.voxelDims],
+      voxel: [vx, vy, vz],
+      mm: [
+        m[0] * vx + m[1] * vy + m[2] * vz + m[3],
+        m[4] * vx + m[5] * vy + m[6] * vz + m[7],
+        m[8] * vx + m[9] * vy + m[10] * vz + m[11],
+      ],
+      explodedMin: [...aabb.min],
+      explodedMax: [...aabb.max],
+    }
+  }
+  return null
 }

@@ -201,12 +201,16 @@ first such interaction warns). Turn one off before turning the other on.
     volume_is_alpha_clip_dark = traitlets.Bool(None, allow_none=True).tag(sync=True)
     volume_is_background_masking = traitlets.Bool(None, allow_none=True).tag(sync=True)
     volume_is_colormap_alpha_on_2d = traitlets.Bool(None, allow_none=True).tag(sync=True)
+    volume_is_cubic_interpolation = traitlets.Bool(None, allow_none=True).tag(sync=True)
     volume_is_nearest_interpolation = traitlets.Bool(None, allow_none=True).tag(sync=True)
     volume_is_v1_slice_shader = traitlets.Bool(None, allow_none=True).tag(sync=True)
+    volume_lod_brightness_compensation = traitlets.Float(None, allow_none=True).tag(sync=True)
+    volume_lod_opacity_compensation = traitlets.Float(None, allow_none=True).tag(sync=True)
     volume_matcap = traitlets.Unicode(None, allow_none=True).tag(sync=True)
     volume_outline_width = traitlets.Float(None, allow_none=True).tag(sync=True)
     volume_paqd_uniforms = traitlets.List(trait=traitlets.Float(None, allow_none=True), default_value=None, minlen=4, maxlen=4, allow_none=True).tag(sync=True)
     volume_render_mode = traitlets.Float(None, allow_none=True).tag(sync=True)
+    volume_sample_rate = traitlets.Float(None, allow_none=True).tag(sync=True)
     volume_transmittance_cutoff = traitlets.Float(None, allow_none=True).tag(sync=True)
 
     # Read-only properties (synced from JS to Python)
@@ -387,17 +391,51 @@ and its volumes alive."""
         return await self._request("centerRenderOnMM", _make_args(mm))
 
     async def chunk_stream_stats(self) -> Any:
-        """Streaming stats across all chunked volumes (base + independent overlay) on the active backend: `{ resident, pending, inFlight, total }` brick counts.
+        """Streaming stats across all chunked volumes (base + independent overlay) on the active backend: `{ resident, pending, inFlight, total, staleDropped }` brick counts.
 
-        Returns null before a view is attached. Useful for HUD / debug overlays:
-        `resident < total` with `pending > 0` for many frames indicates the working
-        set exceeds the residency budget (thrashing).
+        Returns null before a view is attached. Useful for HUD / debug
+        overlays: `resident < total` with `pending > 0` for many frames indicates the
+        working set exceeds the residency budget (thrashing).
+
+        `staleDropped` is cumulative, not per frame: queued uploads retired because
+        the view moved on before they ran. It climbing during a pan or rotate is the
+        queue working as intended, since that work would otherwise have uploaded
+        bricks for viewports the user had already left.
+
+        `predicted` is also cumulative: source reads started AHEAD of the working
+        set, from the direction the view is travelling. Those never enter the
+        upload queue, so they show up here and in the source's byte-cache hit rate
+        rather than in `resident`.
+
+        `decoded` is the decoded-chunk tier summed over every chunked volume: the
+        CPU-side source bytes a brick is demoted to when the GPU evicts it. Its
+        hits are source reads that skipped the network AND the decode entirely,
+        costing only a texture upload; `bytes` / `maxBytes` is how full it is.
 
         Returns
         -------
-        { resident: number; pending: number; inFlight: number; total: number; } | null
+        { resident: number; pending: number; inFlight: number; total: number; staleDropped: number; predicted: number; decoded: DecodedChunkStats; } | null
         """
         return await self._request("chunkStreamStats", [])
+
+    async def chunk_timing_stats(self) -> Any:
+        """Where a streamed brick's time actually goes: bytes over the wire, the work of turning them into a texture, and how much of that blocked the render loop.
+
+        Returns the process-wide totals since the last
+        {@link resetChunkTiming} — the recorder is a module-level singleton, so
+        this aggregates every chunked volume on every instance in the page, not
+        just this one.
+
+        `mainThreadMs` (assemble + upload + gradient) is the figure that decides
+        whether a decode worker is worth building, and `netBusyMs` is network wall
+        clock with overlapping reads counted once. Phase definitions and the
+        accuracy of each number are in `src/volume/chunkTiming.ts`.
+
+        Returns
+        -------
+        ChunkTimingSnapshot
+        """
+        return await self._request("chunkTimingStats", [])
 
     def clear_angles(self) -> None:
         """Clear completed angles only, leaving distance measurements in place.
@@ -670,7 +708,14 @@ and its volumes alive."""
 
         ADDITIVE: the streamed volume is ADDED to the scene (via `addVolume`), not
         swapped for the current volumes. To reload/replace a streamed volume, the
-        caller removes the previous one first.
+        caller removes the previous one first. Because the outgoing volume is still
+        the base while this runs, a reload should call
+        {@link NVChunkedVolume.applyCoarseFloor} once it has removed it.
+
+        Unless the `coarseFloor` option turns it off, the coarsest pyramid level is
+        also installed as the base coarse floor (see
+        {@link NiiVue.setBaseCoarseFloor}), so regions whose bricks are not yet
+        resident show coarse detail instead of the scene background.
 
         Parameters
         ----------
@@ -744,6 +789,33 @@ and its volumes alive."""
 
     def load_volumes(self, volumes: Any) -> None:
         self.send({"cmd": "loadVolumes", "args": _make_args(volumes)})
+
+    async def lod_compensation(self) -> Any:
+        """What the two LOD compensation settings are actually doing right now.
+
+        `volumeLodBrightnessCompensation` and `volumeLodOpacityCompensation` only
+        affect bricks fetched from a COARSE level of a multi-LOD chunked volume, so
+        on an ordinary volume they are exact no-ops with nothing on screen to say
+        so. This is the way to check: `isActive` answers \"is anything being
+        compensated\", `inactiveReason` says why not, and each level reports the
+        exponent and scale being handed to the shader for its bricks.
+
+        ```js
+        const report = nv.lodCompensation()
+        if (!report.isActive) console.log(report.inactiveReason)
+        for (const each of report.levels) {
+          console.log(each.level, each.downsample, each.brickCount, each.brightnessExponent)
+        }
+        ```
+
+        Reads the background volume (`volumes[0]`), which is the volume both
+        settings act on. Cheap enough to call per frame for a debug HUD.
+
+        Returns
+        -------
+        LodCompensationReport
+        """
+        return await self._request("lodCompensation", [])
 
     def mark_draw_dirty(self, x: Any, y: Any, z: Any, radius: Any = _UNSET) -> None:
         """Expand the pending pen-stroke dirty box by a voxel and its pen radius, so the next drawing flush re-uploads only the chunks that region touches.
@@ -819,6 +891,26 @@ and its volumes alive."""
             Index of the volume to move
         """
         self.send({"cmd": "moveVolumeUp", "args": _make_args(volume_index)})
+
+    async def pick_exploded_block(self, client_x: Any, client_y: Any) -> Any:
+        """Resolve a pointer position over the 3D render onto one exploded brick of a chunked volume, or null when the point misses every visible brick.
+
+        Pass `event.clientX` / `event.clientY` from a click handler: the hit test
+        runs here, so no drag needs to be in progress. Pair with
+        `extractChunkBlock(vol, pick.chunkIndex)` to copy the picked brick out as a
+        standalone volume, and with `focusBox` (using `explodedMin`/`explodedMax`) to
+        outline it in place.
+
+        Parameters
+        ----------
+        client_x : number
+        client_y : number
+
+        Returns
+        -------
+        ExplodedBlockPick | null
+        """
+        return await self._request("pickExplodedBlock", _make_args(client_x, client_y))
 
     def rebake_chunked_overlays(self) -> None:
         """Re-bake the streamed/chunked overlays in place: drop their resident bricks so the next frame re-requests and re-bakes only the blocks in the current view frustum, leaving the base volume resident.
@@ -906,6 +998,11 @@ and its volumes alive."""
             Index of the volume to remove
         """
         self.send({"cmd": "removeVolume", "args": _make_args(volume_index)})
+
+    def reset_chunk_timing(self) -> None:
+        """Clear {@link chunkTimingStats} to start a fresh measurement window.
+        """
+        self.send({"cmd": "resetChunkTiming", "args": []})
 
     def reset_volume_affine(self, volume_index: Any) -> None:
         self.send({"cmd": "resetVolumeAffine", "args": _make_args(volume_index)})

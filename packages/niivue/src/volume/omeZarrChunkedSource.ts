@@ -26,6 +26,11 @@ import type {
   ChunkedVolumeFetch,
   ChunkedVolumeSource,
 } from './ChunkedVolumeSource'
+import {
+  recordChunkPhase,
+  timeChunkNetAsync,
+  timeChunkPhaseAsync,
+} from './chunkTiming'
 import { allocTypedArrayLike } from './omeZarr'
 import {
   type OmeZarrLoadOptions,
@@ -34,7 +39,37 @@ import {
   omeZarrNiftiDatatype,
   openOmeZarr,
 } from './omeZarrLoader'
+import {
+  OME_ZARR_PERSIST_BYTES,
+  openPersistentByteCache,
+  type PersistentByteCache,
+  type PersistentCacheOptions,
+  type PersistentCacheStats,
+  withPersistentBytes,
+} from './persistentByteCache'
 import { getBitsPerVoxel } from './utils'
+
+/** What a {@link ByteLruCache} has done since it was created or reset. */
+export interface ByteCacheStats {
+  /** Lookups that found a resident entry. */
+  hits: number
+  /** Lookups that did not, each of which became a store read. */
+  misses: number
+  /** Values admitted, absences included. */
+  admitted: number
+  /** Values refused because one alone exceeds the whole budget. */
+  rejected: number
+  /** Entries dropped to stay inside the budget. */
+  evicted: number
+  /** Bytes dropped by those evictions. */
+  evictedBytes: number
+  /** Entries resident now. */
+  entries: number
+  /** Bytes resident now (absences count 0). */
+  bytes: number
+  /** The budget those bytes are measured against. */
+  maxBytes: number
+}
 
 /**
  * A byte-bounded LRU cache for zarrita's `withByteCaching` store wrapper.
@@ -50,10 +85,19 @@ import { getBitsPerVoxel } from './utils'
  * resident entries are evicted for it). A budget of 0 therefore caches only
  * zero-byte absence entries; `Infinity` never evicts.
  *
+ * {@link stats} answers the question a byte budget always raises: is the
+ * budget too small, or is there simply no reuse in this access pattern? The
+ * two look identical from outside (both are all misses) and want opposite
+ * fixes, so the counters distinguish them — a run with many evictions and few
+ * hits is thrash, a run with few evictions and few hits has nothing to reuse.
+ * `has` is the gate `withByteCaching` consults before every read, so it is the
+ * one place a lookup is counted; `get` only runs after a hit.
+ *
  * ```ts
- * const store = zarr.withByteCaching(new zarr.FetchStore(url), {
- *   cache: new ByteLruCache(256 * 2 ** 20),
- * })
+ * const cache = new ByteLruCache(256 * 2 ** 20)
+ * const store = zarr.withByteCaching(new zarr.FetchStore(url), { cache })
+ * // ... stream ...
+ * const { hits, misses, evicted } = cache.stats
  * ```
  */
 export class ByteLruCache {
@@ -62,6 +106,12 @@ export class ByteLruCache {
     { value: Uint8Array | undefined; bytes: number }
   >()
   private total = 0
+  private hits = 0
+  private misses = 0
+  private admitted = 0
+  private rejected = 0
+  private evicted = 0
+  private evictedBytes = 0
 
   constructor(readonly maxBytes: number) {
     // Rejects NaN and negatives in one comparison; 0 and Infinity are valid.
@@ -77,8 +127,39 @@ export class ByteLruCache {
     return this.total
   }
 
+  /** A snapshot of {@link ByteCacheStats}. Cheap; take it every frame. */
+  get stats(): ByteCacheStats {
+    return {
+      hits: this.hits,
+      misses: this.misses,
+      admitted: this.admitted,
+      rejected: this.rejected,
+      evicted: this.evicted,
+      evictedBytes: this.evictedBytes,
+      entries: this.entries.size,
+      bytes: this.total,
+      maxBytes: this.maxBytes,
+    }
+  }
+
+  /** Zero the counters, keeping the resident entries. Starts a window. */
+  resetStats(): void {
+    this.hits = 0
+    this.misses = 0
+    this.admitted = 0
+    this.rejected = 0
+    this.evicted = 0
+    this.evictedBytes = 0
+  }
+
   has(key: string): boolean {
-    return this.entries.has(key)
+    const hit = this.entries.has(key)
+    if (hit) {
+      this.hits++
+    } else {
+      this.misses++
+    }
+    return hit
   }
 
   get(key: string): Uint8Array | undefined {
@@ -103,10 +184,12 @@ export class ByteLruCache {
     // not admit it, and do not evict resident entries to make room that will
     // not suffice. (The stale same-key entry was already dropped above.)
     if (bytes > this.maxBytes) {
+      this.rejected++
       return
     }
     this.entries.set(key, { value, bytes })
     this.total += bytes
+    this.admitted++
     // Every admitted entry fits the budget on its own, so evicting oldest
     // first always reaches totalBytes <= maxBytes by the time one entry is
     // left.
@@ -117,6 +200,8 @@ export class ByteLruCache {
       }
       this.entries.delete(oldest[0])
       this.total -= oldest[1].bytes
+      this.evicted++
+      this.evictedBytes += oldest[1].bytes
     }
   }
 }
@@ -133,6 +218,31 @@ export interface OmeZarrChunkedSourceOptions {
 export interface OmeZarrChunkedSource extends ChunkedVolumeSource {
   /** The opened store behind the adapter (levels, omero channels, axes). */
   readonly zarr: OmeZarrSource
+  /**
+   * The store-level byte cache, when one was built for this source. Present
+   * on {@link fetchOmeZarrChunkedSource} results with a non-zero budget, so a
+   * host can read {@link ByteLruCache.stats} to see whether the budget is
+   * doing anything; absent when the caller brought its own store.
+   */
+  readonly byteCache?: ByteLruCache
+  /**
+   * The byte cache's counters, wherever the cache lives. Prefer this over
+   * {@link byteCache} in a host that just wants to report a hit rate: with the
+   * chunk worker pool on there is no single `ByteLruCache` on this thread to
+   * read, and this returns the pool's caches summed instead.
+   */
+  readonly byteCacheStats?: () => ByteCacheStats
+  /**
+   * The persistent tier's counters, when one was opened for this source. Same
+   * arrangement as {@link byteCacheStats}: with the chunk worker pool on, the
+   * caches live on the workers and this sums them.
+   */
+  readonly persistStats?: () => PersistentCacheStats
+  /**
+   * Release what this source holds open. Terminates the chunk worker pool when
+   * one is running; a no-op otherwise. Safe to call more than once.
+   */
+  readonly dispose?: () => void
 }
 
 /**
@@ -194,7 +304,7 @@ async function readLevelRegion(
     return zarr.slice(z0, z0 + rz)
   })
 
-  const block = await zarr.get(array, selection)
+  const block = await zarr.get(array, selection, { signal: req.signal })
   if (typeof block !== 'object' || block === null || !('data' in block)) {
     throw new Error('OME-Zarr: reading a level region returned no block')
   }
@@ -224,6 +334,7 @@ async function readLevelRegion(
   }
 
   const out = allocTypedArrayLike(data, sx * sy * sz)
+  const assembleStart = performance.now()
   for (let z = 0; z < rz; z++) {
     for (let y = 0; y < ry; y++) {
       const src = z * strideZ + y * strideY
@@ -237,6 +348,7 @@ async function readLevelRegion(
       }
     }
   }
+  recordChunkPhase('assemble', performance.now() - assembleStart, expectedBytes)
   return new Uint8Array(out.buffer, out.byteOffset, expectedBytes)
 }
 
@@ -300,9 +412,43 @@ export function omeZarrChunkedSource(
             `the store holds ${bytesPerVoxel}`,
         )
       }
-      return readLevelRegion(source, channel, timepoint, req)
+      const expected =
+        req.texDims[0] * req.texDims[1] * req.texDims[2] * req.bytesPerVoxel
+      return timeChunkPhaseAsync(
+        'read',
+        () => readLevelRegion(source, channel, timepoint, req),
+        expected,
+      )
     },
   }
+}
+
+type StoreGet = zarr.AsyncReadable['get']
+type StoreGetRange = NonNullable<zarr.AsyncReadable['getRange']>
+
+/**
+ * Wrap a zarr store so every byte read is timed into the `net` phase of
+ * {@link chunkTimingSnapshot} — the network round trip, or the near-zero cost
+ * of a hit in the byte LRU when this wraps a cached store.
+ *
+ * It is a plain delegate rather than a subclass so it composes with
+ * `withByteCaching` in either order; put it OUTSIDE the cache to measure "time
+ * to get the bytes in hand" (cache hits then show up as the fast reads they
+ * are), and inside it to measure the origin alone. `getRange` is forwarded
+ * only when the wrapped store has it, so a sharded store keeps its range path.
+ *
+ * One `zarr.get` fans out to every store chunk covering the region, so these
+ * calls overlap; the timing they feed also maintains the `netBusyMs` union so
+ * that overlap does not multiply-count the same wall clock.
+ */
+export function withChunkTiming(store: zarr.AsyncReadable): zarr.AsyncReadable {
+  const get: StoreGet = (key, opts) =>
+    timeChunkNetAsync(() => store.get(key, opts))
+  const inner = store.getRange
+  if (!inner) return { get }
+  const getRange: StoreGetRange = (key, range, opts) =>
+    timeChunkNetAsync(() => inner.call(store, key, range, opts))
+  return { get, getRange }
 }
 
 /** Options for {@link fetchOmeZarrChunkedSource}. */
@@ -315,17 +461,53 @@ export interface FetchOmeZarrChunkedSourceOptions
    * remembered absent chunks). 0 disables caching. Default 256 MiB.
    */
   cacheBytes?: number
+  /**
+   * Chunk-reading workers to run. Omit for the default (half the reported
+   * cores, at most four); `0` keeps every read on the calling thread.
+   *
+   * With a pool running, `cacheBytes` is SPLIT across the workers rather than
+   * given to each, so the budget still bounds total memory. Ignored when
+   * `fetchImpl` is set (a function cannot cross to a worker) or where Workers
+   * are unavailable, and a read that fails for an infrastructure reason falls
+   * back to this thread.
+   */
+  workers?: number
+  /**
+   * Keep raw store bytes across sessions, so a reload streams from disk
+   * instead of the network. `true` takes the defaults; an object sizes and
+   * names the cache. Off by default: it writes to the user's disk, which is
+   * theirs to opt into.
+   *
+   * With a pool running, the budget is SPLIT across the workers the same way
+   * `cacheBytes` is, and they share one backing store. Requires a secure
+   * context with Cache Storage; where there is none, this is a no-op.
+   */
+  persist?: boolean | PersistentCacheOptions
 }
 
 /** Default byte budget for {@link fetchOmeZarrChunkedSource}'s store cache. */
 export const OME_ZARR_CHUNK_CACHE_BYTES = 256 * 2 ** 20
 
 /**
- * One-call convenience: open a store by URL with a byte-caching wrapper and
- * adapt it for `nv.loadChunkedVolume`. The opened pyramid stays reachable on
- * the result's `zarr` property (level metadata, omero channels).
+ * `Error.name` for a chunk read that failed on its own terms — a missing
+ * store, a region that will not decode. It marks the failures that re-running
+ * elsewhere would only repeat, so the worker path knows not to pay for the
+ * same read twice on the render thread.
  */
-export async function fetchOmeZarrChunkedSource(
+export const OME_ZARR_CHUNK_ERROR = 'OmeZarrChunkError'
+
+/**
+ * Open a store by URL with a byte-caching wrapper and adapt it for
+ * `nv.loadChunkedVolume`. The opened pyramid stays reachable on the result's
+ * `zarr` property (level metadata, omero channels).
+ *
+ * Every read runs on the CALLING thread. This is the primitive both sides of
+ * the worker pool are built from: {@link fetchOmeZarrChunkedSource} calls it
+ * to hold the metadata and to keep a fallback read path, and each chunk worker
+ * calls it to do the reading. Reach for it directly when you want a store with
+ * no pool behind it at all.
+ */
+export async function openOmeZarrChunkedSource(
   url: string,
   options: FetchOmeZarrChunkedSourceOptions = {},
 ): Promise<OmeZarrChunkedSource> {
@@ -333,9 +515,49 @@ export async function fetchOmeZarrChunkedSource(
   const base = options.fetchImpl
     ? new zarr.FetchStore(url, { fetch: options.fetchImpl })
     : new zarr.FetchStore(url)
-  const store =
-    cacheBytes > 0
-      ? zarr.withByteCaching(base, { cache: new ByteLruCache(cacheBytes) })
-      : base
-  return omeZarrChunkedSource(await openOmeZarr(store, options), options)
+  // Innermost of the three tiers: below memory, above the network. A read
+  // reaches it only when the byte LRU could not answer, and what it hands back
+  // is what the network would have -- raw, still-compressed store bytes.
+  const persistCache = await openPersistTier(options.persist)
+  const persisted = persistCache
+    ? withPersistentBytes(base, persistCache, url)
+    : base
+  const byteCache = cacheBytes > 0 ? new ByteLruCache(cacheBytes) : undefined
+  const cached = byteCache
+    ? zarr.withByteCaching(persisted, { cache: byteCache })
+    : persisted
+  // Outermost, so a byte-cache hit is measured as the fast read it is and the
+  // `net` phase answers "how long did it take to get these bytes in hand".
+  const store = withChunkTiming(cached)
+  const source: OmeZarrChunkedSource = omeZarrChunkedSource(
+    await openOmeZarr(store, options),
+    options,
+  )
+  const withPersist: OmeZarrChunkedSource = persistCache
+    ? { ...source, persistStats: () => persistCache.stats }
+    : source
+  if (!byteCache) return withPersist
+  return {
+    ...withPersist,
+    byteCache,
+    byteCacheStats: () => byteCache.stats,
+  }
+}
+
+/**
+ * Open the persistent tier a `persist` option asks for, or null. Null covers
+ * both "the caller did not ask" and "this context has no Cache Storage", which
+ * the read path treats identically: no tier, no change in behaviour.
+ */
+function openPersistTier(
+  persist: boolean | PersistentCacheOptions | undefined,
+): Promise<PersistentByteCache | null> {
+  if (!persist) return Promise.resolve(null)
+  const options = persist === true ? {} : persist
+  // Spread rather than pick: `scope` and `scopes` decide which keys this cache
+  // owns, and dropping them would hand every worker the whole store.
+  return openPersistentByteCache({
+    ...options,
+    maxBytes: options.maxBytes ?? OME_ZARR_PERSIST_BYTES,
+  })
 }

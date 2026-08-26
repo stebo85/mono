@@ -120,6 +120,128 @@ export const SLICE_TYPE = Object.freeze({
   NONE: 5,
 } as const)
 
+/** Accepted range for scene.gamma. 1 is the neutral no-op. */
+export const GAMMA_RANGE: [number, number] = [0.1, 10]
+
+/**
+ * Shader exponent for a user-facing display gamma: the shaders raise the
+ * classified RGB to this power, so gamma > 1 brightens (pow(rgb, 1/gamma) on a
+ * value in [0,1] moves it toward 1). Clamped away from 0 so a slider dragged to
+ * its floor cannot produce a division by zero or an infinite exponent.
+ */
+export function invGamma(gamma: number): number {
+  if (!Number.isFinite(gamma)) return 1
+  return 1 / Math.min(Math.max(gamma, GAMMA_RANGE[0]), GAMMA_RANGE[1])
+}
+
+/**
+ * Accepted range for volume.lodBrightnessCompensation. 0 disables it. Shares
+ * the range of LOD_OPACITY_RANGE so the two settings obey one rule.
+ */
+export const LOD_BRIGHTNESS_RANGE: [number, number] = [0, 1]
+
+/**
+ * COARSE BRICKS LOOK TOO DARK -> raise the coefficient. That is the whole rule;
+ * the rest is why.
+ *
+ * Shader exponent that compensates the brightness a coarse pyramid brick loses
+ * relative to the finest level, for a brick whose linear downsample factor is
+ * `downsample` (see `chunkLodDownsample`).
+ *
+ * Downsampling averages voxels, which destroys the correlation between a
+ * sample's colour and its opacity; since front-to-back compositing weights
+ * colour by opacity, the coarse brick integrates darker than the fine data it
+ * stands in for. Each pyramid level averages a fixed 2x2x2 neighbourhood, so
+ * the correlation is lost one comparable step PER LEVEL: the exponent falls
+ * below 1 (which brightens) in proportion to `log2(downsample)`.
+ *
+ * Growing it with `downsample - 1` instead - as this did until the deep-level
+ * measurements below - assumes level 4 loses eight times what level 1 does.
+ * Nothing about averaging works that way, and on a seven-level pyramid it ran
+ * away: the level-4 bricks and the whole-volume coarse floor both hit the 0.25
+ * clamp at the default coefficient, so a LOD boundary that should have been
+ * invisible read as a hard step with the COARSE side far too BRIGHT, and the
+ * floor flashed pale every time a refocus swapped the plan.
+ *
+ * This is still an EMPIRICAL heuristic, not a derivation: the true deficit
+ * depends on the intensity variance inside each coarse voxel, which is
+ * data-dependent, and no single global exponent nulls it everywhere. What the
+ * per-level form buys is that the correction stays monotonic and gentle over
+ * the whole useful range instead of saturating, so the coefficient is safe to
+ * turn up on data that needs more. Set it to 0 to disable it.
+ *
+ * Useful magnitudes are SMALL: the default is 0.08 per level and 0.2 is already
+ * strong. The returned exponent is floored at 0.25 so a deep level cannot blow
+ * out, which is why the accepted range runs to 1 without the top end being
+ * useful.
+ * Applies only to a multi-LOD chunked volume; on anything else it is an exact
+ * no-op (ask `nv.lodCompensation()` whether it is doing anything).
+ */
+export function lodGammaExponent(
+  downsample: number,
+  coefficient: number,
+): number {
+  if (!Number.isFinite(downsample) || !Number.isFinite(coefficient)) return 1
+  if (downsample <= 1 || coefficient <= 0) return 1
+  const beta = Math.min(coefficient, LOD_BRIGHTNESS_RANGE[1])
+  // Floored so a brick from a very deep pyramid level cannot be blown out.
+  return Math.max(0.25, 1 - beta * Math.log2(downsample))
+}
+
+/** Accepted range for volume.lodOpacityCompensation. 0 disables it. */
+export const LOD_OPACITY_RANGE: [number, number] = [0, 1]
+
+/** Ceiling on the returned scale, so a deep pyramid level cannot go fully opaque. */
+const LOD_OPACITY_MAX_SCALE = 8
+
+/**
+ * COARSE BRICKS LOOK TOO TRANSPARENT (not too dark) -> raise the coefficient.
+ * If they look too dark, use `lodGammaExponent` instead. That is the whole
+ * rule; the rest is why.
+ *
+ * Multiplier on a coarse brick's step-size opacity exponent, for a brick whose
+ * linear downsample factor is `downsample` (see `chunkLodDownsample`).
+ *
+ * The ray-march already corrects for a coarse brick taking fewer, longer steps:
+ * each sample's alpha is raised to the number of reference steps it stands for,
+ * `a' = 1 - (1-a)^k`. That is exact only if the coarse voxel is HOMOGENEOUS.
+ * It is not: the true transmittance through the k fine voxels it replaces is
+ * `prod(1-a_i)`, and since `log(1-a)` is concave that product is SMALLER than
+ * `(1-mean(a))^k`. So a coarse brick is systematically too see-through, by an
+ * amount set by the intensity variance inside the coarse voxel. This scales the
+ * exponent by `1 + c*(k-1)` to push it back.
+ *
+ * DEFAULT 0 (off), and that is a measured choice, not an oversight. Simulating
+ * the march over a real OME-Zarr pyramid says the variance term is ~0 wherever
+ * the structure is dense enough to saturate the ray: those regions already
+ * integrate the right alpha, and inflating it only front-loads the march onto
+ * the nearer, dimmer samples, which makes the accumulated COLOUR worse. Over
+ * four probe regions, raising `c` from 0 to 0.5 cut mean alpha error from 6.7%
+ * to 5.1% while driving colour error from 15.3% to 25.7%. Only sparse, thin
+ * material has a real alpha deficit, and no single global scale recovers much
+ * of it (a -30% deficit improves to -30.6% at c=0.5) because the correction
+ * needs the per-voxel variance that mean-downsampling threw away.
+ *
+ * It is exposed because the trade is data-dependent: a volume that is mostly
+ * thin structure gets more from the alpha than it loses on the colour. Use
+ * `volumeLodBrightnessCompensation` first; reach for this only if coarse bricks
+ * still look too transparent rather than too dark.
+ *
+ * Ray-march only. A 2D slice tile shows ONE sample with no accumulation, so
+ * there is no aggregated alpha to correct there. Applies only to a multi-LOD
+ * chunked volume; on anything else it is an exact no-op (ask
+ * `nv.lodCompensation()` whether it is doing anything).
+ */
+export function lodOpacityScale(
+  downsample: number,
+  coefficient: number,
+): number {
+  if (!Number.isFinite(downsample) || !Number.isFinite(coefficient)) return 1
+  if (downsample <= 1 || coefficient <= 0) return 1
+  const c = Math.min(coefficient, LOD_OPACITY_RANGE[1])
+  return Math.min(LOD_OPACITY_MAX_SCALE, 1 + c * (downsample - 1))
+}
+
 /** Maps AXIAL→2, CORONAL→1, SAGITTAL→0 (the RAS dimension perpendicular to the slice). */
 export function sliceTypeDim(sliceType: number): number {
   if (sliceType === SLICE_TYPE.CORONAL) return 1
@@ -191,7 +313,7 @@ export const UI_DEFAULTS: UIConfig = {
   placeholderText: 'No image loaded',
   crosshairColor: [1.0, 0, 0, 1.0],
   crosshairGap: 10,
-  crosshairWidth: 1,
+  crosshairWidth: 2,
   fontColor: [0.5, 0.5, 0.5, 1],
   fontScale: 0.4,
   fontMinSize: 13,
@@ -222,6 +344,10 @@ export const VOLUME_DEFAULTS: VolumeRenderConfig = {
   paqdUniforms: [0.01, 0.5, 0.25, 0.4] as [number, number, number, number],
   transmittanceCutoff: 0.95,
   renderMode: VOLUME_RENDER_MODE.COMPOSITE,
+  sampleRate: 2,
+  isCubicInterpolation: false,
+  lodBrightnessCompensation: 0.08,
+  lodOpacityCompensation: 0,
 }
 
 export const MESH_DEFAULTS: MeshRenderConfig = {

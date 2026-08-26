@@ -1042,6 +1042,17 @@
       "doc": null
     },
     {
+      "jsName": "volumeIsCubicInterpolation",
+      "pyName": "volume_is_cubic_interpolation",
+      "tsType": "boolean",
+      "pyTraitlet": {
+        "kind": "Bool"
+      },
+      "hasGetter": true,
+      "hasSetter": true,
+      "doc": null
+    },
+    {
       "jsName": "volumeIsNearestInterpolation",
       "pyName": "volume_is_nearest_interpolation",
       "tsType": "boolean",
@@ -1058,6 +1069,28 @@
       "tsType": "boolean",
       "pyTraitlet": {
         "kind": "Bool"
+      },
+      "hasGetter": true,
+      "hasSetter": true,
+      "doc": null
+    },
+    {
+      "jsName": "volumeLodBrightnessCompensation",
+      "pyName": "volume_lod_brightness_compensation",
+      "tsType": "number",
+      "pyTraitlet": {
+        "kind": "Float"
+      },
+      "hasGetter": true,
+      "hasSetter": true,
+      "doc": null
+    },
+    {
+      "jsName": "volumeLodOpacityCompensation",
+      "pyName": "volume_lod_opacity_compensation",
+      "tsType": "number",
+      "pyTraitlet": {
+        "kind": "Float"
       },
       "hasGetter": true,
       "hasSetter": true,
@@ -1103,6 +1136,17 @@
     {
       "jsName": "volumeRenderMode",
       "pyName": "volume_render_mode",
+      "tsType": "number",
+      "pyTraitlet": {
+        "kind": "Float"
+      },
+      "hasGetter": true,
+      "hasSetter": true,
+      "doc": null
+    },
+    {
+      "jsName": "volumeSampleRate",
+      "pyName": "volume_sample_rate",
       "tsType": "number",
       "pyTraitlet": {
         "kind": "Float"
@@ -1612,8 +1656,18 @@
       "isAsync": false,
       "returnsValue": true,
       "params": [],
-      "returns": "{ resident: number; pending: number; inFlight: number; total: number; } | null",
-      "doc": "Streaming stats across all chunked volumes (base + independent overlay) on\nthe active backend: `{ resident, pending, inFlight, total }` brick counts.\nReturns null before a view is attached. Useful for HUD / debug overlays:\n`resident < total` with `pending > 0` for many frames indicates the working\nset exceeds the residency budget (thrashing).",
+      "returns": "{ resident: number; pending: number; inFlight: number; total: number; staleDropped: number; predicted: number; decoded: DecodedChunkStats; } | null",
+      "doc": "Streaming stats across all chunked volumes (base + independent overlay) on\nthe active backend: `{ resident, pending, inFlight, total, staleDropped }`\nbrick counts. Returns null before a view is attached. Useful for HUD / debug\noverlays: `resident < total` with `pending > 0` for many frames indicates the\nworking set exceeds the residency budget (thrashing).\n\n`staleDropped` is cumulative, not per frame: queued uploads retired because\nthe view moved on before they ran. It climbing during a pan or rotate is the\nqueue working as intended, since that work would otherwise have uploaded\nbricks for viewports the user had already left.\n\n`predicted` is also cumulative: source reads started AHEAD of the working\nset, from the direction the view is travelling. Those never enter the\nupload queue, so they show up here and in the source's byte-cache hit rate\nrather than in `resident`.\n\n`decoded` is the decoded-chunk tier summed over every chunked volume: the\nCPU-side source bytes a brick is demoted to when the GPU evicts it. Its\nhits are source reads that skipped the network AND the decode entirely,\ncosting only a texture upload; `bytes` / `maxBytes` is how full it is.",
+      "returnsDoc": null
+    },
+    {
+      "jsName": "chunkTimingStats",
+      "pyName": "chunk_timing_stats",
+      "isAsync": false,
+      "returnsValue": true,
+      "params": [],
+      "returns": "ChunkTimingSnapshot",
+      "doc": "Where a streamed brick's time actually goes: bytes over the wire, the work\nof turning them into a texture, and how much of that blocked the render\nloop. Returns the process-wide totals since the last\n{@link resetChunkTiming} — the recorder is a module-level singleton, so\nthis aggregates every chunked volume on every instance in the page, not\njust this one.\n\n`mainThreadMs` (assemble + upload + gradient) is the figure that decides\nwhether a decode worker is worth building, and `netBusyMs` is network wall\nclock with overlapping reads counted once. Phase definitions and the\naccuracy of each number are in `src/volume/chunkTiming.ts`.",
       "returnsDoc": null
     },
     {
@@ -2087,7 +2141,7 @@
         }
       ],
       "returns": "Promise<NVChunkedVolume>",
-      "doc": "Load a multi-resolution (pyramid) volume from a pluggable\n{@link ChunkedVolumeSource} and render it with crosshair-focused level of\ndetail: the finest bricks stay around the crosshair while distant regions\nrender coarser, all under a brick/VRAM budget, so a very large finest level\n(e.g. a 20+ GB whole-slide/OME-Zarr volume) is renderable without ever\nmaking it fully resident. Returns an {@link NVChunkedVolume} handle\n(`setFocus` / `setMaxDetail` / `setBudget` / `dispose`); with the default\n`focus: 'crosshair'` it follows the crosshair automatically.\n\nADDITIVE: the streamed volume is ADDED to the scene (via `addVolume`), not\nswapped for the current volumes. To reload/replace a streamed volume, the\ncaller removes the previous one first.",
+      "doc": "Load a multi-resolution (pyramid) volume from a pluggable\n{@link ChunkedVolumeSource} and render it with crosshair-focused level of\ndetail: the finest bricks stay around the crosshair while distant regions\nrender coarser, all under a brick/VRAM budget, so a very large finest level\n(e.g. a 20+ GB whole-slide/OME-Zarr volume) is renderable without ever\nmaking it fully resident. Returns an {@link NVChunkedVolume} handle\n(`setFocus` / `setMaxDetail` / `setBudget` / `dispose`); with the default\n`focus: 'crosshair'` it follows the crosshair automatically.\n\nADDITIVE: the streamed volume is ADDED to the scene (via `addVolume`), not\nswapped for the current volumes. To reload/replace a streamed volume, the\ncaller removes the previous one first. Because the outgoing volume is still\nthe base while this runs, a reload should call\n{@link NVChunkedVolume.applyCoarseFloor} once it has removed it.\n\nUnless the `coarseFloor` option turns it off, the coarsest pyramid level is\nalso installed as the base coarse floor (see\n{@link NiiVue.setBaseCoarseFloor}), so regions whose bricks are not yet\nresident show coarse detail instead of the scene background.",
       "returnsDoc": null
     },
     {
@@ -2274,6 +2328,16 @@
       "returnsDoc": null
     },
     {
+      "jsName": "lodCompensation",
+      "pyName": "lod_compensation",
+      "isAsync": false,
+      "returnsValue": true,
+      "params": [],
+      "returns": "LodCompensationReport",
+      "doc": "What the two LOD compensation settings are actually doing right now.\n\n`volumeLodBrightnessCompensation` and `volumeLodOpacityCompensation` only\naffect bricks fetched from a COARSE level of a multi-LOD chunked volume, so\non an ordinary volume they are exact no-ops with nothing on screen to say\nso. This is the way to check: `isActive` answers \"is anything being\ncompensated\", `inactiveReason` says why not, and each level reports the\nexponent and scale being handed to the shader for its bricks.\n\n```js\nconst report = nv.lodCompensation()\nif (!report.isActive) console.log(report.inactiveReason)\nfor (const each of report.levels) {\n  console.log(each.level, each.downsample, each.brickCount, each.brightnessExponent)\n}\n```\n\nReads the background volume (`volumes[0]`), which is the volume both\nsettings act on. Cheap enough to call per frame for a debug HUD.",
+      "returnsDoc": null
+    },
+    {
       "jsName": "markDrawDirty",
       "pyName": "mark_draw_dirty",
       "isAsync": false,
@@ -2420,6 +2484,29 @@
       ],
       "returns": "Promise<void>",
       "doc": "Move a volume up one index position in the stack of loaded volumes (toward the top layer).",
+      "returnsDoc": null
+    },
+    {
+      "jsName": "pickExplodedBlock",
+      "pyName": "pick_exploded_block",
+      "isAsync": false,
+      "returnsValue": true,
+      "params": [
+        {
+          "name": "clientX",
+          "tsType": "number",
+          "optional": false,
+          "doc": null
+        },
+        {
+          "name": "clientY",
+          "tsType": "number",
+          "optional": false,
+          "doc": null
+        }
+      ],
+      "returns": "ExplodedBlockPick | null",
+      "doc": "Resolve a pointer position over the 3D render onto one exploded brick of a\nchunked volume, or null when the point misses every visible brick.\n\nPass `event.clientX` / `event.clientY` from a click handler: the hit test\nruns here, so no drag needs to be in progress. Pair with\n`extractChunkBlock(vol, pick.chunkIndex)` to copy the picked brick out as a\nstandalone volume, and with `focusBox` (using `explodedMin`/`explodedMax`) to\noutline it in place.",
       "returnsDoc": null
     },
     {
@@ -2621,6 +2708,16 @@
       ],
       "returns": "Promise<void>",
       "doc": "Remove a single volume by index, emitting `volumeRemoved`.",
+      "returnsDoc": null
+    },
+    {
+      "jsName": "resetChunkTiming",
+      "pyName": "reset_chunk_timing",
+      "isAsync": false,
+      "returnsValue": false,
+      "params": [],
+      "returns": "void",
+      "doc": "Clear {@link chunkTimingStats} to start a fresh measurement window.",
       "returnsDoc": null
     },
     {

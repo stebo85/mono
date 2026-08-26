@@ -11,6 +11,7 @@ import {
 } from '@/slide/tileTextureCache'
 import type { UIKitOverlayFrame } from '@/view/NVOverlayHook'
 import { NVRenderer } from '@/view/NVRenderer'
+import { timeChunkPhase } from '@/volume/chunkTiming'
 import { Shader } from './shader'
 import { slideFragShader, slideVertShader } from './slideShader'
 
@@ -141,8 +142,40 @@ export class SlideRenderer extends NVRenderer {
         false,
       )
       const visible = slide.requestVisibleTiles(screen)
+      // Coarser levels first, painted UNDER the target level. Non-empty only
+      // while target tiles are still arriving, so the previous resolution stays
+      // on screen and is overpainted tile by tile as the finer data lands.
+      // No tile grid here: the grid describes the target level.
+      for (const item of visible.fallback) {
+        const bitmap = slide.cachedTileBitmap(item.key)
+        if (!bitmap) continue
+        const texture = this.textureForBitmap(gl, item.key, bitmap)
+        if (!texture) continue
+        this.drawTile(
+          gl,
+          width,
+          height,
+          {
+            x: item.screenX,
+            y: item.screenY,
+            width: item.screenWidth,
+            height: item.screenHeight,
+          },
+          texture.texture,
+          slide.placeholderColor,
+          slide.gridColor,
+          slide.opacity,
+          item,
+          false,
+          false,
+        )
+      }
       for (const item of visible.tiles) {
         const bitmap = slide.cachedTileBitmap(item.key)
+        // A missing tile draws a flat placeholder ONLY when nothing coarser is
+        // behind it; otherwise the placeholder would hide the very fallback
+        // layer that is standing in for it.
+        if (!bitmap && visible.fallback.length > 0) continue
         const texture = bitmap
           ? this.textureForBitmap(gl, item.key, bitmap)
           : null
@@ -233,7 +266,23 @@ export class SlideRenderer extends NVRenderer {
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE)
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE)
     gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false)
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, bitmap)
+    const bytes = bitmap.width * bitmap.height * 4
+    // Timed as `upload` alongside the volume path's brick uploads: a slide tile
+    // and a volume brick are two consumers of the same streamed source, and
+    // both pay their texture cost on this thread.
+    timeChunkPhase(
+      'upload',
+      () =>
+        gl.texImage2D(
+          gl.TEXTURE_2D,
+          0,
+          gl.RGBA,
+          gl.RGBA,
+          gl.UNSIGNED_BYTE,
+          bitmap,
+        ),
+      bytes,
+    )
     const entry = { texture, width: bitmap.width, height: bitmap.height }
     this._textures.set(key, entry, bitmap.width * bitmap.height * 4)
     return entry

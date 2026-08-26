@@ -68,6 +68,16 @@ export class NVWorker {
     })
   }
 
+  /**
+   * Send a message that expects no reply. Use it for out-of-band signals about
+   * work already in flight — a cancellation, say — where waiting for a
+   * response would defeat the point. The worker is created if it does not
+   * exist yet, so a notify that arrives before any `execute` is not lost.
+   */
+  notify(payload: Record<string, unknown>): void {
+    this.getOrCreate().postMessage(payload)
+  }
+
   /** Terminate the worker and reject all outstanding promises. */
   terminate(): void {
     if (this.worker) {

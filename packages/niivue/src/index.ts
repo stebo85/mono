@@ -109,6 +109,8 @@ export type {
   CustomLayoutTile,
   DragReleaseInfo,
   ImageFromUrlOptions,
+  LodCompensationLevel,
+  LodCompensationReport,
   MeasurementScreenLine,
   MeshFromUrlOptions,
   MeshLayerFromUrlOptions,
@@ -198,6 +200,11 @@ export type { SlidePlaneTile } from './slide/slidePlane'
 export { axialPlaneTransform, slidePlaneTiles } from './slide/slidePlane'
 export type { SlideVectorKind, SlideVectorShape } from './slide/slideVector'
 export { SlideVectorLayer } from './slide/slideVector'
+export type {
+  VolumeSliceAxis,
+  VolumeSliceSourceOptions,
+} from './slide/volumeSliceSource'
+export { VolumeSliceSource } from './slide/volumeSliceSource'
 export { buildDrawingLut, drawingBitmapToRGBA } from './view/NVDrawingTexture'
 // Allen "volume-viewer" JSON + PNG atlas datasets (multi-channel microscopy)
 export {
@@ -243,8 +250,38 @@ export type {
   VolumeChunkDesc,
 } from './volume/chunking'
 export { chunkVolumeGrid, chunkVolumeMultiLOD } from './volume/chunking'
+// Chunk-streaming phase timing (docs/caching.md stage B)
+export {
+  type ChunkPhase,
+  type ChunkPhaseTiming,
+  type ChunkTimingSnapshot,
+  chunkTimingSnapshot,
+  mergeOffThreadChunkTiming,
+  type OffThreadChunkTiming,
+  recordChunkPhase,
+  resetChunkTiming,
+} from './volume/chunkTiming'
+// Exploded-block picking: resolve a click on an exploded brick, then copy that
+// brick out as a standalone volume that keeps the parent's anatomical frame.
+export type { ExplodedBlockPick } from './control/interactions'
+export { pickExplodedBlock } from './control/interactions'
+export type { ExtractedSubVolume } from './volume/ChunkExtract'
+export {
+  extractChunkBlock,
+  extractSubVolume,
+  subVolumeAffine,
+} from './volume/ChunkExtract'
 // MRSI (spatial spectroscopic imaging) volume helpers
 export { buildDerivedScalarVolume, isMrsiVolume } from './volume/mrsi'
+// Budget plans: the policy that shapes a streamed volume's octree
+export {
+  type BudgetPlan,
+  type BudgetPlanName,
+  type BudgetPlanOptions,
+  type BudgetPlanSpec,
+  BUDGET_PLANS,
+  resolveBudgetPlan,
+} from './volume/budgetPlans'
 export {
   type ChunkedVolumeOptions,
   NVChunkedVolume,
@@ -289,15 +326,32 @@ export {
   parseOmeZarrAttrs,
 } from './volume/omeZarr'
 // OME-Zarr chunk-streaming adapter for nv.loadChunkedVolume
+export { fetchOmeZarrChunkedSource } from './volume/fetchOmeZarrChunkedSource'
 export {
+  type ByteCacheStats,
   ByteLruCache,
   type FetchOmeZarrChunkedSourceOptions,
-  fetchOmeZarrChunkedSource,
   OME_ZARR_CHUNK_CACHE_BYTES,
+  OME_ZARR_CHUNK_ERROR,
   type OmeZarrChunkedSource,
   type OmeZarrChunkedSourceOptions,
   omeZarrChunkedSource,
+  openOmeZarrChunkedSource,
+  withChunkTiming,
 } from './volume/omeZarrChunkedSource'
+export type { OmeZarrChunkPoolOptions } from './volume/omeZarrChunkWorkerPool'
+export {
+  clearPersistentByteCaches,
+  OME_ZARR_PERSIST_BYTES,
+  openCacheStorageBacking,
+  openPersistentByteCache,
+  PERSISTENT_CACHE_NAME,
+  PersistentByteCache,
+  type PersistentCacheBacking,
+  type PersistentCacheOptions,
+  type PersistentCacheStats,
+  withPersistentBytes,
+} from './volume/persistentByteCache'
 export {
   defaultOmeZarrLevel,
   fetchOmeZarr,

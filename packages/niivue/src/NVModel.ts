@@ -321,6 +321,18 @@ export default class NVModel {
       ...(options.volumeRenderMode !== undefined && {
         renderMode: options.volumeRenderMode,
       }),
+      ...(options.volumeSampleRate !== undefined && {
+        sampleRate: options.volumeSampleRate,
+      }),
+      ...(options.volumeIsCubicInterpolation !== undefined && {
+        isCubicInterpolation: options.volumeIsCubicInterpolation,
+      }),
+      ...(options.volumeLodBrightnessCompensation !== undefined && {
+        lodBrightnessCompensation: options.volumeLodBrightnessCompensation,
+      }),
+      ...(options.volumeLodOpacityCompensation !== undefined && {
+        lodOpacityCompensation: options.volumeLodOpacityCompensation,
+      }),
     }
     // Mesh — flat options mapped to mesh group
     this.mesh = {

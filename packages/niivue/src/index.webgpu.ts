@@ -2,8 +2,13 @@
  * NiiVue — WebGPU-only distribution.
  */
 
+// biome-ignore-all lint/performance/noBarrelFile: package entry point
+
+// Exploded-block picking: resolve a click on an exploded brick, then copy that
+// brick out as a standalone volume that keeps the parent's anatomical frame.
+export type { ExplodedBlockPick } from './control/interactions'
+export { pickExplodedBlock } from './control/interactions'
 export type { NVCanvasViewportControllerOptions } from './control/NVCanvasViewportController'
-// biome-ignore lint/performance/noBarrelFile: package entry point
 export { NVExtensionContext } from './extension/context'
 export type {
   BackgroundVolumeAccess,
@@ -46,6 +51,8 @@ export type {
   CustomLayoutTile,
   DragReleaseInfo,
   ImageFromUrlOptions,
+  LodCompensationLevel,
+  LodCompensationReport,
   MeasurementScreenLine,
   MeshFromUrlOptions,
   MeshLayerFromUrlOptions,
@@ -117,6 +124,21 @@ export {
   fetchAllenAtlasInfo,
   loadAllenAtlasVolumes,
 } from './volume/allenAtlasLoader'
+// Budget plans: the policy that shapes a streamed volume's octree
+export {
+  BUDGET_PLANS,
+  type BudgetPlan,
+  type BudgetPlanName,
+  type BudgetPlanOptions,
+  type BudgetPlanSpec,
+  resolveBudgetPlan,
+} from './volume/budgetPlans'
+export type { ExtractedSubVolume } from './volume/ChunkExtract'
+export {
+  extractChunkBlock,
+  extractSubVolume,
+  subVolumeAffine,
+} from './volume/ChunkExtract'
 // Crosshair-focused multi-resolution (multi-LOD) streamed volumes
 export type {
   ChunkedVolumeFetch,
@@ -137,6 +159,19 @@ export type {
   VolumeChunkDesc,
 } from './volume/chunking'
 export { chunkVolumeGrid, chunkVolumeMultiLOD } from './volume/chunking'
+// Chunk-streaming phase timing (docs/caching.md stage B)
+export {
+  type ChunkPhase,
+  type ChunkPhaseTiming,
+  type ChunkTimingSnapshot,
+  chunkTimingSnapshot,
+  mergeOffThreadChunkTiming,
+  type OffThreadChunkTiming,
+  recordChunkPhase,
+  resetChunkTiming,
+} from './volume/chunkTiming'
+// OME-Zarr chunk-streaming adapter for nv.loadChunkedVolume
+export { fetchOmeZarrChunkedSource } from './volume/fetchOmeZarrChunkedSource'
 // MRSI (spatial spectroscopic imaging) volume helpers
 export { buildDerivedScalarVolume, isMrsiVolume } from './volume/mrsi'
 export {
@@ -179,16 +214,19 @@ export {
   parseOmeroColor,
   parseOmeZarrAttrs,
 } from './volume/omeZarr'
-// OME-Zarr chunk-streaming adapter for nv.loadChunkedVolume
 export {
+  type ByteCacheStats,
   ByteLruCache,
   type FetchOmeZarrChunkedSourceOptions,
-  fetchOmeZarrChunkedSource,
   OME_ZARR_CHUNK_CACHE_BYTES,
+  OME_ZARR_CHUNK_ERROR,
   type OmeZarrChunkedSource,
   type OmeZarrChunkedSourceOptions,
   omeZarrChunkedSource,
+  openOmeZarrChunkedSource,
+  withChunkTiming,
 } from './volume/omeZarrChunkedSource'
+export type { OmeZarrChunkPoolOptions } from './volume/omeZarrChunkWorkerPool'
 export {
   defaultOmeZarrLevel,
   fetchOmeZarr,
@@ -207,6 +245,18 @@ export {
   omeZarrVolumesFrom,
   openOmeZarr,
 } from './volume/omeZarrLoader'
+export {
+  clearPersistentByteCaches,
+  OME_ZARR_PERSIST_BYTES,
+  openCacheStorageBacking,
+  openPersistentByteCache,
+  PERSISTENT_CACHE_NAME,
+  PersistentByteCache,
+  type PersistentCacheBacking,
+  type PersistentCacheOptions,
+  type PersistentCacheStats,
+  withPersistentBytes,
+} from './volume/persistentByteCache'
 export {
   createStreamingNVImage,
   type StreamingVolumeSpec,

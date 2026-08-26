@@ -38,6 +38,7 @@ import {
   chunksCrossingSlice,
   identityChunkSampleTransform,
 } from '@/volume/chunking'
+import type { DecodedChunkStats } from '@/volume/decodedChunkCache'
 import { GLBench } from './bench'
 import { ColorbarRenderer } from './colorbar'
 import { CrosshairRenderer } from './crosshair'
@@ -106,6 +107,17 @@ export default class NVGlview {
    * can draw into the same frame in screen space. See view/NVOverlayHook.ts.
    */
   overlayDraw: ((frame: UIKitOverlayFrame) => void) | null = null
+
+  /**
+   * GPU-context-recovery hook, wired by the controller. Fires when this view has
+   * become unusable because the GPU dropped its context (typically VRAM
+   * exhaustion) AND a replacement is available. Every GPU object this view
+   * created died with the old context, so the only valid response is a full view
+   * rebuild — which the view cannot do itself. On WebGL2 it fires on
+   * 'webglcontextrestored' (the browser owns the replacement); the WebGPU mirror
+   * fires straight from `device.lost`. See NVControlBase._onGpuContextLost.
+   */
+  onContextLost: (() => void) | null = null
   // Narrow public getters for bench.ts to read current render-area size
   // without making the backing fields public or mutable.
   get boundsWidth(): number {
@@ -218,17 +230,12 @@ export default class NVGlview {
     // Surface a lost WebGL context (commonly GPU VRAM exhaustion — e.g. too many
     // large streamed chunks resident at once) instead of a silently white
     // canvas, and stop driving the render loop once lost.
+    // preventDefault() is what makes the browser promise a later
+    // 'webglcontextrestored'; without it the context stays dead forever.
+    this.canvas.addEventListener('webglcontextlost', this._handleContextLost)
     this.canvas.addEventListener(
-      'webglcontextlost',
-      (event) => {
-        event.preventDefault()
-        this._contextLost = true
-        log.error(
-          'WebGL2 context lost — likely GPU out of memory. Reduce ' +
-            'maxChunkResidencyBytes or use a coarser level.',
-        )
-      },
-      { once: true },
+      'webglcontextrestored',
+      this._handleContextRestored,
     )
     let renderer = ''
     let vendor = ''
@@ -285,6 +292,13 @@ export default class NVGlview {
         ? residencyOverride
         : undefined
     await this.volumeRenderer.init(gl, chunkLimit, chunkResidencyBytes)
+    // `chunkFadeMs`, when set, overrides how long a freshly-streamed chunk
+    // dissolves in over the coarse floor; 0 disables the fade, so 0 is a
+    // meaningful value and only a negative/NaN setting falls back to the default.
+    const fadeMs = this.options.chunkFadeMs
+    if (typeof fadeMs === 'number' && fadeMs >= 0) {
+      this.volumeRenderer.chunkFadeMs = fadeMs
+    }
     // Initialize crosshair renderer with pre-allocated buffers
     const attrs = mesh.getAttributeLocations(gl, 'phong')
     this.crosshairRenderer.init(
@@ -502,6 +516,28 @@ export default class NVGlview {
     // Composite (OVER) vs maximum-intensity projection, for every volume pass this
     // frame (base, overlay, PAQD, drawing, and the independent hi-res overlay cube).
     this.volumeRenderer.renderMode = md.volume.renderMode
+    // Ray samples per voxel in the 3D fine march (anti-aliasing vs fragment cost).
+    this.volumeRenderer.sampleRate = md.volume.sampleRate
+    // Tricubic B-spline reconstruction in the fine march (8 fetches vs 1).
+    this.volumeRenderer.isCubicInterpolation = md.volume.isCubicInterpolation
+    // Display gamma for the classified RGB of every volume sample (alpha, and
+    // therefore occlusion, is untouched).
+    this.volumeRenderer.gamma = md.scene.gamma
+    // Per-level brightness compensation for coarse multi-LOD bricks. Folds into
+    // the same shader exponent as `gamma`, but per chunk, so it is a no-op for
+    // single-level and non-chunked volumes whatever the coefficient.
+    this.volumeRenderer.lodBrightnessCompensation =
+      md.volume.lodBrightnessCompensation
+    // Per-level opacity compensation. Ray-march only: the slice renderer shows
+    // one sample per tile with no accumulation, so there is no aggregated alpha
+    // to correct there.
+    this.volumeRenderer.lodOpacityCompensation =
+      md.volume.lodOpacityCompensation
+    // 2D slice tiles read the same two exponents so a slice and the 3D render
+    // panel agree on brightness.
+    this.sliceRenderer.gamma = md.scene.gamma
+    this.sliceRenderer.lodBrightnessCompensation =
+      md.volume.lodBrightnessCompensation
     // Off-screen after viewport transform: skip the entire render pass — scissor would
     // clip everything and the work is wasted. preserveDrawingBuffer keeps prior pixels.
     if (this._isSubCanvasBounds && this._isBoundsOffscreen) return
@@ -616,10 +652,8 @@ export default class NVGlview {
       screenSlices = fit.screenSlices
       this.screenSlices = screenSlices
     }
-    // Update crosshair geometry based on current model state
-    if (this.crosshairRenderer.isReady) {
-      this.crosshairRenderer.update(md)
-    }
+    // Crosshair geometry is rebuilt per tile rather than once per frame: its
+    // radius is a screen weight, so it depends on the tile's mm-per-pixel.
     const ann3DData = md.annotation.isVisibleIn3D
       ? NVAnnotation.buildAnnotation3DRenderData(md)
       : null
@@ -963,6 +997,9 @@ export default class NVGlview {
             md.scene.isClipPlaneCutaway,
             md.volume.paqdUniforms,
             md.volume.transmittanceCutoff,
+            // This tile's background volume, which is not always volumes[0]
+            // (a global3d tile binds its own).
+            vol.opacity ?? 1,
           )
           // Independent hi-res chunked overlay: stream its own working set and
           // draw it as translucent cubes over the base, in the same pass. Uses
@@ -997,12 +1034,17 @@ export default class NVGlview {
       // Layer 2a: Crosshairs (skip on all mosaic tiles)
       const isMosaicTile =
         tile.renderOrientation !== undefined || tile.sliceMM !== undefined
-      if (
+      const chRadiusMM =
         tile.space !== 'global3d' &&
         md.ui.is3DCrosshairVisible &&
         !isMosaicTile &&
         this.crosshairRenderer.isReady
-      ) {
+          ? NVSliceLayout.crosshairRadiusMM(md, tile)
+          : 0
+      // A zero radius is either crosshairWidth: 0 or a degenerate tile; both
+      // mean there is nothing to draw.
+      if (chRadiusMM > 0) {
+        this.crosshairRenderer.update(md, chRadiusMM)
         this.crosshairRenderer.draw(
           gl,
           mvpMatrix as Float32Array,
@@ -1070,12 +1112,8 @@ export default class NVGlview {
       const xrayAlpha = md.mesh.xRay
       if (xrayAlpha > 0) {
         // Re-draw crosshairs with xray (skip on all mosaic tiles and global3d)
-        if (
-          tile.space !== 'global3d' &&
-          md.ui.is3DCrosshairVisible &&
-          !isMosaicTile &&
-          this.crosshairRenderer.isReady
-        ) {
+        // The geometry still holds this tile's radius from Layer 2a.
+        if (chRadiusMM > 0) {
           this.crosshairRenderer.drawXRay(
             gl,
             mvpMatrix as Float32Array,
@@ -1659,12 +1697,19 @@ export default class NVGlview {
     pending: number
     inFlight: number
     total: number
+    staleDropped: number
+    predicted: number
+    decoded: DecodedChunkStats
   } {
     return this.volumeRenderer.chunkStreamStats()
   }
 
   rebakeChunkedOverlays(): void {
     this.volumeRenderer.rebakeChunkedOverlays()
+  }
+
+  coarseFloorDims(): [number, number, number] | null {
+    return this.volumeRenderer.coarseFloorDims
   }
 
   _getMeshGpu(m: NVMesh): MeshGpuWithShader | null {
@@ -1895,26 +1940,30 @@ export default class NVGlview {
           }
           return null
         }
-        // With a CPU sampler (app-supplied coarse data), march to the first
-        // window-visible voxel; otherwise land on the bounding-box / clip surface.
-        const hitMM = vol.pickSampler
-          ? NVTransforms.rayMarchFirstVisibleMM(
-              near,
-              far,
-              vol.extentsMin,
-              vol.extentsMax,
-              vol.pickSampler,
-              md.clipPlanes,
-              md.scene.isClipPlaneCutaway,
-            )
-          : NVTransforms.rayBoxEntryMM(
-              near,
-              far,
-              vol.extentsMin,
-              vol.extentsMax,
-              md.clipPlanes,
-              md.scene.isClipPlaneCutaway,
-            )
+        // With a CPU sampler (the streamed volume's coarse floor, or app-supplied
+        // data), march to the first window-visible voxel. Without one — or when
+        // the ray crosses nothing visible — land on the bounding-box / clip
+        // surface, which is what the GPU shader does with its own miss.
+        const hitMM =
+          (vol.pickSampler
+            ? NVTransforms.rayMarchFirstVisibleMM(
+                near,
+                far,
+                vol.extentsMin,
+                vol.extentsMax,
+                vol.pickSampler,
+                md.clipPlanes,
+                md.scene.isClipPlaneCutaway,
+              )
+            : null) ??
+          NVTransforms.rayBoxEntryMM(
+            near,
+            far,
+            vol.extentsMin,
+            vol.extentsMax,
+            md.clipPlanes,
+            md.scene.isClipPlaneCutaway,
+          )
         if (hitMM) return hitMM
       }
     }
@@ -2008,7 +2057,36 @@ export default class NVGlview {
     return null
   }
 
+  /** The GPU dropped this context (commonly VRAM exhaustion -- e.g. too many
+   *  large streamed chunks resident at once). Latch it so render() stops driving
+   *  the streaming loop against a dead context, and ask the browser for a
+   *  replacement. The latch is never cleared: this view instance is
+   *  unrecoverable, and recovery replaces it wholesale. */
+  private _handleContextLost = (event: Event): void => {
+    event.preventDefault()
+    this._contextLost = true
+    log.error(
+      'WebGL2 context lost — likely GPU out of memory. Reduce ' +
+        'maxChunkResidencyBytes or use a coarser level.',
+    )
+  }
+
+  /** The browser handed back a usable context. Nothing this view owns survived,
+   *  so hand off to the controller for a full rebuild. */
+  private _handleContextRestored = (): void => {
+    log.info('WebGL2 context restored — rebuilding the view.')
+    this.onContextLost?.()
+  }
+
   destroy(): void {
+    // Detach before the gl guard: the listeners live on the canvas, not on the
+    // context, so a view torn down without a context must still release them
+    // (recreateView normally swaps in a fresh canvas, but a caller may not).
+    this.canvas.removeEventListener('webglcontextlost', this._handleContextLost)
+    this.canvas.removeEventListener(
+      'webglcontextrestored',
+      this._handleContextRestored,
+    )
     const gl = this.gl
     if (!gl) return
 

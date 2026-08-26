@@ -1,7 +1,14 @@
 import { log } from '@/logger'
 import * as NVTransforms from '@/math/NVTransforms'
 import * as NVShapes from '@/mesh/NVShapes'
-import { isPaqd } from '@/NVConstants'
+import {
+  invGamma,
+  isPaqd,
+  lodGammaExponent,
+  lodOpacityScale,
+  SCENE_DEFAULTS,
+  VOLUME_DEFAULTS,
+} from '@/NVConstants'
 import type { NVImage, VolumeChunkExplode } from '@/NVTypes'
 import { NVRenderer } from '@/view/NVRenderer'
 import {
@@ -28,11 +35,22 @@ import {
 } from '@/volume/chunkBudget'
 import {
   type ChunkPlan,
+  chunkLodDownsample,
+  chunkOwnedTexBox,
   chunkVolume,
+  dimsDownsample,
   matchChunksByContent,
   needsChunking,
+  planSupportsCubic,
   type Vec3i,
+  warnIfCubicUnsafe,
 } from '@/volume/chunking'
+import { ChunkTravelPredictor } from '@/volume/chunkPrediction'
+import {
+  DecodedChunkCache,
+  type DecodedChunkStats,
+  decodedTierBudgetBytes,
+} from '@/volume/decodedChunkCache'
 import { buildModulationParams } from '@/volume/modulation'
 import {
   chunkedDisplayKey,
@@ -104,6 +122,13 @@ const MAX_CHUNK_UPLOADS_PER_FRAME = 24
  */
 const CHUNK_PREFETCH_WINDOW = 16
 /**
+ * How many predicted chunks a chunked volume may have on speculative fetch at
+ * once. Small on purpose: the prediction is served from whatever fetch slots
+ * the working set left over, so a wrong guess costs a few reads, never a
+ * visible chunk's place in the queue.
+ */
+const CHUNK_PREDICT_WINDOW = 4
+/**
  * Share of the single configured `maxChunkResidencyBytes` given to an
  * independent hi-res overlay's residency manager; the base keeps the rest. In
  * the 3D render both layers are all-resident, so without a split base + overlay
@@ -145,6 +170,20 @@ interface ChunkUniforms {
    * resolution instead of being oversampled at the finest density.
    */
   rayStepTexVox: Vec3f
+  /**
+   * False when this draw reads a brick whose halo is too thin for the tricubic
+   * kernel (see planSupportsCubic). The filter is forced off for that draw so
+   * it cannot reconstruct from clamp-to-edge data at an internal brick face,
+   * which would show as a seam. Defaults to true (non-chunked draws, and the
+   * coarse floor, which is one whole-volume texture).
+   */
+  cubicSafe?: boolean
+  /**
+   * Linear downsample factor of this brick's source pyramid level relative to
+   * the finest grid (see chunkLodDownsample). 1 for single-level plans and
+   * non-chunked draws; drives the per-level brightness compensation.
+   */
+  lodDownsample?: number
 }
 
 /** Single-texture volume: fits within maxTextureDimension3D on all axes. */
@@ -152,6 +191,8 @@ interface SingleTexEntry {
   kind: 'single'
   volumeTexture: GPUTexture
   volumeGradientTexture: GPUTexture
+  /** Categorical volume: never smooth its baked label colors (see _cubicVolumeSafe). */
+  isLabel: boolean
 }
 
 /** Chunked (tiled) volume: one or more axes exceed maxTextureDimension3D. */
@@ -172,13 +213,48 @@ interface ChunkedTexEntry {
    * uploader rebuild + full re-stream (see _ensureChunkedVolumeEntry).
    */
   displayKey: string
+  /** planSupportsCubic(plan), cached: the plan is immutable for the entry's life. */
+  cubicSafe: boolean
+  /** Tracks how this volume's working set travels across its chunk grid. */
+  predictor: ChunkTravelPredictor
+  /** Chunk indices this frame's working set asked for, across every tile. */
+  requestedThisFrame: number[]
+  /** Chunks currently on speculative fetch, so a stale guess can be released. */
+  speculative: Set<number>
+  /** Speculative fetches started for this volume, cumulative. */
+  predictedCount: number
+  /**
+   * Decoded source bytes for this volume's chunks, so a chunk evicted from the
+   * GPU is demoted here instead of destroyed. Owned by the entry rather than
+   * the uploader: the bytes outlive an uploader rebuild, and survive a plan
+   * swap by being re-keyed alongside the resident chunks.
+   */
+  decoded: DecodedChunkCache
+  /** Source bytes per voxel, which sets what the decoded tier costs to hold. */
+  sourceBytesPerVoxel: number
+}
+
+/**
+ * Set a chunked entry's GPU residency budget, keeping its decoded tier sized
+ * against it. The two move together by construction: the tier exists to shadow
+ * the resident set, so a share change that shrinks one must shrink the other.
+ */
+function setChunkBudget(entry: ChunkedTexEntry, bytes: number): void {
+  entry.manager.setBudgetBytes(bytes)
+  entry.decoded.setMaxBytes(
+    decodedTierBudgetBytes(bytes, entry.sourceBytesPerVoxel),
+  )
 }
 
 type TexCacheEntry = SingleTexEntry | ChunkedTexEntry
 
 // 496 bytes = 124 floats:
 //   16 mvp + 16 norm + 16 matRAS + 4 volScale + 4 rayDir + 4 (gradient/numVol/cutaway/pad)
-//   + 4 clipPlaneColor + 24 clipPlanes + 4 paqd + 1 earlyTermination + 7 _pad0 (vec3 align)
+//   + 4 clipPlaneColor + 24 clipPlanes + 4 paqd + 8 scalars (earlyTermination,
+//     clipPlaneOverlay, fadeAlpha, renderMode, cubicFilter, invGamma,
+//     lodOpacityScale, backOpacity). The last four replaced a 2-lane _pad0
+//     plus the 2 lanes WGSL was already inserting implicitly to 16-align
+//     volumeTexDimsFull, so the group is 8 lanes before and after.
 //   + 4 volumeTexDimsFull + 4 chunkSubOrigin + 4 chunkSubSize
 //   + 4 dataOriginTexFrac + 4 dataSizeTexFrac + 4 rayStepTexVox
 // Still rounds up to the same 512-byte alignedRenderSize (UNIFORM_ALIGNMENT 256),
@@ -200,12 +276,17 @@ const OVERLAY_CHUNK_PARAMS_BASE =
 // base bank) in one frame without their dynamic-offset uniforms colliding.
 const FLOOR_CHUNK_PARAMS_BASE =
   CHUNK_PARAMS_BASE + 2 * CHUNK_BANK_SLOTS * alignedRenderSize
-// Duration of the streaming-chunk cross-fade between LOD levels. A chunk
-// admitted this long ago (or longer) draws at full strength; younger chunks
-// dissolve in over the floor. Set to 0 to disable the cross-fade entirely:
-// fadeFraction then returns 1 immediately, so a fine chunk pops in at full
-// strength (the floor is still drawn for chunks that are not yet resident).
-const CHUNK_FADE_MS = 0
+/**
+ * Default duration of the streaming-chunk cross-fade between LOD levels, in ms.
+ * A chunk admitted this long ago (or longer) draws at full strength; younger
+ * chunks dissolve in over the coarse floor, so a plan swap reads as a soften-
+ * then-sharpen rather than a hard cut. Overridable per instance with the
+ * `chunkFadeMs` option; 0 disables the cross-fade entirely (fadeFraction then
+ * returns 1 immediately, so a fine chunk pops in at full strength — the floor
+ * is still drawn for chunks that are not yet resident). Kept short enough that
+ * it never reads as lag on a settled view.
+ */
+const DEFAULT_CHUNK_FADE_MS = 120
 
 /**
  * Steady-state GPU bytes one resident chunk occupies. The scalar source
@@ -222,10 +303,13 @@ function chunkResidentBytes(chunk: VolumeChunkGPU): number {
 function chunkUniformsFor(plan: ChunkPlan, chunkIndex: number): ChunkUniforms {
   const desc = plan.chunks[chunkIndex]
   const [vx, vy, vz] = plan.volumeDims
-  const [tx, ty, tz] = desc.texDims
   // Ray-step density comes from this brick's source level (full-volume dims);
   // for single-level plans levelDims is absent so it falls back to volumeDims.
   const rayStep = plan.levelDims?.[desc.sourceLevel ?? 0] ?? plan.volumeDims
+  // The brick's OWNED box inside its own texture. A multi-LOD brick fetches a
+  // box snapped out to whole level voxels, so the fetched box is NOT the owned
+  // box and using it here would misregister the brick. See `chunkOwnedTexBox`.
+  const owned = chunkOwnedTexBox(plan, desc)
   return {
     // World placement uses the COMMON grid (voxelOrigin/voxelDims are common-grid
     // for multi-LOD bricks; identical to the level grid for single-level plans).
@@ -240,18 +324,11 @@ function chunkUniformsFor(plan: ChunkPlan, chunkIndex: number): ChunkUniforms {
       desc.voxelDims[1] / vy,
       desc.voxelDims[2] / vz,
     ],
-    // Texture-space remap uses the brick's OWN level grid (texDims + level halo).
-    dataOriginTexFrac: [
-      desc.haloLow[0] / tx,
-      desc.haloLow[1] / ty,
-      desc.haloLow[2] / tz,
-    ],
-    dataSizeTexFrac: [
-      (tx - desc.haloLow[0] - desc.haloHigh[0]) / tx,
-      (ty - desc.haloLow[1] - desc.haloHigh[1]) / ty,
-      (tz - desc.haloLow[2] - desc.haloHigh[2]) / tz,
-    ],
+    // Texture-space remap uses the brick's OWN level grid.
+    dataOriginTexFrac: owned.origin,
+    dataSizeTexFrac: owned.size,
     rayStepTexVox: [rayStep[0], rayStep[1], rayStep[2]],
+    lodDownsample: chunkLodDownsample(plan, desc),
   }
 }
 
@@ -322,12 +399,49 @@ export class VolumeRenderer extends NVRenderer {
   // GPU memory budget for a chunked volume's resident chunk set. Set from the
   // maxChunkResidencyBytes option in init; passed to each ChunkResidencyManager.
   private _chunkResidencyBytes = DEFAULT_CHUNK_RESIDENCY_BYTES
+  // Cross-fade duration, ms, for a freshly-admitted streaming chunk. Set from
+  // the chunkFadeMs option when the view initializes; 0 disables the fade.
+  chunkFadeMs = DEFAULT_CHUNK_FADE_MS
   // Scene flag (set per-frame from md.scene): clip the overlay/PAQD/drawing passes
   // with the base volume instead of letting them ignore the clip plane.
   clipPlaneOverlay = false
   // Volume flag (set per-frame from md.volume.renderMode): 0 = composite (OVER),
   // 1 = maximum-intensity projection. See VOLUME_RENDER_MODE.
   renderMode = 0
+  // Scene display gamma (set per-frame from md.scene.gamma). Applied to the
+  // classified RGB of every volume sample, never to alpha, so brightening does
+  // not change how much a ray occludes. 1.0 is a strict no-op.
+  gamma = SCENE_DEFAULTS.gamma
+  // Coefficient for the per-level coarse-brick brightness compensation (from
+  // md.volume.lodBrightnessCompensation). 0 disables it. Multiplies into the
+  // same shader exponent as `gamma`, per chunk.
+  lodBrightnessCompensation = VOLUME_DEFAULTS.lodBrightnessCompensation
+  // Coefficient for the per-level coarse-brick OPACITY compensation (from
+  // md.volume.lodOpacityCompensation). 0 disables it, which is the default:
+  // it measures worse than the brightness compensation on dense structure.
+  // Scales the step-size opacity exponent, per chunk.
+  lodOpacityCompensation = VOLUME_DEFAULTS.lodOpacityCompensation
+  // Samples per voxel along the ray in the 3D fine march (from md.volume.sampleRate).
+  // Converges the ray integral at a proportional fragment cost. It does NOT remove
+  // concentric banding on smooth structures (measured ring contrast is flat from 1
+  // to 4) -- that banding is in the integrand, not in how densely it is sampled.
+  sampleRate = VOLUME_DEFAULTS.sampleRate
+  // Tricubic B-spline instead of hardware trilinear in the background fine pass
+  // (from md.volume.isCubicInterpolation). Cures the blocky texel staircase that
+  // C0 trilinear leaves on band edges, at 8 fetches per sample instead of 1.
+  // Assigned every frame by the view, so the setter is where an "on, but the
+  // active chunk plan cannot feed the kernel" warning is raised: it is the only
+  // point that sees the request and the current plan together (the entry may
+  // have been built long before the user turned cubic on).
+  private _isCubicInterpolation = VOLUME_DEFAULTS.isCubicInterpolation
+  get isCubicInterpolation(): boolean {
+    return this._isCubicInterpolation
+  }
+  set isCubicInterpolation(v: boolean) {
+    this._isCubicInterpolation = v
+    const entry = this._activeChunked
+    if (entry) warnIfCubicUnsafe(entry.volume.name, entry.cubicSafe, v)
+  }
   private _matcapUrl: string | null = null
   private _bindTexVol: GPUTexture | null = null
   private _bindTexGrad: GPUTexture | null = null
@@ -358,6 +472,11 @@ export class VolumeRenderer extends NVRenderer {
   // Set when bindCachedVolume selects a chunked entry; null for single
   // entries. draw() branches on this to run the multi-chunk loop.
   private _activeChunked: ChunkedTexEntry | null = null
+  // False when the active volume is categorical (colormapLabel): the ray march
+  // samples an RGBA texture whose colors are already baked, so a smooth
+  // reconstruction would blend two unrelated labels into a third label's colour.
+  // Cubic is forced off for such a volume regardless of the global setting.
+  private _cubicVolumeSafe = true
   // Set when an independently-streamed hi-res overlay (chunkOverlayOf) is
   // loaded over a chunked base. It has its OWN ChunkPlan + residency manager
   // (a second _texCache entry, keyed by its own url/name) and is drawn as
@@ -376,6 +495,8 @@ export class VolumeRenderer extends NVRenderer {
   // immediately and sharpens as chunks arrive. Oriented once from a coarse
   // pyramid level the app supplies (niivue stays LOD-agnostic). Null when unset.
   coarseFloorTexture: GPUTexture | null = null
+  /** Voxel dims of `coarseFloorTexture` (drives the floor cubes' step count). */
+  coarseFloorDims: [number, number, number] | null = null
   // Gradient for the coarse floor, used by the 3D ray-march floor cubes for
   // matcap lighting consistent with the resident fine chunks. Null when unset.
   coarseFloorGradientTexture: GPUTexture | null = null
@@ -699,6 +820,7 @@ export class VolumeRenderer extends NVRenderer {
         this._chunkResidencyBytes,
       )
       this._activeChunked = chunkedEntry
+      this._cubicVolumeSafe = !vol.colormapLabel
       this._activeVolKey = cacheKey || null
       this.volumeTexture =
         chunkedEntry.manager.getChunk(0)?.volumeTexture ?? null
@@ -711,6 +833,7 @@ export class VolumeRenderer extends NVRenderer {
     const mtx = NVTransforms.calculateOverlayTransformMatrix(vol, vol)
     const modParams = buildModulationParams(vol, vol, allVolumes)
     this._activeChunked = null
+    this._cubicVolumeSafe = !vol.colormapLabel
 
     if (perVolumeCache) {
       // Multi-instance / global3d: cache each volume's texture by key so the
@@ -736,7 +859,12 @@ export class VolumeRenderer extends NVRenderer {
           device,
           volumeTexture,
         )
-        entry = { kind: 'single', volumeTexture, volumeGradientTexture }
+        entry = {
+          kind: 'single',
+          volumeTexture,
+          volumeGradientTexture,
+          isLabel: !!vol.colormapLabel,
+        }
         if (cacheKey) this._texCache.set(cacheKey, entry)
       }
       this.volumeTexture = entry.volumeTexture
@@ -844,14 +972,19 @@ export class VolumeRenderer extends NVRenderer {
         // while the working set refills — the same drop-and-refill mechanism as
         // _refreshUnlitChunksForLighting.
         existing.displayKey = displayKey
+        // The decoded tier is deliberately kept: it holds SOURCE bytes, and a
+        // colormap or window change re-orients the same source. The re-stream
+        // below therefore costs uploads, not fetches.
         const newUploader = await createChunkUploaderGPU(
           device,
           vol,
           existing.plan,
           () => this.gradientAmount > 0,
+          existing.decoded,
         )
         existing.uploader.dispose()
         existing.uploader = newUploader
+        existing.speculative.clear()
         existing.manager.remap(new Map(), existing.plan.chunks.length)
         existing.bindGroups = existing.plan.chunks.map(() => null)
         const chunk0 = await existing.uploader.uploadChunk(0)
@@ -861,11 +994,15 @@ export class VolumeRenderer extends NVRenderer {
       return existing
     }
     if (existing) this._destroyTexEntry(existing)
+    const decoded = new DecodedChunkCache(
+      decodedTierBudgetBytes(budgetBytes, bpv),
+    )
     const uploader = await createChunkUploaderGPU(
       device,
       vol,
       plan,
       () => this.gradientAmount > 0,
+      decoded,
     )
     // The entry holds the live uploader + per-chunk bind groups so an in-place
     // plan swap (swapChunkedVolumePlan) can replace them; the manager hooks read
@@ -880,7 +1017,15 @@ export class VolumeRenderer extends NVRenderer {
       plan,
       bindGroups: plan.chunks.map(() => null),
       displayKey,
+      cubicSafe: planSupportsCubic(plan),
+      predictor: new ChunkTravelPredictor(),
+      requestedThisFrame: [],
+      speculative: new Set(),
+      predictedCount: 0,
+      decoded,
+      sourceBytesPerVoxel: bpv,
     }
+    warnIfCubicUnsafe(vol.name, entry.cubicSafe, this.isCubicInterpolation)
     entry.manager = new ChunkResidencyManager<VolumeChunkGPU>(
       plan.chunks.length,
       budgetBytes,
@@ -892,6 +1037,7 @@ export class VolumeRenderer extends NVRenderer {
           onResidencyChange?.(ci)
         },
         prefetch: (ci) => entry.uploader.prefetchChunk(ci),
+        cancel: (ci) => entry.uploader.cancelChunk(ci),
         onAdmit: onResidencyChange,
       },
     )
@@ -930,11 +1076,27 @@ export class VolumeRenderer extends NVRenderer {
       vol,
       newPlan,
       () => this.gradientAmount > 0,
+      entry.decoded,
     )
     entry.uploader.dispose()
     entry.uploader = newUploader
     entry.manager.remap(oldToNew, newPlan.chunks.length)
+    // Chunk indices are plan-relative, so the tier is re-keyed by the same
+    // content match: a brick the new plan still contains keeps its bytes, and
+    // a refocus back to this level finds them.
+    entry.decoded.remap(oldToNew)
     entry.plan = newPlan
+    // A new grid makes the recorded travel meaningless, and the old uploader
+    // took its outstanding speculative reads with it.
+    entry.predictor.reset()
+    entry.requestedThisFrame.length = 0
+    entry.speculative.clear()
+    entry.cubicSafe = planSupportsCubic(newPlan)
+    warnIfCubicUnsafe(
+      entry.volume.name,
+      entry.cubicSafe,
+      this.isCubicInterpolation,
+    )
     entry.bindGroups = newPlan.chunks.map(() => null)
     entry.volume = vol
     entry.displayKey = chunkedDisplayKey(vol)
@@ -982,12 +1144,14 @@ export class VolumeRenderer extends NVRenderer {
       // single-texture pointers are best-effort aliases for callers that
       // inspect them, not the chunked volume's readiness signal.
       this._activeChunked = entry
+      this._cubicVolumeSafe = !entry.volume.colormapLabel
       this.volumeTexture = entry.manager.getChunk(0)?.volumeTexture ?? null
       this.volumeGradientTexture =
         entry.manager.getChunk(0)?.volumeGradientTexture ?? null
       return true
     }
     this._activeChunked = null
+    this._cubicVolumeSafe = !entry.isLabel
     this.volumeTexture = entry.volumeTexture
     this.volumeGradientTexture = entry.volumeGradientTexture
     const cached = this._bindGroupCache.get(cacheKey)
@@ -1059,7 +1223,7 @@ export class VolumeRenderer extends NVRenderer {
 
   /**
    * Streaming cross-fade weight in [0,1] for one chunk of the active chunked
-   * base, for the 2D slice path: ramps 0->1 over CHUNK_FADE_MS from admit, so a
+   * base, for the 2D slice path: ramps 0->1 over `chunkFadeMs` from admit, so a
    * fine chunk slice dissolves in over the coarse floor instead of popping.
    * Returns 1 (no fade) when there is no floor to dissolve into or no active
    * chunked base. Flags fadeActive while a chunk is mid-fade so the view keeps
@@ -1070,7 +1234,7 @@ export class VolumeRenderer extends NVRenderer {
     const fade = this._activeChunked.manager.fadeFraction(
       chunkIndex,
       this._frameNow,
-      CHUNK_FADE_MS,
+      this.chunkFadeMs,
     )
     if (fade < 1) this._fadeActive = true
     return fade
@@ -1216,6 +1380,9 @@ export class VolumeRenderer extends NVRenderer {
       entry.manager.requestUpload(ci)
       for (const m of mirrors) m.requestUpload(ci)
     }
+    // Accumulate rather than replace: a multiplanar layout drives this volume
+    // from several tiles per frame, and the union is what travels.
+    for (const ci of capped) entry.requestedThisFrame.push(ci)
   }
 
   /**
@@ -1288,6 +1455,7 @@ export class VolumeRenderer extends NVRenderer {
       entry.manager.requestUpload(ci)
       for (const m of mirrors) m.requestUpload(ci)
     }
+    for (const ci of capped) entry.requestedThisFrame.push(ci)
   }
 
   /**
@@ -1301,7 +1469,64 @@ export class VolumeRenderer extends NVRenderer {
     this._fadeActive = false
     this._refreshUnlitChunksForLighting()
     for (const entry of this._texCache.values()) {
-      if (entry.kind === 'chunked') entry.manager.beginFrame()
+      if (entry.kind !== 'chunked') continue
+      // Predict from the frame that just ended, before its record is cleared.
+      // Here rather than in the pump because the pump is paused mid-drag, and a
+      // drag is exactly when the view is travelling and worth fetching ahead of.
+      this._speculateAhead(entry)
+      entry.requestedThisFrame.length = 0
+      entry.manager.beginFrame()
+    }
+  }
+
+  /**
+   * Fetch ahead of the working set along its direction of travel: ask the
+   * predictor where the last frame's chunks were heading and start source reads
+   * for the answer, releasing the guesses that no longer apply so a wrong turn
+   * cannot hold fetch slots for the rest of the session.
+   *
+   * Speculative only. Nothing here is requested for upload, so the residency
+   * queue and the eviction clock never see it, and the uploader admits these
+   * reads only into fetch slots the working set is not using.
+   */
+  private _speculateAhead(entry: ChunkedTexEntry): void {
+    const predicted = entry.predictor.predict(
+      entry.plan,
+      entry.requestedThisFrame,
+      CHUNK_PREDICT_WINDOW,
+    )
+    if (predicted.length === 0) {
+      // Either the view is settled or this frame said nothing new. Standing
+      // guesses are left alone: dropping them on the first idle frame would
+      // cancel every read a discrete scrub had just started for its next step.
+      return
+    }
+    for (const ci of entry.requestedThisFrame) {
+      // The view arrived at a guess: the read did its job and the chunk is the
+      // working set's now, so drop the claim without cancelling it.
+      entry.speculative.delete(ci)
+    }
+    if (!predicted.some((ci) => entry.speculative.has(ci))) {
+      // Nothing standing is on the new heading, so the view turned. Release the
+      // old guesses; travel that merely continues shares chunks with them and
+      // takes this branch only once its whole flight has been consumed.
+      for (const ci of entry.speculative) {
+        entry.speculative.delete(ci)
+        // Once the working set has claimed a guess the read belongs to the
+        // pump, and cancelling it would abort an upload already under way.
+        if (entry.manager.isUploadPending(ci)) continue
+        entry.uploader.cancelChunk(ci)
+      }
+    }
+    for (const ci of predicted) {
+      // One flight of guesses at a time: new reads start only as the view
+      // consumes the standing ones, so speculation cannot churn per frame.
+      if (entry.speculative.size >= CHUNK_PREDICT_WINDOW) break
+      if (entry.manager.isResident(ci)) continue
+      if (entry.speculative.has(ci)) continue
+      entry.speculative.add(ci)
+      entry.predictedCount++
+      entry.uploader.prefetchChunk(ci, true)
     }
   }
 
@@ -1392,7 +1617,11 @@ export class VolumeRenderer extends NVRenderer {
             // view's self-driven re-render loop, freezing all streaming until an
             // unrelated redraw (e.g. a drag) re-kicks it.
             entry.manager.failUpload(i)
-            log.error('chunk upload failed', err)
+            // An abort is this renderer's own doing (the view stopped wanting
+            // the chunk, or the uploader was disposed), so it is not a failure
+            // to report.
+            if (!(err instanceof Error && err.name === 'AbortError'))
+              log.error('chunk upload failed', err)
             continue
           }
           admitted = true
@@ -1411,6 +1640,7 @@ export class VolumeRenderer extends NVRenderer {
     if (entry.kind === 'chunked') {
       entry.manager.destroy()
       entry.uploader.dispose()
+      entry.decoded.clear()
       if (this._activeChunked === entry) this._activeChunked = null
       if (this._activeOverlayChunked === entry)
         this._activeOverlayChunked = null
@@ -1711,10 +1941,11 @@ export class VolumeRenderer extends NVRenderer {
     )
     // Apply the split even when the entry was reused from the cache (its
     // manager may have been built with a different budget).
-    entry.manager.setBudgetBytes(overlayBudget)
+    setChunkBudget(entry, overlayBudget)
     this._activeOverlayChunked = entry
     if (this._activeChunked && this._activeChunked !== entry) {
-      this._activeChunked.manager.setBudgetBytes(
+      setChunkBudget(
+        this._activeChunked,
         this._chunkResidencyBytes * (1 - OVERLAY_RESIDENCY_FRACTION),
       )
     }
@@ -1729,7 +1960,9 @@ export class VolumeRenderer extends NVRenderer {
    */
   clearOverlayChunked(): void {
     this._activeOverlayChunked = null
-    this._activeChunked?.manager.setBudgetBytes(this._chunkResidencyBytes)
+    if (this._activeChunked) {
+      setChunkBudget(this._activeChunked, this._chunkResidencyBytes)
+    }
   }
 
   hasOverlayChunked(): boolean {
@@ -1771,11 +2004,12 @@ export class VolumeRenderer extends NVRenderer {
           if (base) base.bindGroups[ci] = null
         },
       )
-      entry.manager.setBudgetBytes(overlayBudget)
+      setChunkBudget(entry, overlayBudget)
       this._combinedOverlayEntries.push(entry)
     }
     if (this._activeChunked) {
-      this._activeChunked.manager.setBudgetBytes(
+      setChunkBudget(
+        this._activeChunked,
         this._chunkResidencyBytes * (1 - OVERLAY_RESIDENCY_FRACTION),
       )
     }
@@ -1786,7 +2020,9 @@ export class VolumeRenderer extends NVRenderer {
   private _clearCombinedOverlayChunked(): void {
     if (this._combinedOverlayEntries.length === 0) return
     this._combinedOverlayEntries = []
-    this._activeChunked?.manager.setBudgetBytes(this._chunkResidencyBytes)
+    if (this._activeChunked) {
+      setChunkBudget(this._activeChunked, this._chunkResidencyBytes)
+    }
     this._invalidateBindGroupCache()
   }
 
@@ -1799,25 +2035,64 @@ export class VolumeRenderer extends NVRenderer {
    * Aggregate streaming stats across all chunked volumes (base + overlay), for
    * HUD / debug instrumentation. `resident` is bricks currently on the GPU,
    * `pending` queued for upload, `inFlight` mid-upload, `total` the chunk count.
+   * `staleDropped` counts queued uploads retired because the working set moved
+   * on before they ran — upload work the old cross-frame queue would have spent
+   * on viewports the user had already left. `decoded` sums the decoded-chunk
+   * tiers: its hit rate is the share of source reads that an evicted brick's
+   * return cost nothing but an upload.
    */
   chunkStreamStats(): {
     resident: number
     pending: number
     inFlight: number
     total: number
+    staleDropped: number
+    predicted: number
+    decoded: DecodedChunkStats
   } {
     let resident = 0
     let pending = 0
     let inFlight = 0
     let total = 0
+    let staleDropped = 0
+    let predicted = 0
+    const decoded: DecodedChunkStats = {
+      hits: 0,
+      misses: 0,
+      admitted: 0,
+      rejected: 0,
+      evicted: 0,
+      entries: 0,
+      bytes: 0,
+      maxBytes: 0,
+    }
     for (const entry of this._texCache.values()) {
       if (entry.kind !== 'chunked') continue
       resident += entry.manager.residentCount
       pending += entry.manager.pendingUploadCount
       inFlight += entry.manager.inFlightUploadCount
       total += entry.manager.chunkCount
+      staleDropped += entry.manager.staleDropCount
+      predicted += entry.predictedCount
+      const d = entry.decoded.stats
+      decoded.hits += d.hits
+      decoded.misses += d.misses
+      decoded.admitted += d.admitted
+      decoded.rejected += d.rejected
+      decoded.evicted += d.evicted
+      decoded.entries += d.entries
+      decoded.bytes += d.bytes
+      decoded.maxBytes += d.maxBytes
     }
-    return { resident, pending, inFlight, total }
+    return {
+      resident,
+      pending,
+      inFlight,
+      total,
+      staleDropped,
+      predicted,
+      decoded,
+    }
   }
 
   /**
@@ -2217,6 +2492,7 @@ export class VolumeRenderer extends NVRenderer {
     isClipCutaway = false,
     paqdUniforms: readonly number[] = [0, 0, 0, 0],
     earlyTermination = 0.95,
+    backOpacity = 1,
   ): void {
     if (
       !this.isReady ||
@@ -2244,6 +2520,7 @@ export class VolumeRenderer extends NVRenderer {
         isClipCutaway,
         paqdUniforms,
         earlyTermination,
+        backOpacity,
       )
       return
     }
@@ -2287,6 +2564,11 @@ export class VolumeRenderer extends NVRenderer {
           this.volumeTexture.depthOrArrayLayers,
         ],
       },
+      // Not an overlay layer, never cross-faded, and carrying the base
+      // volume's own opacity.
+      0,
+      1,
+      backOpacity,
     )
 
     pass.setPipeline(this.pipeline)
@@ -2319,6 +2601,7 @@ export class VolumeRenderer extends NVRenderer {
     isClipCutaway: boolean,
     paqdUniforms: readonly number[],
     earlyTermination: number,
+    backOpacity: number,
   ): void {
     this._drawChunkedEntry(
       device,
@@ -2339,6 +2622,7 @@ export class VolumeRenderer extends NVRenderer {
       isClipCutaway,
       paqdUniforms,
       earlyTermination,
+      backOpacity,
     )
   }
 
@@ -2424,7 +2708,10 @@ export class VolumeRenderer extends NVRenderer {
     clipPlanes: number[],
     isClipCutaway: boolean,
     paqdUniforms: readonly number[],
+    // The base volume's own opacity. Left at the neutral 1 by the overlay
+    // entry, whose opacity is already baked into its chunk textures.
     earlyTermination: number,
+    backOpacity = 1,
   ): void {
     if (
       !entry ||
@@ -2591,11 +2878,33 @@ export class VolumeRenderer extends NVRenderer {
           chunkSubSize: cu.chunkSubSize,
           dataOriginTexFrac: cu.chunkSubOrigin,
           dataSizeTexFrac: cu.chunkSubSize,
-          // Floor cube samples the coarse whole-volume texture; keep its step at
-          // the fine (common) density exactly as before this field existed.
-          rayStepTexVox: cu.volumeTexDimsFull,
+          // March at the floor texture's OWN voxel density, not the fine common
+          // grid: the step-size correction turns each step into an optical depth
+          // of `fineVoxels / steps` reference steps, so oversampling a much
+          // coarser texture drives the first in-tissue sample to alpha 1 and the
+          // cube renders as a dark surface shell instead of an integrated
+          // backdrop.
+          rayStepTexVox: this.coarseFloorDims ?? cu.volumeTexDimsFull,
+          // The floor is not a member of `plan.chunks`, so its downsample
+          // comes from its own dims. It is usually the coarsest data on
+          // screen: uncompensated, it puts the scene's largest brightness
+          // step right at the edge of the resident fine region.
+          lodDownsample: this.coarseFloorDims
+            ? dimsDownsample(entry.plan.volumeDims, this.coarseFloorDims)
+            : 1,
+          // The floor is one whole-volume texture, so the cubic kernel is always
+          // safely fed here. It still follows the fine bricks' verdict: when
+          // their halo is too thin and cubic is refused, a cubic floor under
+          // trilinear bricks would put a reconstruction change exactly at the
+          // edge of the resident region. One filter per volume, always.
+          cubicSafe: entry.cubicSafe,
         },
         0,
+        // Full strength: the fine cube in front of this one carries the
+        // cross-fade weight. The floor is base-volume data, so it takes the
+        // base's opacity along with it.
+        1,
+        backOpacity,
       )
       pass.setBindGroup(0, this._floorBindGroup, [floorRenderOffset])
       pass.drawIndexed(this.cube.indices.length)
@@ -2613,7 +2922,11 @@ export class VolumeRenderer extends NVRenderer {
       // it with premultiplied weight `fade`. Once settled (fade === 1) the floor
       // cube is skipped and only the fine cube is drawn.
       const fade = floorActive
-        ? entry.manager.fadeFraction(chunkIndex, this._frameNow, CHUNK_FADE_MS)
+        ? entry.manager.fadeFraction(
+            chunkIndex,
+            this._frameNow,
+            this.chunkFadeMs,
+          )
         : 1
       if (fade < 1) {
         drawFloorCube(chunkIndex, slot)
@@ -2685,9 +2998,13 @@ export class VolumeRenderer extends NVRenderer {
         earlyTermination,
         clipPlaneColor,
         clipPlanes,
-        chunkUniformsFor(entry.plan, chunkIndex),
+        {
+          ...chunkUniformsFor(entry.plan, chunkIndex),
+          cubicSafe: entry.cubicSafe,
+        },
         overlayMode ? 1 : 0,
         fade,
+        backOpacity,
       )
 
       pass.setBindGroup(0, bindGroup, [renderOffset])
@@ -2714,6 +3031,7 @@ export class VolumeRenderer extends NVRenderer {
     chunkUniforms: ChunkUniforms,
     overlayLayerMode = 0,
     fadeAlpha = 1,
+    backOpacity = 1,
   ): void {
     device.queue.writeBuffer(
       paramsBuffer,
@@ -2746,10 +3064,38 @@ export class VolumeRenderer extends NVRenderer {
         // renderMode (offset 380): 0 = composite (OVER), 1 = maximum-intensity
         // projection. Occupies what used to be implicit padding, so nothing moves.
         this.renderMode,
-        0,
-        0,
-        0,
-        0,
+        // cubicFilter (offset 384, was _pad0.x): tricubic B-spline reconstruction
+        // in the background fine pass. Forced off for a categorical volume and
+        // for a brick whose halo is too thin to feed the kernel (see the GL
+        // renderer's identical gate).
+        this.isCubicInterpolation &&
+        this._cubicVolumeSafe &&
+        chunkUniforms.cubicSafe !== false
+          ? 1
+          : 0,
+        // invGamma (offset 388, was _pad0.y): the shader raises the classified
+        // RGB to this power. Two exponents compose here (pow is associative in
+        // the exponent): the reciprocal of the user-facing display gamma, and
+        // this brick's per-level compensation for the brightness a coarse
+        // pyramid level loses in the march. The latter is 1 for every
+        // single-level and non-chunked draw.
+        invGamma(this.gamma) *
+          lodGammaExponent(
+            chunkUniforms.lodDownsample ?? 1,
+            this.lodBrightnessCompensation,
+          ),
+        // lodOpacityScale (offset 392, was the first _pad0 lane): scales the
+        // step-size opacity exponent for a coarse brick. 1 for every
+        // single-level and non-chunked draw, and for the default coefficient 0.
+        lodOpacityScale(
+          chunkUniforms.lodDownsample ?? 1,
+          this.lodOpacityCompensation,
+        ),
+        // backOpacity (offset 396, the last _pad0 lane): the background
+        // volume's own opacity, scaling every background sample's alpha.
+        // Overlays bake theirs into the overlay texture during the orient
+        // pass, so this is the only volume it applies to.
+        backOpacity,
         ...chunkUniforms.volumeTexDimsFull,
         1,
         ...chunkUniforms.chunkSubOrigin,
@@ -2761,7 +3107,8 @@ export class VolumeRenderer extends NVRenderer {
         ...chunkUniforms.dataSizeTexFrac,
         1,
         ...chunkUniforms.rayStepTexVox,
-        1,
+        // .w lane: ray samples per voxel in the fine march (was pad).
+        this.sampleRate,
       ]),
     )
   }
@@ -2802,6 +3149,7 @@ export class VolumeRenderer extends NVRenderer {
       this.coarseFloorGradientTexture?.destroy()
       this.coarseFloorTexture = null
       this.coarseFloorGradientTexture = null
+      this.coarseFloorDims = null
       this._coarseFloorKey = null
       return
     }
@@ -2813,12 +3161,17 @@ export class VolumeRenderer extends NVRenderer {
       coarseVol,
       coarseVol,
     )
+    // overlayOpacity 0: the floor stands in for the BASE volume, so it must be
+    // baked with base semantics (alpha straight from the colormap LUT). Passing
+    // 1 selects the overlay path, which makes alpha binary (`step()`); every
+    // voxel above threshold then reads fully opaque and a floor cube terminates
+    // its ray on the first surface hit, rendering as a dark shell.
     const tex = await orient.volume2Texture(
       device,
       coarseVol,
       coarseVol,
       mtx as Float32Array,
-      1,
+      0,
     )
     // Gradient for the 3D floor cubes' matcap lighting (matches base shading).
     const grad = await wgpu.volume2TextureGradientRGBA(device, tex)
@@ -2826,6 +3179,7 @@ export class VolumeRenderer extends NVRenderer {
     this.coarseFloorGradientTexture?.destroy()
     this.coarseFloorTexture = tex
     this.coarseFloorGradientTexture = grad
+    this.coarseFloorDims = [tex.width, tex.height, tex.depthOrArrayLayers]
     this._coarseFloorKey = key
   }
 
@@ -2877,6 +3231,7 @@ export class VolumeRenderer extends NVRenderer {
     this.coarseFloorGradientTexture?.destroy()
     this.coarseFloorTexture = null
     this.coarseFloorGradientTexture = null
+    this.coarseFloorDims = null
     this._floorBindGroup = null
     this._coarseFloorKey = null
     this.clearOverlay()

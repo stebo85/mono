@@ -458,6 +458,21 @@
         </select>
       </span>
       <span class="control">
+        <label for="illum">illum <span id="illumVal">0.00</span></label>
+        <input id="illum" type="range" min="0" max="1" step="0.05" value="0"
+          title="3D RENDER ONLY -- set Layout to `render` to see any of the three lighting sliders. Matcap illumination, lit from the precomputed gradient texture. 0 leaves the stream UNLIT, which is the interesting default here: an unlit brick skips its gradient pass entirely, so bricks arrive faster and explode does not flood the pipeline. Raising it off 0 turns the gradient on for every brick, which evicts and re-streams the whole working set once (watch requested/completed and the cache row). Moving it within the non-zero range after that is free" />
+      </span>
+      <span class="control">
+        <label for="gradOpacity">grad opacity <span id="gradOpacityVal">0.00</span></label>
+        <input id="gradOpacity" type="range" min="0" max="1" step="0.05" value="0"
+          title="3D render only. Suppress homogeneous interior by the gradient magnitude (alpha *= magnitude ^ 8c), so the volume reads as a set of surfaces rather than a fog. Needs the same gradient texture as illum. It is also the most expensive setting on this page: emptying the interior stops rays terminating early, so every ray marches the full depth. Measured on mni152, 2.9 -> 13.4 ms per frame on WebGL2" />
+      </span>
+      <span class="control">
+        <label for="silhouette">silhouette <span id="silhouetteVal">0.00</span></label>
+        <input id="silhouette" type="range" min="0" max="0.95" step="0.05" value="0"
+          title="3D render only. Fade material whose gradient normal faces the camera, leaving the rim where the surface turns away (the Fresnel term of a non-photorealistic volume render). Needs the same gradient texture as illum. On exploded bricks this is the one to watch for halo correctness: with a halo the cut faces stay unlit and a brick's rim follows the specimen; the default synthetic shard source has halo 0, so its rims outline the brick boxes instead -- switch to an OME-Zarr source for the positive case" />
+      </span>
+      <span class="control">
         <label for="blocks">
           <input id="blocks" type="checkbox" />
           blocks

@@ -67,16 +67,47 @@ uniform sampler3D paqd;
 uniform sampler2D paqdLut;
 uniform sampler3D drawing;
 uniform sampler3D drawingLinear;
+// Which stencil the overlay and drawing passes estimate their own gradient
+// with (LAYER_GRAD_CENTRAL | LAYER_GRAD_BLOB | LAYER_GRAD_SOBEL8). The
+// background volume reads a precomputed gradient texture and ignores this.
+// Mirrors params.layerGradMode in wgpu/volumeShaderLib.ts.
+uniform float layerGradMode;
+// Background-volume gradient opacity and silhouette (Fresnel rim), both 0 when
+// off. gradientOpacity scales each background sample's alpha by
+// magnitude^(gradientOpacity*8) -- the analytic form of the old niivue's
+// 192-entry LUT, which sampled exactly that function -- and silhouettePower
+// scales it by (1-|dot(normal,rayDir)|)^silhouettePower with a cull above
+// 1-silhouettePower. Both read the PRECOMPUTED gradient texture (rgb =
+// direction, a = magnitude), so they apply to the background pass only. Mirror
+// params.gradientOpacity / params.silhouettePower in wgpu/volumeShaderLib.ts.
+uniform float gradientOpacity;
+uniform float silhouettePower;
 
-// In-shader layer-gradient tuning constants, used by the overlay and drawing
-// passes (neither has a precomputed gradient texture the way the background
-// does). Kept inline because they are shader authoring choices (widens vs
-// sharpens the gradient stencil), not runtime-tunable parameters.
-// Offset (in voxels) for the 6-tap gradient stencil. The non-integer value
-// exploits the LINEAR sampler — each tap is a trilinear blend of 8 texels,
-// giving a Gaussian-like smoothing for free.
+// In-shader layer-gradient constants, used by the overlay and drawing passes
+// (neither has a precomputed gradient texture the way the background does).
+//
+// Three estimators, selected at runtime by the layerGradMode uniform, which the
+// controller drives through volumeLayerGradientMode / LAYER_GRADIENT_MODE:
+//   0 CENTRAL  the legacy 6-tap central difference at a hand-tuned offset
+//   1 BLOB     the Gaussian-blob derivative (see layerGradBlob)
+//   2 SOBEL8   the 8-corner Sobel the old niivue precomputes with
+//
+// The rest are shader authoring choices rather than runtime knobs. SIGMA is the
+// width, in voxels, of the Gaussian blob the layer is reconstructed with; it is
+// the only knob for mode 1, since both tap radii and their weights derive from
+// it. DIAGONALS adds the four body-diagonal directions to the three axes (mode
+// 1 only). OFFSET is used by mode 0 only, and its non-integer value exploits
+// the LINEAR sampler — each tap is a trilinear blend of 8 texels, giving a
+// Gaussian-like smoothing for free. EPSILON is the magnitude below which the
+// gradient is too small to normalize reliably.
+//
+// Mirrors the LAYER_GRAD_* block in wgpu/render.wgsl — keep the two in step.
+const int LAYER_GRAD_CENTRAL = 0;
+const int LAYER_GRAD_BLOB = 1;
+const int LAYER_GRAD_SOBEL8 = 2;
+const float LAYER_GRAD_SIGMA = 1.0;
+const bool LAYER_GRAD_DIAGONALS = true;
 const float LAYER_GRAD_OFFSET = 1.5;
-// Below this, the gradient is too small to normalize reliably.
 const float LAYER_GRAD_EPSILON = 1e-6;
 // Weighted scalar projection of a layer's RGBA → f32. Luminance weights on
 // RGB distinguish distinct label/channel colors; heavy alpha weight (2.0) makes
@@ -87,29 +118,120 @@ float layerScalar(vec4 c) {
   return dot(c, vec4(0.299, 0.587, 0.114, 2.0));
 }
 
-// Matcap shade factor from a 6-tap central-difference gradient of \`tex\` at \`p\`.
-// Pass a LINEARLY-filtered sampler (the drawing pass uses \`drawingLinear\`, its
-// nearest-filtered texture rebound with LINEAR) so each tap is a trilinear
-// blend of 8 texels. Sign: value(+x) - value(-x), matching the volume
-// gradient's inward-pointing convention. Returns vec3(1.0) — no shading — when
-// the gradient is degenerate.
-vec3 layerShade(sampler3D tex, vec3 p, float amount) {
-  // Offset in full-volume [0,1] space so the stencil width is correct for a
-  // chunked layer (chunk texDims differ from the full volume); chunkTexCoord
-  // then maps each tap into the chunk texture.
+// Central difference of tex along one antipodal pair. off is a half-offset in
+// full-volume [0,1] units, so the stencil width stays correct for a chunked
+// layer (chunk texDims differ from the full volume); chunkTexCoord then maps
+// each tap into the chunk texture. Sign: value(+dir) - value(-dir), matching
+// the precomputed volume gradient's inward-pointing normals.
+float layerPairDiff(sampler3D tex, vec3 p, vec3 off) {
+  float a = layerScalar(texture(tex, chunkTexCoord(p + off)));
+  float b = layerScalar(texture(tex, chunkTexCoord(p - off)));
+  return a - b;
+}
+
+// Radial envelope of a Gaussian's derivative. For g(r) = exp(-r^2 / (2 s^2)),
+// grad g = -(r / s^2) g(r), so the magnitude goes as r * g(r). The 1 / s^2 is a
+// common factor over every direction and the result is normalized, so it is
+// dropped. Peaks at r == s, which is where the diagonal shell samples.
+float blobWeight(float r, float s) {
+  return r * exp(-(r * r) / (2.0 * s * s));
+}
+
+// Legacy estimator: a 6-tap central difference at a hand-tuned 1.5-voxel
+// offset — three axes, no diagonals. The default, and what NiiVue has always
+// drawn.
+vec3 layerGradCentral(sampler3D tex, vec3 p) {
   vec3 dv = LAYER_GRAD_OFFSET / volumeTexDimsFull;
-  float vXp = layerScalar(texture(tex, chunkTexCoord(p + vec3(dv.x, 0.0, 0.0))));
-  float vXm = layerScalar(texture(tex, chunkTexCoord(p - vec3(dv.x, 0.0, 0.0))));
-  float vYp = layerScalar(texture(tex, chunkTexCoord(p + vec3(0.0, dv.y, 0.0))));
-  float vYm = layerScalar(texture(tex, chunkTexCoord(p - vec3(0.0, dv.y, 0.0))));
-  float vZp = layerScalar(texture(tex, chunkTexCoord(p + vec3(0.0, 0.0, dv.z))));
-  float vZm = layerScalar(texture(tex, chunkTexCoord(p - vec3(0.0, 0.0, dv.z))));
-  vec3 grad = vec3(vXp - vXm, vYp - vYm, vZp - vZm);
+  return vec3(
+    layerPairDiff(tex, p, vec3(dv.x, 0.0, 0.0)),
+    layerPairDiff(tex, p, vec3(0.0, dv.y, 0.0)),
+    layerPairDiff(tex, p, vec3(0.0, 0.0, dv.z)));
+}
+
+// Gaussian-blob gradient. Treat the layer as a sum of radially symmetric
+// Gaussian basis functions rather than a lattice of point samples. That
+// reconstruction differentiates analytically — d(f * g) = f * dg — so the
+// gradient of the smoothed field is a radially weighted sum of directional
+// central differences, with no finite-difference stencil left to hand-tune.
+// Every tap radius and weight falls out of LAYER_GRAD_SIGMA. Two shells: the
+// axes (whose two same-sign DoG taps at 1 and 2 voxels fold into ONE linear
+// fetch, so they cost what the central difference did) and the body diagonals
+// (which do not fold, and which buy the isotropy). See the full derivation in
+// the layerGradBlob comment in wgpu/render.wgsl.
+vec3 layerGradBlob(sampler3D tex, vec3 p) {
+  float s = LAYER_GRAD_SIGMA;
+  // One voxel in full-volume [0,1] units. Componentwise, so a voxel-space
+  // direction stays that direction after the anisotropic texture scaling.
+  vec3 vox = 1.0 / volumeTexDimsFull;
+
+  float w1 = blobWeight(1.0, s);
+  float w2 = blobWeight(2.0, s);
+  float rAx = (w1 + 2.0 * w2) / (w1 + w2);
+  float kAx = (w1 + w2) / rAx;
+  vec3 ax = rAx * vox;
+  vec3 grad = kAx * vec3(
+    layerPairDiff(tex, p, vec3(ax.x, 0.0, 0.0)),
+    layerPairDiff(tex, p, vec3(0.0, ax.y, 0.0)),
+    layerPairDiff(tex, p, vec3(0.0, 0.0, ax.z)));
+
+  if (LAYER_GRAD_DIAGONALS) {
+    float rDg = s;
+    float kDg = blobWeight(rDg, s) / rDg;
+    float u = 1.0 / sqrt(3.0);
+    vec3 d0 = vec3(u, u, u);
+    vec3 d1 = vec3(u, u, -u);
+    vec3 d2 = vec3(u, -u, u);
+    vec3 d3 = vec3(u, -u, -u);
+    vec3 dg = rDg * vox;
+    grad += kDg * (
+      d0 * layerPairDiff(tex, p, d0 * dg)
+      + d1 * layerPairDiff(tex, p, d1 * dg)
+      + d2 * layerPairDiff(tex, p, d2 * dg)
+      + d3 * layerPairDiff(tex, p, d3 * dg));
+  }
+  return grad;
+}
+
+// The old niivue's estimator: an 8-corner Sobel, i.e. the four body-diagonal
+// antipodal pairs at (+-1,+-1,+-1) voxels and no axis taps at all. The exact
+// mirror of the legacy central difference, and the better half of that trade
+// (0.68 vs 0.80 degrees mean angular error on an analytic sphere). Upstream it
+// runs as a precompute over a 27-tap blur prepass, which this in-shader version
+// does not have; see the wgpu/render.wgsl comment for what that costs.
+vec3 layerGradSobel8(sampler3D tex, vec3 p) {
+  vec3 vox = 1.0 / volumeTexDimsFull;
+  vec3 d0 = vec3(1.0, 1.0, 1.0);
+  vec3 d1 = vec3(1.0, 1.0, -1.0);
+  vec3 d2 = vec3(1.0, -1.0, 1.0);
+  vec3 d3 = vec3(1.0, -1.0, -1.0);
+  return d0 * layerPairDiff(tex, p, d0 * vox)
+    + d1 * layerPairDiff(tex, p, d1 * vox)
+    + d2 * layerPairDiff(tex, p, d2 * vox)
+    + d3 * layerPairDiff(tex, p, d3 * vox);
+}
+
+vec3 layerGrad(sampler3D tex, vec3 p, int mode) {
+  if (mode == LAYER_GRAD_SOBEL8) { return layerGradSobel8(tex, p); }
+  if (mode == LAYER_GRAD_BLOB) { return layerGradBlob(tex, p); }
+  return layerGradCentral(tex, p);
+}
+
+// Matcap shade factor from the layer's own gradient at p. Pass a
+// LINEARLY-filtered sampler (the drawing pass uses drawingLinear, its
+// nearest-filtered texture rebound with LINEAR) so each tap is a trilinear
+// blend of 8 texels. Returns vec3(1.0) — no shading — when the gradient is
+// degenerate.
+vec3 layerShade(sampler3D tex, vec3 p, float amount) {
+  vec3 grad = layerGrad(tex, p, int(layerGradMode));
   if (length(grad) <= LAYER_GRAD_EPSILON) { return vec3(1.0); }
   vec3 localNormal = normalize(grad);
   mat3 norm3 = mat3(normMtx);
   vec3 n = norm3 * localNormal;
-  vec2 uv = n.xy * 0.5 + 0.5;
+  // Flip y for the lookup. A matcap PNG is a lit sphere whose light sits near
+  // the TOP of the image, and v=0 is the image's top row (neither backend
+  // flips on upload), so v must count DOWN from the eye-space +y a normal
+  // pointing up produces. Without this the volume is lit from below.
+  vec2 uv = vec2(n.x, -n.y) * 0.5 + 0.5;
   vec3 mc_rgb = texture(matcap, uv).rgb * (1.0 + (amount / 3.0));
   return mix(vec3(1.0), mc_rgb, amount);
 }
@@ -570,6 +692,13 @@ void main() {
       // and dark seams along level boundaries.
       float bLo = (snappedBg <= stepSize) ? 0.0 : max(snappedBg - 0.5 * stepSize, 0.0);
       mat3 norm3 = mat3(normMtx);
+      // Three features read the precomputed gradient texture, and NONE of them
+      // is on by default. Hoisted out of the loop because all three terms are
+      // uniform over the draw (localGradientAmount is settled by the fast pass
+      // above), so the branch is fully coherent -- every fragment takes the
+      // same side. Skipping the fetch + normalize + matcap tap when they are
+      // all off measures ~20% of the render. Mirrored in wgpu/render.wgsl.
+      bool needsGradient = (localGradientAmount > 0.0) || (gradientOpacity > 0.0) || (silhouettePower > 0.0);
       for (int fi = 0; fi < MAX_FINE_STEPS; fi++) {
         if (bLo >= len) { break; }
         // Clipped to len, so the final sample covers the trailing sliver past
@@ -595,19 +724,54 @@ void main() {
             bgHasHit = true;
             firstHit = samplePos;
           }
-          vec3 gradRaw = texture(volumeGradient, volCoord).rgb;
-          vec3 localNormal = normalize(gradRaw * 2.0 - 1.0);
-          vec3 n = norm3 * localNormal;
-          vec2 uv = n.xy * 0.5 + 0.5;
-          float lightingAmount = localGradientAmount;
-          vec3 mc_rgb = texture(matcap, uv).rgb * (1.0 + (lightingAmount / 3.0));
-          vec3 blendedRGB = mix(vec3(1.0), mc_rgb, lightingAmount);
-          vec3 finalRGB = blendedRGB * applyGamma(colorSample.rgb, invGamma);
+          // Identity defaults, so the branch below is the only thing that has
+          // to know about the gradient: a magnitude of 1 is a no-op in the
+          // gradient-opacity pow(), and localNormal is read only under
+          // silhouettePower > 0, which implies needsGradient.
+          float gradMagnitude = 1.0;
+          vec3 localNormal = vec3(0.0);
+          vec3 finalRGB = applyGamma(colorSample.rgb, invGamma);
+          if (needsGradient) {
+            vec4 gradSample = texture(volumeGradient, volCoord);
+            gradMagnitude = gradSample.a;
+            // Guarded normalize: the precompute writes 0.5 (a zero vector once
+            // decoded) wherever the data is flat, and normalize(0) is undefined
+            // -- which would poison the matcap lookup and, below, the silhouette
+            // dot. The guarded form leaves both defined.
+            vec3 gradVec = gradSample.rgb * 2.0 - 1.0;
+            localNormal = gradVec / max(length(gradVec), 1e-6);
+            float lightingAmount = localGradientAmount;
+            if (lightingAmount > 0.0) {
+              vec3 n = norm3 * localNormal;
+              // See layerShade() for why y is flipped: the matcap's light is at
+              // the top of the PNG and v=0 is the top row, so v counts down from +y.
+              vec2 uv = vec2(n.x, -n.y) * 0.5 + 0.5;
+              vec3 mc_rgb = texture(matcap, uv).rgb * (1.0 + (lightingAmount / 3.0));
+              finalRGB *= mix(vec3(1.0), mc_rgb, lightingAmount);
+            }
+          }
           // Step-size correction compensates a coarse brick's sparser sampling
           // in an OVER accumulation. A max projection reads each sample
           // independently, so correcting it would brighten coarse bricks
           // instead of matching them.
           float correctedA = mip ? colorSample.a : (1.0 - pow(1.0 - colorSample.a, max(slab * refPerLen * lodOpacityScale, 1e-3)));
+          // Gradient opacity: scale alpha by the gradient magnitude raised to
+          // gradientOpacity*8. This is the analytic form of the old niivue's
+          // 192-entry LUT, which held exactly pow(i/191, opacity*8) -- so there
+          // is no table to upload and 0 is a no-op by construction
+          // (pow(m, 0) == 1) rather than by a special case. Homogeneous interior
+          // has magnitude ~0 and fades out; edges keep their alpha.
+          if (gradientOpacity > 0.0) {
+            correctedA *= pow(gradMagnitude, gradientOpacity * 8.0);
+          }
+          // Silhouette: fade material whose surface faces the camera and keep
+          // material seen edge-on, so a surface reads as a rim. The hard cull
+          // above 1-silhouettePower is what opens the interior at higher settings.
+          if (silhouettePower > 0.0) {
+            float viewAlign = abs(dot(localNormal, dir));
+            correctedA *= pow(1.0 - viewAlign, silhouettePower);
+            if (viewAlign > 1.0 - silhouettePower) { correctedA = 0.0; }
+          }
           vec4 premultiplied = vec4(finalRGB * correctedA, correctedA);
           if (mip) {
             colAcc = max(colAcc, premultiplied);

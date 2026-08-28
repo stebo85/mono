@@ -520,6 +520,15 @@ export default class NVGlview {
     this.volumeRenderer.sampleRate = md.volume.sampleRate
     // Tricubic B-spline reconstruction in the fine march (8 fetches vs 1).
     this.volumeRenderer.isCubicInterpolation = md.volume.isCubicInterpolation
+    // Stencil for the overlay/drawing passes' own gradient (the background's is
+    // precomputed into a texture and unaffected).
+    this.volumeRenderer.layerGradientMode = md.volume.layerGradientMode
+    // Background-only alpha modulation from that precomputed gradient: suppress
+    // homogeneous interior (gradientOpacity) and fade view-aligned material into
+    // a rim (silhouette). Set before chunk work, like gradientAmount, because a
+    // non-zero value means an unlit chunk still needs its gradient computed.
+    this.volumeRenderer.gradientOpacity = md.volume.gradientOpacity
+    this.volumeRenderer.silhouette = md.volume.silhouette
     // Display gamma for the classified RGB of every volume sample (alpha, and
     // therefore occlusion, is untouched).
     this.volumeRenderer.gamma = md.scene.gamma

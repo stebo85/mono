@@ -35,6 +35,7 @@ export {
 } from './mrs/MrsScene'
 export {
   DRAG_MODE,
+  LAYER_GRADIENT_MODE,
   MULTIPLANAR_TYPE,
   NiiDataType,
   SHOW_RENDER,

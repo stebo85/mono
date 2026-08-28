@@ -106,6 +106,7 @@ const PROPS_RW = [
   ["thumbnailUrl", "thumbnail_url"],
   ["tileMargin", "tile_margin"],
   ["volumeAlphaShader", "volume_alpha_shader"],
+  ["volumeGradientOpacity", "volume_gradient_opacity"],
   ["volumeIllumination", "volume_illumination"],
   ["volumeIsAlphaClipDark", "volume_is_alpha_clip_dark"],
   ["volumeIsBackgroundMasking", "volume_is_background_masking"],
@@ -113,6 +114,7 @@ const PROPS_RW = [
   ["volumeIsCubicInterpolation", "volume_is_cubic_interpolation"],
   ["volumeIsNearestInterpolation", "volume_is_nearest_interpolation"],
   ["volumeIsV1SliceShader", "volume_is_v1_slice_shader"],
+  ["volumeLayerGradientMode", "volume_layer_gradient_mode"],
   ["volumeLodBrightnessCompensation", "volume_lod_brightness_compensation"],
   ["volumeLodOpacityCompensation", "volume_lod_opacity_compensation"],
   ["volumeMatcap", "volume_matcap"],
@@ -120,6 +122,7 @@ const PROPS_RW = [
   ["volumePaqdUniforms", "volume_paqd_uniforms"],
   ["volumeRenderMode", "volume_render_mode"],
   ["volumeSampleRate", "volume_sample_rate"],
+  ["volumeSilhouette", "volume_silhouette"],
   ["volumeTransmittanceCutoff", "volume_transmittance_cutoff"],
 ]
 

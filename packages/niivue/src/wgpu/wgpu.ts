@@ -1,56 +1,82 @@
 import * as NVCmaps from '@/cmap/NVCmaps'
 import { applyCORS } from '@/NVLoader'
-import blurWGSL from './blur.wgsl?raw'
+import {
+  GRAD_EPS,
+  GRAD_SCALE,
+  GRAD_SHIFT,
+  SOBEL_RADIUS,
+} from '@/view/NVGradient'
 import sobelWGSL from './sobel.wgsl?raw'
 
 // --- per-device cached pipelines ---
 interface GradientPipelines {
   sobelPipeline: GPUComputePipeline
-  blurPipeline: GPUComputePipeline
   sobelBindLayout: GPUBindGroupLayout
-  blurBindLayout: GPUBindGroupLayout
+  sampler: GPUSampler
 }
 const _deviceCache = new WeakMap<GPUDevice, GradientPipelines>()
 
-// ensure compute & blur pipelines exist and are cached for this device
+// ensure the gradient pipeline exists and is cached for this device
 function ensureComputePipelines(device: GPUDevice): GradientPipelines {
   let cached = _deviceCache.get(device)
   if (cached) return cached
   const compModule = device.createShaderModule({ code: sobelWGSL })
   const sobelPipeline = device.createComputePipeline({
     layout: 'auto',
-    compute: { module: compModule, entryPoint: 'main' },
+    compute: {
+      module: compModule,
+      entryPoint: 'main',
+      // Pipeline-overridable constants rather than string-interpolated
+      // literals, so this and the GLSL in gl/gradient.ts read the same
+      // numbers from view/NVGradient.ts by construction.
+      constants: {
+        sobelRadius: SOBEL_RADIUS,
+        gradEps: GRAD_EPS,
+        gradShift: GRAD_SHIFT,
+        gradScale: GRAD_SCALE,
+      },
+    },
   })
-  const blurModule = device.createShaderModule({ code: blurWGSL })
-  const blurPipeline = device.createComputePipeline({
-    layout: 'auto',
-    compute: { module: blurModule, entryPoint: 'main' },
+  // LINEAR + clamp-to-edge, matching the filtering and wrap gl/gradient.ts
+  // sets on its input texture. The filtering is what makes the fractional
+  // sobelRadius tap smooth, so it is load-bearing, not a default.
+  const sampler = device.createSampler({
+    magFilter: 'linear',
+    minFilter: 'linear',
+    addressModeU: 'clamp-to-edge',
+    addressModeV: 'clamp-to-edge',
+    addressModeW: 'clamp-to-edge',
   })
   cached = {
     sobelPipeline,
-    blurPipeline,
     sobelBindLayout: sobelPipeline.getBindGroupLayout(0),
-    blurBindLayout: blurPipeline.getBindGroupLayout(0),
+    sampler,
   }
   _deviceCache.set(device, cached)
   return cached
 }
 
-export async function volume2TextureGradientRGBA(
+/**
+ * Await-free gradient build, for callers that cannot be async.
+ *
+ * The `await onSubmittedWorkDone()` in the async wrapper below is a
+ * synchronisation convenience, not a correctness requirement: the compute pass
+ * and every later render pass that samples its output go on the same queue, so
+ * the queue already orders the write before the read. This variant encodes and
+ * submits exactly the same work and hands back the texture immediately, which
+ * is what lets the per-frame lazy fill run inside the synchronous frame hook.
+ */
+export function volume2TextureGradientRGBASync(
   device: GPUDevice,
   textureRGBA: GPUTexture,
-): Promise<GPUTexture> {
+): GPUTexture {
   const cached = ensureComputePipelines(device)
   const vx = textureRGBA.width
   const vy = textureRGBA.height
   const vz = textureRGBA.depthOrArrayLayers
-  // 1) Create the output textures
-  const tempGradientTex = device.createTexture({
-    size: [vx, vy, vz],
-    format: 'rgba8unorm',
-    dimension: '3d',
-    usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.STORAGE_BINDING,
-  })
+  // 1) Create the output texture. One pass, so no temp texture and no
+  // ping-pong: the blur that used to sit between them is gone (its smoothing
+  // now comes from the linear sampler, as it does on WebGL2).
   const finalVolumeTexture = device.createTexture({
     size: [vx, vy, vz],
     format: 'rgba8unorm',
@@ -60,19 +86,13 @@ export async function volume2TextureGradientRGBA(
       GPUTextureUsage.STORAGE_BINDING |
       GPUTextureUsage.COPY_SRC,
   })
-  // 2) Create Bind Groups using the input texture directly
+  // 2) Bind the input texture directly, plus the filtering sampler
   const sobelBindGroup = device.createBindGroup({
     layout: cached.sobelBindLayout,
     entries: [
       { binding: 0, resource: textureRGBA.createView() },
-      { binding: 1, resource: tempGradientTex.createView() },
-    ],
-  })
-  const blurBindGroup = device.createBindGroup({
-    layout: cached.blurBindLayout,
-    entries: [
-      { binding: 0, resource: tempGradientTex.createView() },
       { binding: 1, resource: finalVolumeTexture.createView() },
+      { binding: 2, resource: cached.sampler },
     ],
   })
   // 3) Dispatch
@@ -88,21 +108,17 @@ export async function volume2TextureGradientRGBA(
     )
     pass.end()
   }
-  {
-    const pass2 = encoder.beginComputePass()
-    pass2.setPipeline(cached.blurPipeline)
-    pass2.setBindGroup(0, blurBindGroup)
-    pass2.dispatchWorkgroups(
-      Math.ceil(vx / 8),
-      Math.ceil(vy / 8),
-      Math.ceil(vz / 4),
-    )
-    pass2.end()
-  }
   device.queue.submit([encoder.finish()])
-  await device.queue.onSubmittedWorkDone()
-  tempGradientTex.destroy()
   return finalVolumeTexture
+}
+
+export async function volume2TextureGradientRGBA(
+  device: GPUDevice,
+  textureRGBA: GPUTexture,
+): Promise<GPUTexture> {
+  const texture = volume2TextureGradientRGBASync(device, textureRGBA)
+  await device.queue.onSubmittedWorkDone()
+  return texture
 }
 
 export async function lutBytes2texture(

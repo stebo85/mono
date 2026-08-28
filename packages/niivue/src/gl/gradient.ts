@@ -6,6 +6,12 @@
  * Uses WebGL2 slice-by-slice rendering (no compute shaders needed).
  */
 import { log } from '@/logger'
+import {
+  GRAD_EPS,
+  GRAD_SCALE,
+  GRAD_SHIFT,
+  SOBEL_RADIUS,
+} from '@/view/NVGradient'
 
 // Shader program cache (one program per GL context)
 const _programCache = new WeakMap<WebGL2RenderingContext, WebGLProgram>()
@@ -27,6 +33,11 @@ void main() {
     TexCoord = vPos.xy;
     gl_Position = vec4((vPos.xy - vec2(0.5, 0.5)) * 2.0, 0.0, 1.0);
 }`
+
+// Constants for the LOGARITHMIC gradient magnitude written to alpha, and the
+// tap offset. Shared with wgpu/sobel.wgsl, which takes the same values as
+// pipeline-overridable constants -- the two backends run the SAME estimator,
+// so neither may define these locally. See view/NVGradient.ts.
 
 // Fragment shader - computes gradients using diagonal sampling
 const fragShader = `#version 300 es
@@ -77,8 +88,25 @@ void main() {
     // Map from [-1, 1] to [0, 1] for RGBA8 storage
     vec3 normalized = gradient * 0.5 + 0.5;
 
-    // Store normalized gradient in RGB, alpha = 1.0
-    FragColor = vec4(normalized, 1.0);
+    // Alpha carries the gradient MAGNITUDE, which the render shader's
+    // gradientOpacity reads to suppress homogeneous interior. It used to be a
+    // constant 1.0, which made that feature a silent no-op on this backend --
+    // WebGPU's sobel.wgsl has always written a magnitude here.
+    //
+    // The encoding is LOGARITHMIC in the SQUARED gradient. That is not
+    // cosmetic: gradientOpacity raises this value to the power
+    // gradientOpacity*8, and a linear magnitude sits near zero through most of
+    // a volume, so any useful slider position would drive the whole render to
+    // black. The log spreads "one 8-bit level of contrast" to "full contrast"
+    // across [0, 1], which is the range those exponents were tuned against.
+    //
+    // wgpu/sobel.wgsl runs this same estimator -- same channel, same stencil,
+    // same offsets, same constants -- so the two backends produce the same
+    // image, which is the whole point. Change one and you must change both.
+    float g2 = gx * gx + gy * gy + gz * gz;
+    float magnitude = (log2(g2 + float(${GRAD_EPS})) + float(${GRAD_SHIFT})) * float(${GRAD_SCALE});
+
+    FragColor = vec4(normalized, magnitude);
 }`
 
 /**
@@ -190,7 +218,8 @@ function createQuadGeometry(gl: WebGL2RenderingContext, program: WebGLProgram) {
  * @param {WebGL2RenderingContext} gl - WebGL2 context
  * @param {WebGLTexture} textureRGBA - Input RGBA8 3D texture
  * @param {Array<number>} dims - Volume dimensions [width, height, depth]
- * @returns {WebGLTexture} Output RGBA8 3D texture with gradients in RGB channels
+ * @returns {WebGLTexture} Output RGBA8 3D texture: normalized gradient
+ *   direction in RGB, gradient magnitude in alpha
  */
 export function volume2TextureGradientRGBA(
   gl: WebGL2RenderingContext,
@@ -212,11 +241,20 @@ export function volume2TextureGradientRGBA(
   // Create quad geometry
   const { vao, vbo } = createQuadGeometry(gl, program)
 
-  // Set input texture to use LINEAR filtering for smooth gradient computation
+  // LINEAR + clamp-to-edge on the INPUT, matching the sampler wgpu/wgpu.ts
+  // hands to sobel.wgsl. The filtering is what makes the fractional-radius tap
+  // smooth (it replaces a blur pass), and the wrap decides what the tap reads
+  // one voxel outside the volume -- with REPEAT the boundary face would take
+  // its gradient from the opposite face. Every caller already sets both, but
+  // stating them here is what makes the two backends agree by construction
+  // rather than by the caller's good behaviour.
   gl.activeTexture(gl.TEXTURE0)
   gl.bindTexture(gl.TEXTURE_3D, textureRGBA)
   gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MIN_FILTER, gl.LINEAR)
   gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MAG_FILTER, gl.LINEAR)
+  gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE)
+  gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE)
+  gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_R, gl.CLAMP_TO_EDGE)
 
   // Create output gradient texture
   const outputTexture = gl.createTexture()
@@ -275,11 +313,11 @@ export function volume2TextureGradientRGBA(
   }
   gl.uniform1i(uniforms.intensityVol, 0) // Input texture unit
 
-  // Sobel radius for diagonal sampling (matches user's snippet)
-  const sobelRadius = 0.7
-  gl.uniform1f(uniforms.dX, sobelRadius / vx)
-  gl.uniform1f(uniforms.dY, sobelRadius / vy)
-  gl.uniform1f(uniforms.dZ, sobelRadius / vz)
+  // Fractional on purpose: the input texture is sampled LINEAR, so each tap is
+  // a trilinear blend and the stencil gets its smoothing from the sampler.
+  gl.uniform1f(uniforms.dX, SOBEL_RADIUS / vx)
+  gl.uniform1f(uniforms.dY, SOBEL_RADIUS / vy)
+  gl.uniform1f(uniforms.dZ, SOBEL_RADIUS / vz)
 
   // Render each output slice
   for (let z = 0; z < vz; z++) {

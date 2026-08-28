@@ -1350,6 +1350,24 @@ export default class NiiVue extends EventTarget {
   }
 
   /**
+   * Which stencil estimates the in-shader LAYER gradient used to light the
+   * overlay and drawing ray-march passes from their own normals:
+   * `LAYER_GRADIENT_MODE.CENTRAL` (default), `BLOB`, or `SOBEL8`. The
+   * background volume is unaffected -- its gradient is precomputed into a
+   * texture. Only matters when `volumeIllumination` is above 0, which is what
+   * turns layer shading on. An out-of-range value falls back to CENTRAL in the
+   * shader. See LAYER_GRADIENT_MODE for the accuracy measurements.
+   */
+  get volumeLayerGradientMode(): number {
+    return this.model.volume.layerGradientMode
+  }
+  set volumeLayerGradientMode(v: number) {
+    this.model.volume.layerGradientMode = v
+    this.emit('change', { property: 'volumeLayerGradientMode', value: v })
+    this.drawScene()
+  }
+
+  /**
    * Samples per voxel along the ray in the 3D render. Higher values converge the
    * ray integral at a proportional fragment cost. Clamped to [1, 4]. This does
    * NOT remove concentric banding on smooth structures; for the reconstruction
@@ -1484,6 +1502,58 @@ export default class NiiVue extends EventTarget {
     this.emit('change', {
       property: 'volumeLodOpacityCompensation',
       value: this.model.volume.lodOpacityCompensation,
+    })
+    this.drawScene()
+  }
+
+  /**
+   * Gradient-magnitude opacity modulation for the BACKGROUND volume's 3D
+   * ray-march, [0, 1]; 0 (the default) is a no-op. Raising it suppresses
+   * homogeneous interior while leaving edges intact: each sample's alpha is
+   * scaled by `magnitude ^ (gradientOpacity * 8)`, and the magnitude is near 0
+   * wherever the data is flat.
+   *
+   * Reads the magnitude from the precomputed background gradient texture, so it
+   * does nothing to overlays or the drawing layer (those estimate a gradient
+   * in-shader -- see `volumeLayerGradientMode`) and nothing on 2D slices, which
+   * show one sample with no accumulation. Independent of `volumeIllumination`:
+   * this changes opacity, that changes lighting, and either works alone.
+   * See `volumeSilhouette` for the companion rim effect.
+   */
+  get volumeGradientOpacity(): number {
+    return this.model.volume.gradientOpacity
+  }
+  set volumeGradientOpacity(v: number) {
+    this.model.volume.gradientOpacity = Number.isFinite(v)
+      ? Math.min(Math.max(v, 0), 1)
+      : VOLUME_DEFAULTS.gradientOpacity
+    this.emit('change', {
+      property: 'volumeGradientOpacity',
+      value: this.model.volume.gradientOpacity,
+    })
+    this.drawScene()
+  }
+
+  /**
+   * Silhouette (Fresnel rim) enhancement for the BACKGROUND volume's 3D
+   * ray-march, [0, 1]; 0 (the default) is a no-op.
+   *
+   * Alpha is scaled by `(1 - |dot(normal, rayDir)|) ^ silhouette`, fading
+   * material that faces the camera and keeping material seen edge-on, so a
+   * surface reads as an outline; samples more view-aligned than `1 - silhouette`
+   * are culled outright. Same background-only, 3D-only scope as
+   * `volumeGradientOpacity`, and the two are independent.
+   */
+  get volumeSilhouette(): number {
+    return this.model.volume.silhouette
+  }
+  set volumeSilhouette(v: number) {
+    this.model.volume.silhouette = Number.isFinite(v)
+      ? Math.min(Math.max(v, 0), 1)
+      : VOLUME_DEFAULTS.silhouette
+    this.emit('change', {
+      property: 'volumeSilhouette',
+      value: this.model.volume.silhouette,
     })
     this.drawScene()
   }

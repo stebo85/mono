@@ -998,6 +998,17 @@
       "doc": null
     },
     {
+      "jsName": "volumeGradientOpacity",
+      "pyName": "volume_gradient_opacity",
+      "tsType": "number",
+      "pyTraitlet": {
+        "kind": "Float"
+      },
+      "hasGetter": true,
+      "hasSetter": true,
+      "doc": null
+    },
+    {
       "jsName": "volumeIllumination",
       "pyName": "volume_illumination",
       "tsType": "number",
@@ -1069,6 +1080,17 @@
       "tsType": "boolean",
       "pyTraitlet": {
         "kind": "Bool"
+      },
+      "hasGetter": true,
+      "hasSetter": true,
+      "doc": null
+    },
+    {
+      "jsName": "volumeLayerGradientMode",
+      "pyName": "volume_layer_gradient_mode",
+      "tsType": "number",
+      "pyTraitlet": {
+        "kind": "Float"
       },
       "hasGetter": true,
       "hasSetter": true,
@@ -1147,6 +1169,17 @@
     {
       "jsName": "volumeSampleRate",
       "pyName": "volume_sample_rate",
+      "tsType": "number",
+      "pyTraitlet": {
+        "kind": "Float"
+      },
+      "hasGetter": true,
+      "hasSetter": true,
+      "doc": null
+    },
+    {
+      "jsName": "volumeSilhouette",
+      "pyName": "volume_silhouette",
       "tsType": "number",
       "pyTraitlet": {
         "kind": "Float"

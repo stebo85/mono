@@ -92,6 +92,27 @@ struct Params {
     // it). It rides in what was pad, so the struct size and every offset are
     // unchanged.
     rayStepTexVox: vec4f,
+    // Which stencil the overlay and drawing passes estimate their own gradient
+    // with: LAYER_GRAD_CENTRAL | LAYER_GRAD_BLOB | LAYER_GRAD_SOBEL8. The
+    // background volume reads a precomputed gradient texture and ignores this.
+    // A trailing f32: the struct's 16-byte alignment absorbs it, so every
+    // offset above is unchanged and the uniform slot does not grow. Mirrors
+    // layerGradMode in gl/renderShader.ts. The depth-pick shader shares this
+    // struct but never reads the field -- a pick reads geometry, not shading.
+    layerGradMode: f32,
+    // Background-volume gradient opacity and silhouette (Fresnel rim), both 0
+    // when off. gradientOpacity scales each background sample's alpha by
+    // magnitude^(gradientOpacity*8) -- the analytic form of the old NiiVue's
+    // 192-entry LUT, which sampled exactly that function -- and silhouette
+    // scales it by (1-|dot(normal,rayDir)|)^silhouette with a cull above
+    // 1-silhouette. Both read the PRECOMPUTED gradient texture (rgb = direction,
+    // a = magnitude), so they apply to the background pass only. Two more
+    // trailing f32s: the struct's 16-byte alignment still rounds the size to the
+    // 512 it already occupied, so no offset above moves. Mirror gradientOpacity
+    // and silhouettePower in gl/renderShader.ts. The depth-pick shader shares
+    // this struct but never reads them -- a pick reads geometry, not opacity.
+    gradientOpacity: f32,
+    silhouettePower: f32,
 }
 
 // Remap a sample position from full-volume [0,1] cube space to the local chunk
@@ -245,7 +266,10 @@ fn vertex_main(vert: VertexInput) -> VertexOutput {
     return out;
 }
 
-fn frac2ndc(frac: vec3f) -> f32 {
+// Clip-space position of a point given in full-volume texture fraction. Same
+// chain the vertex shader runs, so a fragment can recover where its sample
+// landed on screen without a varying.
+fn frac2clip(frac: vec3f) -> vec4f {
     var pos: vec4f = vec4f(frac, 1.0);
     let dim: vec4f = vec4f(params.volumeTexDimsFull.xyz, 1.0);
     pos = pos * dim;
@@ -254,7 +278,11 @@ fn frac2ndc(frac: vec3f) -> f32 {
     // WGSL matrices are column-major.
     // In GLSL 'transpose(matRAS) * pos' is equivalent to 'pos * matRAS' in WGSL
     let mm: vec4f = pos * params.matRAS;
-    let gl_pos: vec4f = params.mvpMtx * vec4f(mm.xyz, 1.0);
+    return params.mvpMtx * vec4f(mm.xyz, 1.0);
+}
+
+fn frac2ndc(frac: vec3f) -> f32 {
+    let gl_pos: vec4f = frac2clip(frac);
     let z_ndc: f32 = gl_pos.z / gl_pos.w;
     // orthoZO produces clip Z in [0,1], matching WebGPU's native NDC range
     return z_ndc;

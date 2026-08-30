@@ -946,6 +946,23 @@ export default class NiiVue extends EventTarget {
   }
 
   /**
+   * Let a single 2D slice (axial, coronal or sagittal alone) use the whole
+   * canvas rather than a tile letterboxed to the slice's aspect ratio. The
+   * slice draws at the same scale and position either way; filling only means a
+   * zoomed view spends the margins on image instead of clipping them away.
+   * @default `true`
+   * @example nv1.isSingleViewFillCanvas = false
+   */
+  get isSingleViewFillCanvas(): boolean {
+    return this.model.layout.isSingleViewFillCanvas
+  }
+  set isSingleViewFillCanvas(v: boolean) {
+    this.model.layout.isSingleViewFillCanvas = v
+    this.emit('change', { property: 'isSingleViewFillCanvas', value: v })
+    this.drawScene()
+  }
+
+  /**
    * Get or set a custom tile layout. When set to a non-empty array this
    * overrides all built-in layout modes (multiplanar, mosaic, hero).
    * Each tile specifies a slice type and a normalized [left, top, width, height]

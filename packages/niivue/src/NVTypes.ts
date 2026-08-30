@@ -632,6 +632,8 @@ export type LayoutConfig = {
   isMosaicCentered: boolean
   margin: number
   isRadiological: boolean
+  /** Let a single 2D slice tile fill the canvas instead of letterboxing it. */
+  isSingleViewFillCanvas: boolean
   customLayout: CustomLayoutTile[] | null
 }
 
@@ -1077,6 +1079,7 @@ export type NiiVueOptions = {
   isMosaicCentered?: boolean
   tileMargin?: number
   isRadiological?: boolean
+  isSingleViewFillCanvas?: boolean
   customLayout?: CustomLayoutTile[] | null
 
   // UI

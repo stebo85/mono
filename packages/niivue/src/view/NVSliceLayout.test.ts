@@ -7,6 +7,7 @@ import {
   fitSlicesAndGraph,
   type SliceLayoutConfig,
   type SliceTile,
+  screenSlicesLayout,
 } from './NVSliceLayout'
 
 // Wide pane (2000x400) with a cube volume: a single-orientation slice is ~square
@@ -24,9 +25,20 @@ function cfg(over: Partial<SliceLayoutConfig> = {}): SliceLayoutConfig {
 describe('fitSlicesAndGraph', () => {
   test('singleAxial_graphReclaimsHorizontalSlack', () => {
     const base = 200
-    const { screenSlices, graphWidth } = fitSlicesAndGraph(cfg(), base)
+    const { screenSlices, graphWidth } = fitSlicesAndGraph(
+      cfg({ isSingleViewFillCanvas: false }),
+      base,
+    )
     expect(screenSlices.length).toBeGreaterThanOrEqual(1)
     expect(graphWidth).toBeGreaterThan(base)
+  })
+
+  test('singleAxialFillingTheCanvas_leavesNoSlackToReclaim', () => {
+    // The slack the graph used to take is now the slice's, so the graph keeps
+    // its base width rather than both laying claim to the same pixels.
+    const base = 200
+    const { graphWidth } = fitSlicesAndGraph(cfg(), base)
+    expect(graphWidth).toBe(base)
   })
 
   test('noGraph_returnsZeroWidthAndUnchangedSlices', () => {
@@ -123,5 +135,81 @@ describe('crosshairRadiusMM', () => {
         leftTopWidthHeight: [0, 0, 360, 360],
       } as unknown as SliceTile),
     ).toBe(0)
+  })
+})
+
+describe('isSingleViewFillCanvas', () => {
+  const mmPerPx = (t: SliceTile, axis: 0 | 1): number => {
+    const s = t.screen as { mnMM: vec3; mxMM: vec3 }
+    const ltwh = t.leftTopWidthHeight as number[]
+    return (s.mxMM[axis] - s.mnMM[axis]) / ltwh[2 + axis]
+  }
+  const centre = (t: SliceTile, axis: 0 | 1): number => {
+    const s = t.screen as { mnMM: vec3; mxMM: vec3 }
+    return (s.mnMM[axis] + s.mxMM[axis]) / 2
+  }
+
+  test('off_letterboxesToTheSliceAspect', () => {
+    const [tile] = screenSlicesLayout(cfg({ isSingleViewFillCanvas: false }))
+    // Cube volume in a 2000x400 pane: a square tile centered horizontally.
+    expect(tile.leftTopWidthHeight).toEqual([800, 0, 400, 400])
+  })
+
+  test('onTakesTheWholeCanvas', () => {
+    const [tile] = screenSlicesLayout(cfg())
+    expect(tile.leftTopWidthHeight).toEqual([0, 0, 2000, 400])
+  })
+
+  test('fillingChangesNeitherTheScaleNorTheCentreOfTheSlice', () => {
+    // The whole point: the slice lands on the same pixels either way. Only the
+    // clipping rect grows, so a zoom eats the margin instead of the image.
+    // Swept over all three orientations with ANISOTROPIC extents and both pane
+    // aspects -- on a cube in a wide pane only axis 0 moves, so a swapped U/V
+    // index in fillScreen would pass unnoticed.
+    const extentsMax = vec3.fromValues(20, 10, 40)
+    for (const sliceType of [0, 1, 2]) {
+      for (const canvasWH of [
+        [2000, 400],
+        [400, 2000],
+        [400, 400],
+      ] as [number, number][]) {
+        const over = { sliceType, canvasWH, extentsMax }
+        const [boxed] = screenSlicesLayout(
+          cfg({ ...over, isSingleViewFillCanvas: false }),
+        )
+        const [filled] = screenSlicesLayout(cfg(over))
+        for (const axis of [0, 1] as const) {
+          expect(mmPerPx(filled, axis)).toBeCloseTo(mmPerPx(boxed, axis), 10)
+          expect(centre(filled, axis)).toBeCloseTo(centre(boxed, axis), 10)
+        }
+      }
+    }
+  })
+
+  test('degenerateSliceAreaKeepsFiniteBounds', () => {
+    // No room to fill: widening by the fit scale would be a divide by zero and
+    // NaN mm bounds reach the projection matrix.
+    for (const wh of [
+      [0, 400],
+      [-50, 400],
+    ] as [number, number][]) {
+      const [tile] = screenSlicesLayout(cfg({ canvasWH: wh }))
+      const scr = tile.screen as { mnMM: vec3; mxMM: vec3; fovMM: vec3 }
+      for (const axis of [0, 1]) {
+        expect(Number.isFinite(scr.mnMM[axis])).toBe(true)
+        expect(Number.isFinite(scr.mxMM[axis])).toBe(true)
+        expect(scr.mxMM[axis]).toBeGreaterThan(scr.mnMM[axis])
+      }
+    }
+  })
+
+  test('multiplanarIgnoresTheFlag', () => {
+    const off = screenSlicesLayout(
+      cfg({ sliceType: 3, isSingleViewFillCanvas: false }),
+    )
+    const on = screenSlicesLayout(cfg({ sliceType: 3 }))
+    expect(on.map((t) => t.leftTopWidthHeight)).toEqual(
+      off.map((t) => t.leftTopWidthHeight),
+    )
   })
 })

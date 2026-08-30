@@ -933,13 +933,17 @@ describe('stepZoom2D', () => {
   })
 
   test('bothEndsOfTheRangeAreReachable', () => {
-    let zoom = 1
-    for (let i = 0; i < 200 && zoom > ZOOM_2D_MIN; i++)
-      zoom = stepZoom2D(zoom, -1)
-    expect(zoom).toBe(ZOOM_2D_MIN)
-    for (let i = 0; i < 200 && zoom < ZOOM_2D_MAX; i++)
-      zoom = stepZoom2D(zoom, 1)
-    expect(zoom).toBe(ZOOM_2D_MAX)
+    // Second pass through fround: scene.pan2Dxyzmm is a vec4, so 0.4 comes back
+    // as 0.40000000596 and an exact stall test jammed the wheel there.
+    for (const f of [(x: number) => x, Math.fround]) {
+      let zoom = f(1)
+      for (let i = 0; i < 200 && zoom > ZOOM_2D_MIN; i++)
+        zoom = f(stepZoom2D(zoom, -1))
+      expect(zoom).toBe(f(ZOOM_2D_MIN))
+      for (let i = 0; i < 200 && zoom < ZOOM_2D_MAX; i++)
+        zoom = f(stepZoom2D(zoom, 1))
+      expect(zoom).toBe(f(ZOOM_2D_MAX))
+    }
   })
 
   test('lowEndStepsAreReversible', () => {

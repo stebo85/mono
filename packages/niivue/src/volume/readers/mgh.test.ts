@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test'
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
+import { gunzipSync } from 'node:zlib'
 import { NiiDataType } from '@/NVConstants'
 import { calMinMax, toTypedViewOrU8 } from '@/volume/utils'
 import { read } from './mgh'
@@ -26,8 +27,9 @@ const EXPECTED = {
   midValue: 8,
 }
 
-describe('mgh reader (big-endian INT32 MGZ)', () => {
+describe('mgh reader (big-endian INT32)', () => {
   test('decodesInt32VoxelsInNativeByteOrder', async () => {
+    // Straight from the .mgz, so the reader's own gzip branch is covered.
     const buf = readFileSync(FIXTURE)
     const { hdr, img } = await read(buf, 'brainmask-int.mgz')
 
@@ -71,5 +73,23 @@ describe('mgh reader (big-endian INT32 MGZ)', () => {
     expect(max).toBe(EXPECTED.max)
     expect(sum).toBe(EXPECTED.sum)
     expect(i32[EXPECTED.midIndex]).toBe(EXPECTED.midValue)
+  })
+
+  test('acceptsANodeBufferWithoutHandingBackItsWholeAllocation', async () => {
+    // A Buffer's slice() is subarray(), so taking `.buffer` off it returns the
+    // entire underlying allocation rather than the image. gunzipSync gives a
+    // real Buffer; a .mgh name skips the gzip branch so this exercises only the
+    // slicing. The reader must also leave the caller's bytes unswapped.
+    const raw = gunzipSync(readFileSync(FIXTURE))
+    const firstVoxelByte = raw[raw.length - 1]
+    const { hdr, img } = await read(raw, 'brainmask-int.mgh')
+
+    expect(img).toBeInstanceOf(ArrayBuffer)
+    expect((img as ArrayBuffer).byteLength).toBe(256 * 256 * 256 * 4)
+    const i32 = toTypedViewOrU8(img, hdr.datatypeCode)
+    expect(i32).toBeInstanceOf(Int32Array)
+    expect((i32 as Int32Array).length).toBe(256 * 256 * 256)
+    expect((i32 as Int32Array)[EXPECTED.midIndex]).toBe(EXPECTED.midValue)
+    expect(raw[raw.length - 1]).toBe(firstVoxelByte)
   })
 })

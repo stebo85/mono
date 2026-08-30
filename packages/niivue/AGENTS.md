@@ -10,9 +10,16 @@ NiiVue is a WebGPU-based neuroimaging visualization library (volumes + meshes) w
 
 Package manager is **Bun**. Never use `npm`/`npx`/`pnpm`/`yarn`.
 
+The version is pinned in `.bun-version` (every workflow reads it via
+`oven-sh/setup-bun`'s `bun-version-file`); match it locally with
+`curl -fsSL https://bun.sh/install | bash -s "bun-v$(cat .bun-version)"`. An older
+Bun silently diverges: it rewrites `bun.lock` to an older format, does not hoist
+`bun-types` (so several projects fail `typecheck` with TS2688), and lacks
+`DecompressionStream`, which fails any test that decodes a gzipped fixture.
+
 ```bash
 bun install                          # Install dependencies
-bun run dev                          # Hot-reload dev server at localhost:8080
+bun run dev                          # Hot-reload dev server at localhost:5273
 bun run build                        # Library build to ./dist (vite.config.lib.ts, ES)
 bun run build:examples               # Examples site build (vite.config.examples.ts)
 bun run deploy                       # Production examples-site build (GitHub Pages)
@@ -33,7 +40,7 @@ bunx nx lint niivue
 
 **Before committing**, run `bun run lint:fix && bun run typecheck` (or `bunx nx lint niivue && bunx nx typecheck niivue`).
 
-`bun run dev` uses a Vite plugin (`vite.config.dev.js`) to redirect `import '../dist/niivue.js'` to source for HMR, so the same HTML/JS files work in dev and production.
+`bun run dev` serves `examples/` from source (the pages `import '../src/index.ts'`), so dev and the examples build run the same files.
 
 Library packaging: `bun run build` emits `dist/niivue.js` (both backends), `dist/niivue.webgpu.js` (WebGPU-only), and `dist/niivue.webgl2.js` (WebGL2-only), exported as `@niivue/niivue`, `@niivue/niivue/webgpu`, and `@niivue/niivue/webgl2`.
 
@@ -216,7 +223,7 @@ The model is organized into 8 semantic config groups:
 | Group | Purpose | Example properties |
 |-------|---------|-------------------|
 | `scene` | Camera, crosshair, clip planes, background | `azimuth`, `elevation`, `backgroundColor`, `scaleMultiplier` |
-| `layout` | Slice type, mosaic, multiplanar, hero, tiling | `sliceType`, `mosaicString`, `heroFraction`, `isRadiological` |
+| `layout` | Slice type, mosaic, multiplanar, hero, tiling | `sliceType`, `mosaicString`, `heroFraction`, `isRadiological`, `isSingleViewFillCanvas` |
 | `ui` | Visual chrome: colorbars, orient labels, fonts | `isColorbarVisible`, `crosshairWidth`, `fontScale`, `placeholderText` |
 | `volume` | Global volume rendering settings | `illumination`, `isNearestInterpolation`, `outlineWidth` |
 | `mesh` | Global mesh rendering settings | `xRay`, `thicknessOn2D` |
@@ -367,6 +374,13 @@ Each `SliceTile` caches `mvpMatrix`, `planeNormal`, and `planePoint` during rend
 
 The built-in wheel zoom (`control/interactions.ts`, `isPanZoomMode` branch) anchors on `crosshairPos`. It holds that point still by calling `NVTransforms.zoomPan2DAbout`, which is the exact inverse of the window `calculateMvpMatrix2D` builds: `pan' = (zoom / newZoom) * (d + pan) - d` with `d = anchorMM - extentCentre`. Keep the two in step — a change to the ortho window's zoom or pan handling must be mirrored there, or the crosshair drifts again (issue #68).
 
+**`pan2Dxyzmm` is a `vec4` (Float32Array) — never test a value read back out of it
+for exact equality** (0.4 returns 0.40000000596). `stepZoom2D`
+(`src/math/NVTransforms.ts`) detects a stalled zoom notch with
+`Math.abs(next - zoom) < ZOOM_2D_SNAP / 2`, not `next === zoom`: the float32
+round-trip made the equality unreachable, jamming the wheel zoom at 0.4 in both
+directions. Pinned by `bothEndsOfTheRangeAreReachable` in `NVTransforms.test.ts`.
+
 ## Format extensibility
 
 All format readers use Vite's `import.meta.glob` for automatic discovery. To add a new reader:
@@ -375,6 +389,12 @@ All format readers use Vite's `import.meta.glob` for automatic discovery. To add
 3. Auto-registered at build time — no manual wiring needed
 
 Shared utilities: `NVLoader.buildExtensionMap()` (extension→module maps), `NVGz.maybeDecompress()` (transparent gzip).
+
+**A reader's input may be a Node `Buffer`, whose `slice()` is `subarray()`.** Take
+`.buffer` only from a fresh copy (`new Uint8Array(raw.subarray(a, b)).buffer`), or
+the caller receives the whole underlying allocation instead of the slice (and, for
+a small pooled Buffer, at a non-zero `byteOffset`). Browser loads never hit this —
+fetch yields offset-0 buffers — so `mgh.test.ts` passes a `Buffer` explicitly.
 
 Same pattern for: mesh readers (`mesh/readers/`), volume readers (`volume/readers/`), tract readers (`mesh/tracts/readers/`), connectome readers (`mesh/connectome/readers/`), layer readers (`mesh/layers/readers/`), volume transforms (`volume/transforms/`).
 
@@ -1300,7 +1320,49 @@ Pure-data layout engine in `view/NVSliceLayout.ts`. Computes `SliceTile[]` from 
 
 Priority: mosaic string > render-only > single slice > hero layout > multiplanar.
 
+The scale ruler (`view/NVRuler.ts`) takes px-per-mm from `mmPerPixel2D` so it
+tracks the 2D zoom (`pan2Dxyzmm` is threaded in by both renderers), and reads
+`screen.fovMM` as tile-local `[u, v, depth]`. Pinned by `view/NVRuler.test.ts`.
+
 **`SliceTile`** key fields: `leftTopWidthHeight`, `axCorSag`, `screen` (ortho mm bounds), `azimuth`/`elevation`, `sliceMM` (mosaic mm position), `renderOrientation`, `crossLines`, `showLabels`. Cached `mvpMatrix`/`planeNormal`/`planePoint` populated during render for picking.
+
+### Single-slice canvas fill (`isSingleViewFillCanvas`, default **true**)
+
+A lone AXIAL/CORONAL/SAGITTAL tile takes the whole canvas instead of being
+letterboxed to the slice's aspect ratio; the stored mm window
+(`screen.mnMM`/`mxMM`/`fovMM`, in-plane indices 0 and 1) is widened about its own
+centre by the same ratio. Scale (mm-per-pixel) and centre are unchanged — the slice
+lands on identical pixels — only the clipping rect grows, so a zoom spends the old
+letterbox margins on image instead of cropping them away. Excluded: multiplanar,
+render, mosaic, hero, custom layouts.
+
+- **The widened span is stored PRE-zoom**, and the fill branch is taken only for a
+  positive finite fit scale. A window sized from the live zoom reintroduces the
+  crosshair drift of issue #68 (`zoomPan2DAbout` assumes a fixed window that zoom
+  narrows); a zero/infinite scale puts NaN mm bounds in the projection. A filled
+  slice also leaves `fitSlicesAndGraph` no letterbox slack to give the 4D graph.
+  All pinned in `view/NVSliceLayout.test.ts`.
+- **`fovMM` stays the DATA's span; only `mnMM`/`mxMM` widen.** They are equal on
+  every other tile. Chrome that must size against the image rather than the empty
+  margin reads `fovMM` (the scale ruler does, or its bar outgrows a small volume);
+  anything projecting the window reads `mnMM`/`mxMM`.
+- **No edge-voxel smear into the new margins.** Both backends draw a unit quad in
+  TEXTURE space (`gl/sliceShader.ts`, `wgpu/slice.wgsl`), so its corners are the
+  volume's mm extents and sampler wrap mode is unreachable.
+- **The whole canvas is a live tile.** `hitTest`/`screenSlicePick` clamp to the
+  TILE, which used to equal the volume extents, so picks in the former letterbox
+  margin land outside the volume. `setCrosshairPos` clamps frac to [0,1] and
+  `buildDragReleaseInfo` clamps voxels to `dimsRAS` (its mm fields stay unclamped —
+  they describe the real gesture), but a PEN stroke straying into blank margin
+  paints the boundary voxel rather than missing, because `drawPoint` clamps.
+- **Old documents reopen filled.** `documentSettings.fillGroup` writes
+  `LAYOUT_DEFAULTS` for any key a document omits, and `loadDocument` resets an
+  explicit `false` unless called with `{ fill: 'current' }`. Standard for every
+  layout default; noted because this one is visible.
+- **Plumbing follows the `isRadiological` pattern**; NVDocument serializes the
+  layout group generically. Model-to-config mapping lives ONCE in
+  `NVSliceLayout.fitSlicesFromModel`, which both renderers call — a flag threaded
+  into one backend is a parity break.
 
 ### Mosaic string format
 

@@ -120,6 +120,14 @@ const SYNTHETIC_DEFAULT_WINDOW = { min: 24, max: 210 }
 //
 // A store outside the Open SciVis bucket sets `base` (an absolute URL that the
 // store id is appended to) instead of resolving through the local mirror.
+//
+// `defaultWindow` is OPTIONAL. Omit it and core derives a 2%-98% window from the
+// coarse floor it builds anyway, which is what a store nobody has characterised
+// should get. The five that keep one keep it because the comment beside each
+// records a choice percentiles cannot make: putting calMin ABOVE a background
+// shoulder (air, resin, embedding medium) so the background clips to black and
+// the whole ramp is spent on tissue. A 2nd percentile sits inside those peaks,
+// not past them.
 const HOA_BASE =
   'https://storage.googleapis.com/ucl-hip-ct-35a68e99feaae8932b1d44da0358940b/'
 const OMEZARR_STORES = {
@@ -127,19 +135,21 @@ const OMEZARR_STORES = {
     id: 'stent.ome.zarr',
     name: 'Stent OME-Zarr',
     levels: [2],
-    defaultWindow: { min: 0, max: 1200 },
   },
   pawpawsaurus: {
     id: 'pawpawsaurus.ome.zarr',
     name: 'Pawpawsaurus OME-Zarr',
     levels: [3, 2, 1, 0],
+    // A fossil skull still in its matrix, so the same shoulder problem as the
+    // biological microCT below: the derived 2%-98% window is 12075-48463, whose
+    // calMin sits inside the matrix rather than past it, and the skull washes
+    // out to flat white. calMin above the matrix spends the ramp on bone.
     defaultWindow: { min: 30269, max: 56893 },
   },
   richtmyer_meshkov: {
     id: 'richtmyer_meshkov.ome.zarr',
     name: 'Richtmyer-Meshkov OME-Zarr',
     levels: [4, 3, 2, 1, 0],
-    defaultWindow: { min: 0, max: 230 },
   },
   // Biological microCT.
   chameleon: {
@@ -663,9 +673,10 @@ function formatWindow(win) {
 
 function setDefaultWindowForSelectedSource() {
   const store = currentStore()
-  els.window.value = formatWindow(
-    store ? store.defaultWindow : SYNTHETIC_DEFAULT_WINDOW,
-  )
+  const win = store ? store.defaultWindow : SYNTHETIC_DEFAULT_WINDOW
+  // Empty means "no opinion": the load passes no calMin/calMax, core derives
+  // one, and the reload writes what it chose back into the field.
+  els.window.value = win ? formatWindow(win) : ''
 }
 
 async function fetchJson(url) {
@@ -944,7 +955,9 @@ async function loadOmezarrSource(storeDef, serial) {
     dtype,
     datatypeCode: dtypeInfo.code,
     numBitsPerVoxel: dtypeInfo.bits,
-    defaultWindow: { ...storeDef.defaultWindow },
+    defaultWindow: storeDef.defaultWindow
+      ? { ...storeDef.defaultWindow }
+      : null,
     chunkGrid,
     chunkShape,
     chunkCount: chunkGrid[0] * chunkGrid[1] * chunkGrid[2],
@@ -1875,8 +1888,9 @@ async function runReload(token, options) {
           // `name` (what the HUD/labels show) stays activeSource.name.
           id: `${activeSource.name}#${token}`,
           name: activeSource.name,
-          calMin: win.min,
-          calMax: win.max,
+          // No window means core places one from the coarse floor; supplying
+          // one suppresses that, which is what the characterised stores want.
+          ...(win ? { calMin: win.min, calMax: win.max } : {}),
           colormap: els.colormap.value,
           // Policy (where the detail goes, how many bricks it may cost) comes
           // from the named plan; only the VRAM ceiling is pinned by the demo,
@@ -1904,6 +1918,15 @@ async function runReload(token, options) {
         return
       }
       activeCv = cv
+      if (!win) {
+        // Percentiles land on long floats; the field is an editable control, so
+        // show a readable number rather than 15 significant digits.
+        const tidy = (value) => Number(value.toPrecision(6))
+        els.window.value = formatWindow({
+          min: tidy(cv.volume.calMin),
+          max: tidy(cv.volume.calMax),
+        })
+      }
       // New streamed volume is resident; drop the one(s) it displaced.
       await removeSceneVolumes(stale)
       chunkPlan = activeCv.currentPlan

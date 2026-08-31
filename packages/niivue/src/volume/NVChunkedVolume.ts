@@ -21,7 +21,11 @@ import {
   type Vec3i,
 } from './chunking'
 import { createStreamingNVImage } from './streamingVolume'
-import { getBitsPerVoxel, getTypedArrayConstructor } from './utils'
+import {
+  getBitsPerVoxel,
+  getTypedArrayConstructor,
+  robustDisplayWindow,
+} from './utils'
 
 /**
  * Options for {@link NiiVue.loadChunkedVolume}. The plan-shaping half lives in
@@ -57,6 +61,14 @@ export interface ChunkedVolumeOptions extends BudgetPlanOptions {
  */
 const COARSE_FLOOR_MAX_VOXELS = 256 ** 3
 const COARSE_FLOOR_MAX_EDGE = 512
+
+/**
+ * Edge cap for the window probe used when there is NO coarse floor to read
+ * (the floor was disabled, or the coarsest level is over the floor caps above).
+ * A centred crop of the coarsest level, capped here, is enough to place a
+ * 2%-98% window and costs one bounded fetch.
+ */
+const WINDOW_PROBE_MAX_EDGE = 64
 
 // --- pure helpers (unit-tested; no controller needed) -----------------------
 
@@ -315,6 +327,13 @@ export class NVChunkedVolume {
   // repeat call does not re-fetch the coarse level.
   private floorVolume: NVImage | null = null
   private floorBuilt = false
+  /**
+   * True when the caller passed NEITHER `calMin` nor `calMax`, so the window is
+   * ours to derive from the data. Passing either one is taken as "I know this
+   * store", and nothing is derived.
+   */
+  private readonly wantsAutoWindow: boolean
+  private windowResolved = false
 
   constructor(
     host: NiiVue,
@@ -332,6 +351,8 @@ export class NVChunkedVolume {
     // precedence rule (knobs win). Passing no plan reproduces the pre-plan
     // defaults exactly.
     this.o = resolveBudgetPlan(options, this.planContext())
+    this.wantsAutoWindow =
+      options.calMin === undefined && options.calMax === undefined
     this.followCrosshair = this.o.focus === 'crosshair'
     this.focusFrac = Array.isArray(this.o.focus)
       ? [this.o.focus[0], this.o.focus[1], this.o.focus[2]]
@@ -391,6 +412,11 @@ export class NVChunkedVolume {
     this.host.addEventListener('viewDestroyed', this.onViewDestroyed)
     this.applyRenderCentering()
     await this.applyCoarseFloor()
+    // The floor path resolves the window for free when a floor was built. When
+    // it was not, fall back to a bounded probe so a streamed volume still opens
+    // on a window that shows the data rather than on the 0..1 placeholder.
+    if (this.wantsAutoWindow && !this.windowResolved) await this.probeWindow()
+    if (this.windowResolved && !this.disposed) await this.host.updateGLVolume()
   }
 
   /**
@@ -766,10 +792,123 @@ export class NVChunkedVolume {
         id: `${this.volumeId}:floor`,
       })
       floor.img = toVoxelView(bytes, Ctor, bytesPerVoxel, voxels)
+      // The floor IS the whole volume at its coarsest level, so it is the best
+      // window sample available and it costs no extra fetch.
+      this.applyAutoWindow(floor)
       return floor
     } catch (err) {
       log.warn('NVChunkedVolume: coarse floor unavailable', err)
       return null
+    }
+  }
+
+  /**
+   * Adopt a 2%-98% display window derived from `sample`, when the caller did
+   * not supply one.
+   *
+   * A streamed volume is constructed before a single voxel has been read, so
+   * the window it starts with can only be a placeholder (`calMin` 0 /
+   * `calMax` 1). That is meaningless for real data — a uint8 store renders
+   * saturated white, a uint16 store nearly black — which is why every consumer
+   * has had to hand-tune a window per store. Deriving it here removes that
+   * from the callers.
+   *
+   * `robustMin`/`robustMax` are set from the same pair deliberately: contrast
+   * dragging scales by `robustMax - robustMin` (`control/dragModes.ts`), which
+   * on the placeholder window is a range of 1, making the drag useless on a
+   * streamed volume.
+   */
+  private applyAutoWindow(sample: NVImage): void {
+    if (!this.wantsAutoWindow || this.windowResolved || !sample.img) return
+    let derived: [number, number, number, number]
+    try {
+      derived = robustDisplayWindow(sample.hdr, sample.img)
+    } catch (err) {
+      // calMinMax throws only for an all-non-finite sample. Keep the
+      // placeholder rather than installing a NaN window.
+      log.warn(
+        'NVChunkedVolume: no automatic window, sample has no finite voxels',
+        err,
+      )
+      return
+    }
+    const [lo, hi, globalMin, globalMax] = derived
+    if (!Number.isFinite(lo) || !Number.isFinite(hi) || hi <= lo) {
+      log.warn(
+        `NVChunkedVolume: no automatic window, sample is flat (${lo}..${hi})`,
+      )
+      return
+    }
+    // `addVolume` stores a SHALLOW COPY of the NVImage
+    // (`NVModel.prepareVolume`), and `init` has already added this volume by the
+    // time a window can be derived, so the object the scene renders is NOT
+    // `this.volume`. Address it by id the way `swapVolumeChunkPlan` does, or the
+    // derived window reaches this handle and nothing the user can see.
+    const scene = this.host.volumes?.find((v) => v.id === this.volumeId)
+    const targets = new Set<NVImage>([this.volume, sample])
+    if (scene) targets.add(scene)
+    for (const vol of targets) {
+      vol.calMin = lo
+      vol.calMax = hi
+      vol.robustMin = lo
+      vol.robustMax = hi
+      vol.globalMin = globalMin
+      vol.globalMax = globalMax
+      vol.hdr.cal_min = lo
+      vol.hdr.cal_max = hi
+    }
+    this.windowResolved = true
+    log.debug(
+      `NVChunkedVolume: auto window ${lo}..${hi} (global ${globalMin}..${globalMax})`,
+    )
+  }
+
+  /**
+   * Read a bounded centred crop of the coarsest level purely to place the
+   * window. Only used when no coarse floor exists to read instead.
+   */
+  private async probeWindow(): Promise<void> {
+    const levelIndex = this.source.levels.length - 1
+    const level = this.source.levels[levelIndex]
+    const Ctor = getTypedArrayConstructor(this.source.datatypeCode)
+    if (!Ctor || this.disposed) return
+    const texDims: Vec3i = [
+      Math.min(level.shape[0], WINDOW_PROBE_MAX_EDGE),
+      Math.min(level.shape[1], WINDOW_PROBE_MAX_EDGE),
+      Math.min(level.shape[2], WINDOW_PROBE_MAX_EDGE),
+    ]
+    const texOrigin: Vec3i = [
+      Math.floor((level.shape[0] - texDims[0]) / 2),
+      Math.floor((level.shape[1] - texDims[1]) / 2),
+      Math.floor((level.shape[2] - texDims[2]) / 2),
+    ]
+    try {
+      const bytesPerVoxel = getBitsPerVoxel(this.source.datatypeCode) / 8
+      const bytes = await this.source.fetchChunk({
+        levelIndex,
+        texOrigin,
+        texDims,
+        bytesPerVoxel,
+      })
+      if (this.disposed) return
+      const probe = createStreamingNVImage({
+        shape: texDims,
+        spacing: level.spacing,
+        datatypeCode: this.source.datatypeCode,
+        calMin: 0,
+        calMax: 1,
+        name: `${this.volume.name} window probe`,
+        id: `${this.volumeId}:window-probe`,
+      })
+      probe.img = toVoxelView(
+        bytes,
+        Ctor,
+        bytesPerVoxel,
+        texDims[0] * texDims[1] * texDims[2],
+      )
+      this.applyAutoWindow(probe)
+    } catch (err) {
+      log.warn('NVChunkedVolume: window probe unavailable', err)
     }
   }
 

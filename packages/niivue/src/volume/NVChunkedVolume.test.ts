@@ -878,3 +878,140 @@ describe('budget plans', () => {
     expect(Math.min(...levelsOf(mgr))).toBeGreaterThanOrEqual(2)
   })
 })
+
+// --- automatic display window ---------------------------------------------
+
+/**
+ * A streamed volume is built before any voxel has been read, so its window can
+ * only be a placeholder until data arrives. These cover the derivation that
+ * replaces it, and the caller override that suppresses it.
+ */
+describe('NVChunkedVolume automatic display window', () => {
+  const COARSE = 32
+
+  /** uint8 pyramid whose coarsest level reads back as a 0..200 ramp + outliers. */
+  const rampSource = (): ChunkedVolumeSource => ({
+    datatypeCode: 2, // DT_UINT8
+    levels: [
+      { level: 0, shape: [128, 128, 128], spacing: [1, 1, 1] },
+      { level: 1, shape: [COARSE, COARSE, COARSE], spacing: [4, 4, 4] },
+    ],
+    fetchChunk: async (r: { texDims: Vec3i }) => {
+      const n = r.texDims[0] * r.texDims[1] * r.texDims[2]
+      const out = new Uint8Array(n)
+      for (let i = 0; i < n; i++) out[i] = Math.floor((i / n) * 200)
+      for (let i = Math.max(0, n - 8); i < n; i++) out[i] = 255
+      return out
+    },
+  })
+
+  /**
+   * The stub mirrors ONE controller behaviour that matters here: `addVolume`
+   * stores a SHALLOW COPY (`NVModel.prepareVolume`), so what the scene renders
+   * is a different object from the handle's `volume`. Without that, a window
+   * written only to the handle looks correct in a test and is invisible on
+   * screen.
+   */
+  function makeWindowHost(): {
+    host: NiiVue
+    updateGLCalls: () => number
+    sceneVolume: () => NVImage | undefined
+  } {
+    let updateGL = 0
+    const volumes: NVImage[] = []
+    const host = {
+      volumes,
+      addVolume: async (vol: NVImage) => {
+        volumes.push({ ...vol })
+      },
+      addEventListener: () => {},
+      removeEventListener: () => {},
+      setBaseCoarseFloor: async () => {},
+      updateGLVolume: async () => {
+        updateGL++
+      },
+      swapVolumeChunkPlan: async () => {},
+      _registerChunkedVolume: () => {},
+      _unregisterChunkedVolume: () => {},
+      isDestroyed: false,
+    } as unknown as NiiVue
+    return {
+      host,
+      updateGLCalls: () => updateGL,
+      sceneVolume: () => volumes[0],
+    }
+  }
+
+  test('derives the window from the coarse floor instead of the 0..1 placeholder', async () => {
+    const { host, updateGLCalls, sceneVolume } = makeWindowHost()
+    const mgr = new NVChunkedVolume(host, rampSource(), { radius: 16 })
+    // The placeholder every streamed volume starts on.
+    expect(mgr.volume.calMin).toBe(0)
+    expect(mgr.volume.calMax).toBe(1)
+
+    await mgr.init()
+
+    expect(mgr.volume.calMax).toBeGreaterThan(1)
+    expect(mgr.volume.calMax).toBeGreaterThan(mgr.volume.calMin)
+    // Contrast dragging scales by this range; on the placeholder it was 1.
+    expect(mgr.volume.robustMin).toBe(mgr.volume.calMin)
+    expect(mgr.volume.robustMax).toBe(mgr.volume.calMax)
+    expect(mgr.volume.globalMax).toBe(255)
+    // The outliers sit above the robust high, which is the point of a window.
+    expect(mgr.volume.calMax).toBeLessThan(mgr.volume.globalMax as number)
+    // The scene renders a shallow copy made before the window was derived; the
+    // window is only real if it landed there too.
+    expect(sceneVolume()?.calMin).toBe(mgr.volume.calMin)
+    expect(sceneVolume()?.calMax).toBe(mgr.volume.calMax)
+    expect(sceneVolume()?.robustMax).toBe(mgr.volume.calMax)
+    // The new window has to reach the GPU, not just the model.
+    expect(updateGLCalls()).toBe(1)
+  })
+
+  test('a caller-supplied window is left alone', async () => {
+    const { host, updateGLCalls } = makeWindowHost()
+    const mgr = new NVChunkedVolume(host, rampSource(), {
+      radius: 16,
+      calMin: 12,
+      calMax: 34,
+    })
+    await mgr.init()
+    expect(mgr.volume.calMin).toBe(12)
+    expect(mgr.volume.calMax).toBe(34)
+    expect(updateGLCalls()).toBe(0)
+  })
+
+  test('supplying only one bound still counts as caller-owned', async () => {
+    const { host } = makeWindowHost()
+    const mgr = new NVChunkedVolume(host, rampSource(), {
+      radius: 16,
+      calMax: 90,
+    })
+    await mgr.init()
+    expect(mgr.volume.calMax).toBe(90)
+  })
+
+  test('falls back to a bounded probe when there is no coarse floor', async () => {
+    const { host } = makeWindowHost()
+    const mgr = new NVChunkedVolume(host, rampSource(), {
+      radius: 16,
+      coarseFloor: false,
+    })
+    await mgr.init()
+    expect(mgr.volume.calMax).toBeGreaterThan(1)
+    expect(mgr.volume.calMax).toBeGreaterThan(mgr.volume.calMin)
+  })
+
+  test('keeps the placeholder when every sampled voxel is identical', async () => {
+    const { host } = makeWindowHost()
+    const flat: ChunkedVolumeSource = {
+      ...rampSource(),
+      fetchChunk: async (r: { texDims: Vec3i }) =>
+        new Uint8Array(r.texDims[0] * r.texDims[1] * r.texDims[2]).fill(7),
+    }
+    const mgr = new NVChunkedVolume(host, flat, { radius: 16 })
+    await mgr.init()
+    expect(mgr.volume.calMin).toBe(0)
+    expect(mgr.volume.calMax).toBe(1)
+  })
+})

@@ -35,7 +35,11 @@ import NiiVue, {
 // everything that draws in the overlay. The slide renderers expose the same
 // `overlayDraw` hook the controller does, so the widget composes onto the
 // standalone deep-zoom pane exactly as it does onto a NiiVue canvas.
-import { loadDefaultFont, UIKitRulerOverlay } from '@niivue/uikit'
+import {
+  loadDefaultFont,
+  UIKitCrosshairOverlay,
+  UIKitRulerOverlay,
+} from '@niivue/uikit'
 
 const backend =
   new URLSearchParams(location.search).get('backend') === 'webgpu'
@@ -185,6 +189,7 @@ const els = {
   zoomVal: el('zoomVal'),
   fit: el('fit'),
   measure: el('measure'),
+  crosshair: el('crosshair'),
   canvas: el('nv-canvas'),
   slideCanvas: el('slide-canvas'),
   volBusy: el('volBusy'),
@@ -209,7 +214,10 @@ let slideFrame = 0
 let slideFitted = false
 let planeIndex = 0
 let planeTimer = 0
-let windowRange = [0, 1]
+// Null until a dataset load resolves one. NVChunkedVolume derives a 2%-98%
+// window from the coarse floor it builds anyway, so the demo reads the window
+// back off the volume instead of paying for a probe fetch of its own.
+let windowRange = null
 let drag = null
 let dragMoved = false
 let ruler = null
@@ -219,6 +227,11 @@ let ruler = null
 let ruleA = null
 let ruleB = null
 let hoverCss = null
+let crosshair = null
+// The volume pane's crosshair, in RAS voxels, mirrored into the slide pane. Held
+// in voxels rather than slide pixels for the same reason the ruler is held in
+// base pixels: a level swap must not move it.
+let crosshairVox = null
 
 // ---------------------------------------------------------------- utilities
 
@@ -333,10 +346,7 @@ function tileSizeForAxis(axis) {
 
 // ------------------------------------------------------------ source loading
 
-// Robust window from the COARSEST level, which is one small read: percentiles
-// rather than min/max, so a handful of hot voxels cannot flatten everything
-// else. Needed because these stores range from 1e-4 float reflectivity (OCT) to
-// raw uint16 photon counts (SPIM) -- no fixed default fits both.
+// NIfTI datatype code -> typed array, used to size a tile decode in bytes.
 const TYPED_ARRAYS = {
   2: Uint8Array,
   4: Int16Array,
@@ -344,51 +354,6 @@ const TYPED_ARRAYS = {
   16: Float32Array,
   512: Uint16Array,
   768: Uint32Array,
-}
-
-// The probe reads a CENTRED BOX, not the whole coarsest level: a terabyte store's
-// coarsest level is still 666 x 588 x 588 (460 MB), which is not a window probe,
-// it is a download. A centred box is where the sample is in every one of these
-// stores, and the percentiles are taken over a subsample so the sort stays cheap
-// whatever the box holds.
-const WINDOW_PROBE_EDGE = 128
-const WINDOW_PROBE_SAMPLES = 200000
-
-async function autoWindow(source) {
-  const index = source.levels.length - 1
-  const level = source.levels[index]
-  const Ctor = TYPED_ARRAYS[source.datatypeCode]
-  if (!Ctor) return [0, 255]
-  const texDims = level.shape.map((n) => Math.min(n, WINDOW_PROBE_EDGE))
-  const texOrigin = level.shape.map((n, a) => Math.floor((n - texDims[a]) / 2))
-  const bytes = await source.fetchChunk({
-    levelIndex: index,
-    texOrigin,
-    texDims,
-    bytesPerVoxel: Ctor.BYTES_PER_ELEMENT,
-  })
-  const aligned =
-    bytes.byteOffset % Ctor.BYTES_PER_ELEMENT === 0 ? bytes : bytes.slice()
-  const values = new Ctor(
-    aligned.buffer,
-    aligned.byteOffset,
-    aligned.byteLength / Ctor.BYTES_PER_ELEMENT,
-  )
-  const stride = Math.max(1, Math.floor(values.length / WINDOW_PROBE_SAMPLES))
-  const kept = []
-  for (let i = 0; i < values.length; i += stride) {
-    // Float stores (the OCT ones) carry NaN outside the imaged cylinder, and a
-    // NaN sorts to the end of a typed array, which would drag the high
-    // percentile with it.
-    if (Number.isFinite(values[i])) kept.push(values[i])
-  }
-  if (kept.length === 0) return [0, 255]
-  const sorted = Float64Array.from(kept).sort()
-  const at = (p) =>
-    sorted[Math.min(sorted.length - 1, Math.floor(p * sorted.length))]
-  const low = at(0.02)
-  const high = at(0.998)
-  return high > low ? [low, high] : [sorted[0], sorted[sorted.length - 1] || 1]
 }
 
 function datasetUrl(def) {
@@ -415,8 +380,10 @@ async function loadVolumetric(def, token) {
   const cv = await nv.loadChunkedVolume(chunkSource, {
     id: `${def.zarrId}#${token}`,
     name: def.label,
-    calMin: windowRange[0],
-    calMax: windowRange[1],
+    // Passing neither bound lets the core place the window from the coarse
+    // floor; passing both (a user edit, or a reload of an open dataset) is
+    // taken as "I know this store" and suppresses that.
+    ...(windowRange ? { calMin: windowRange[0], calMax: windowRange[1] } : {}),
     colormap: els.colormap.value,
     // 'focus' spends the byte budget around the crosshair, which is exactly the
     // policy that pairs with a linked deep-zoom pane: what you are inspecting in
@@ -432,6 +399,7 @@ async function loadVolumetric(def, token) {
     return
   }
   activeCv = cv
+  windowRange ??= [cv.volume.calMin, cv.volume.calMax]
   await removeVolumes(stale)
   await activeCv.applyCoarseFloor()
 }
@@ -466,7 +434,7 @@ async function removeVolumes(ids) {
 // ------------------------------------------------------------- deep-zoom pane
 
 function rebuildSlide({ keepViewport = true } = {}) {
-  if (!chunkSource) return
+  if (!chunkSource || !windowRange) return
   const axis = els.axis.value
   const previous = slide
   const viewport = keepViewport && previous ? { ...previous.viewport } : null
@@ -553,6 +521,7 @@ function renderSlide() {
     }
     slide.clampViewport(screen)
     updateRuler(screen)
+    updateCrosshair(screen)
     if (slideView.kind === 'gpu') {
       slideView.renderer.render([slide], screen)
     } else {
@@ -602,6 +571,12 @@ function onLocationChange(event) {
   if (!els.follow.checked || !chunkSource) return
   const vox = event.detail?.vox
   if (!vox) return
+  // Recorded before the plane changes: the marker is what tells you WHERE a 3D
+  // depth-pick landed in-plane, and on a slab whose short axis spans ~10 screen
+  // pixels that is the only feedback distinguishing "the pick missed" from "the
+  // pick landed on an empty edge plane".
+  crosshairVox = [vox[0], vox[1], vox[2]]
+  requestSlideRender()
   setPlane(vox[AXIS_INDEX[els.axis.value]], { fromCrosshair: true })
 }
 
@@ -802,9 +777,11 @@ function updateVolumeHud() {
     <div class="row"><span class="key">disk cache</span><span>${persistCost()}</span></div>
     <div class="row"><span class="key">workers</span><span>${workerCost()}</span></div>
     <div class="row"><span class="key">stalls</span><span>${stallCost()}</span></div>
-    <div class="row"><span class="key">window</span><span>${formatValue(
-      windowRange[0],
-    )} .. ${formatValue(windowRange[1])}</span></div>
+    <div class="row"><span class="key">window</span><span>${
+      windowRange
+        ? `${formatValue(windowRange[0])} .. ${formatValue(windowRange[1])}`
+        : '-'
+    }</span></div>
   `
 }
 
@@ -884,6 +861,79 @@ function updateRuler(screen) {
   })
 }
 
+// The crosshair marker is the UIKit crosshair widget (`UIKitCrosshairOverlay`),
+// drawn into the same slide frame as the ruler. Without it the slide pane gives
+// no feedback at all about a link from the volume pane: a 3D depth-pick that
+// lands on an empty edge plane looks identical to one that did not register.
+const CROSSHAIR_COLOR = [0.2, 1, 0.9, 0.9]
+const CROSSHAIR_LABEL_PX = 15
+// Device pixels a minor graduation aims for. Ticks much tighter than this stop
+// resolving on screen; much wider and the arms carry too few to read as a scale.
+const TARGET_TICK_PX = 22
+
+// Round a raw step up to the next 1/2/5 of its decade, the spacing a printed
+// scale would use. Without it a zoom would graduate in 3.7 um steps.
+function niceStep(raw) {
+  const decade = 10 ** Math.floor(Math.log10(raw))
+  for (const m of [1, 2, 5]) {
+    if (m * decade >= raw) return m * decade
+  }
+  return 10 * decade
+}
+
+// The crosshair's graduation, in the units the pane is actually at: micrometres
+// until a tick is worth a whole millimetre. `pxPerUnit` is per axis because
+// `pixelSpacingMM` is (the NeuN slab never downsamples z), so a tick means the
+// same distance on both arms even when the plane is anisotropic.
+function crosshairGraduation(screen) {
+  const spacing = slide.manifest.pixelSpacingMM
+  if (!spacing) return null
+  const devicePerBase = slide.viewport.scale * (screen.devicePixelRatio ?? 1)
+  // Device pixels per micrometre, per plane axis.
+  const perUm = [
+    devicePerBase / (spacing[0] * 1000),
+    devicePerBase / (spacing[1] * 1000),
+  ]
+  if (!(perUm[0] > 0) || !(perUm[1] > 0)) return null
+  // The horizontal axis sets the unit for both, so one label reads for the pair.
+  const wantUm = niceStep(TARGET_TICK_PX / perUm[0])
+  return wantUm >= 1000
+    ? {
+        units: 'mm',
+        pxPerUnit: [perUm[0] * 1000, perUm[1] * 1000],
+        unitsPerTick: wantUm / 1000,
+      }
+    : { units: 'um', pxPerUnit: perUm, unitsPerTick: wantUm }
+}
+
+// Set BEFORE the slide draws, for the same reason updateRuler is.
+function updateCrosshair(screen) {
+  if (!crosshair) return
+  // Unlinked panes navigate independently, so a marker carried over from the
+  // volume pane would point at a position this slide is not showing.
+  const mode = els.crosshair.value
+  if (!slide || !crosshairVox || !els.follow.checked || mode === 'off') {
+    crosshair.clear()
+    return
+  }
+  const [u, v] = PLANE_AXES[els.axis.value]
+  // Voxel centre, matching the floor() the slide-click inverse applies.
+  const point = { x: crosshairVox[u] + 0.5, y: crosshairVox[v] + 0.5 }
+  const dpr = screen.devicePixelRatio ?? 1
+  const graduation = mode === 'plain' ? null : crosshairGraduation(screen)
+  crosshair.setCrosshair({
+    at: slideToDevice(point, screen),
+    color: CROSSHAIR_COLOR,
+    thickness: 2 * dpr,
+    gapPx: 10 * dpr,
+    showTicks: graduation !== null,
+    showTickNumbers: graduation !== null && mode === 'numbers',
+    tickLength: 5 * dpr,
+    sizePx: CROSSHAIR_LABEL_PX * dpr,
+    ...(graduation ?? {}),
+  })
+}
+
 function clearRuler() {
   ruleA = null
   ruleB = null
@@ -955,6 +1005,8 @@ async function loadDataset() {
   slide = null
   slideView?.renderer?.clearTextures?.()
   clearRuler()
+  // A voxel index from the outgoing store means nothing in the incoming one.
+  crosshairVox = null
   // Per-brick phase timings are process-wide totals, so a dataset switch starts
   // a fresh measurement window rather than averaging two stores together.
   nv?.resetChunkTiming()
@@ -977,11 +1029,7 @@ async function loadDataset() {
       return
     }
     chunkSource = source
-    windowRange = await autoWindow(source)
-    if (token !== loadToken) return
-    els.window.value = `${formatValue(windowRange[0])},${formatValue(
-      windowRange[1],
-    )}`
+    windowRange = null
     els.axis.value = def.axis
     planeIndex = Math.floor(shape()[AXIS_INDEX[def.axis]] / 2)
     syncPlaneControl()
@@ -989,6 +1037,9 @@ async function loadDataset() {
     updateProvenance(def)
     await loadVolumetric(def, token)
     if (token !== loadToken) return
+    els.window.value = `${formatValue(windowRange[0])},${formatValue(
+      windowRange[1],
+    )}`
     // Park the crosshair on the plane the slide opens at, so the two panes agree
     // from the first frame rather than after the first click.
     const dims = shape()
@@ -1020,6 +1071,7 @@ function updateProvenance(def) {
 }
 
 function applyWindow() {
+  if (!windowRange) return
   const next = parseWindow(els.window.value, windowRange)
   const changed = next[0] !== windowRange[0] || next[1] !== windowRange[1]
   windowRange = next
@@ -1162,6 +1214,7 @@ els.measure.addEventListener('change', () => {
   if (!els.measure.checked) clearRuler()
   requestSlideRender()
 })
+els.crosshair.addEventListener('change', requestSlideRender)
 els.colormap.addEventListener('change', applyColormap)
 els.window.addEventListener('change', applyWindow)
 els.fit.addEventListener('click', () => {
@@ -1185,10 +1238,17 @@ async function main() {
   nv.scaleMultiplier = DEFAULT_3D_ZOOM
   syncZoomControl(nv.scaleMultiplier)
   slideView = await createSlideView()
-  // One font fetch for the pane. The widget owns its GPU resources on whichever
-  // backend the slide renderer came up on, so this is identical for both.
-  ruler = new UIKitRulerOverlay(await loadDefaultFont())
-  slideView.renderer.overlayDraw = (frame) => ruler.drawOverlay(frame)
+  // One font fetch for the pane, shared by both widgets (each still owns its own
+  // GPU resources on whichever backend the slide renderer came up on).
+  const font = await loadDefaultFont()
+  ruler = new UIKitRulerOverlay(font)
+  crosshair = new UIKitCrosshairOverlay(font)
+  // One hook, two widgets: the renderer exposes a single overlayDraw slot, so the
+  // pane composes them here. Crosshair last, so the marker reads over the ruler.
+  slideView.renderer.overlayDraw = (frame) => {
+    ruler.drawOverlay(frame)
+    crosshair.drawOverlay(frame)
+  }
   await loadDataset()
   // Both panes stream asynchronously with no completion event, so the HUDs poll.
   // Cheap: two innerHTML writes a few times a second.

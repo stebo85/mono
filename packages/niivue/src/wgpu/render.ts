@@ -862,7 +862,7 @@ export class VolumeRenderer extends NVRenderer {
       // per-tile volume switching.)
       let entry = cacheKey ? this._texCache.get(cacheKey) : undefined
       if (entry && entry.kind !== 'single') {
-        this._destroyTexEntry(entry)
+        this._evictTexEntry(cacheKey, entry)
         entry = undefined
       }
       if (!entry) {
@@ -1016,7 +1016,7 @@ export class VolumeRenderer extends NVRenderer {
       }
       return existing
     }
-    if (existing) this._destroyTexEntry(existing)
+    if (existing) this._evictTexEntry(cacheKey, existing)
     const decoded = new DecodedChunkCache(
       decodedTierBudgetBytes(budgetBytes, bpv),
     )
@@ -1732,13 +1732,30 @@ export class VolumeRenderer extends NVRenderer {
     }
   }
 
+  /**
+   * Release an entry's GPU resources AND drop every cache that points at it.
+   *
+   * Destroying without deleting is the dangerous half: the entry stays in
+   * `_texCache`, so every method that iterates the map -- `beginChunkFrame`,
+   * `_ensureSingleGradients`, `_refreshUnlitChunksForLighting`,
+   * `chunkStreamStats` -- can still reach a destroyed manager and a disposed
+   * uploader. The replace-in-place call sites only re-`set` the key after an
+   * await, so a frame landing in that window sees the dead entry. Always evict
+   * through here rather than pairing the two calls by hand.
+   */
+  private _evictTexEntry(key: string | undefined, entry: TexCacheEntry): void {
+    this._destroyTexEntry(entry)
+    if (!key) return
+    this._texCache.delete(key)
+    // The cached bind group holds this entry's textures at bindings 3 and 4.
+    this._bindGroupCache.delete(key)
+  }
+
   /** Release any cached volume textures whose key is not in `keepKeys`. */
   pruneVolumeCache(keepKeys: Set<string>): void {
     for (const [key, entry] of this._texCache) {
       if (keepKeys.has(key)) continue
-      this._destroyTexEntry(entry)
-      this._texCache.delete(key)
-      this._bindGroupCache.delete(key)
+      this._evictTexEntry(key, entry)
     }
   }
 

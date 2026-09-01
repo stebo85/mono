@@ -57,11 +57,11 @@ function measure(
     [1, 1, 1, 1],
     [0, 0, 0, zoom],
   )
-  const m = /^(\d+) (cm|mm)$/.exec(label)
+  const m = /^(\d+) (cm|mm|um)$/.exec(label)
   if (!m) throw new Error(`no ruler drawn (label: "${label}")`)
   const barPx =
     Math.max(...lines.map((l) => l[1])) - Math.min(...lines.map((l) => l[0]))
-  const labelMM = Number(m[1]) * (m[2] === 'cm' ? 10 : 1)
+  const labelMM = Number(m[1]) * (m[2] === 'cm' ? 10 : m[2] === 'um' ? 1e-3 : 1)
   return { pxPerMM: barPx / labelMM, barPx, label }
 }
 
@@ -97,6 +97,44 @@ describe('buildRuler', () => {
         ),
       ).not.toThrow()
     }
+  })
+
+  test('subMillimetreFovStillGetsABar_labelledInUm', () => {
+    // A microscopy field of view narrower than the smallest nice mm value
+    // used to fall off the end of chooseRulerSize and draw no ruler at all.
+    // maxMM = 0.65 * 0.4 = 0.26, so the um ladder picks 200 um.
+    const r = measure(0, false, 1, {
+      extentsMax: vec3.fromValues(0.4, 0.4, 0.4),
+    })
+    expect(r.label).toBe('200 um')
+    // The bar must still be as long as its label claims: fit scale is
+    // min(2000 / 0.4, 400 / 0.4) px per mm.
+    expect(r.pxPerMM).toBeCloseTo(400 / 0.4, 3)
+  })
+
+  test('umLadderWalksTheSubMmDecades_notJustOne', () => {
+    // A single pass of NICE_VALUES spans one decade; without the decade walk
+    // a few-hundred-micron slide window would get a 10 um sliver of a bar.
+    // maxMM = 0.65 * 0.3 = 0.195, so the ladder picks 100 um.
+    const r = measure(0, false, 1, {
+      extentsMax: vec3.fromValues(0.3, 0.3, 0.3),
+    })
+    expect(r.label).toBe('100 um')
+    expect(r.pxPerMM).toBeCloseTo(400 / 0.3, 3)
+  })
+
+  test('boundaryBetweenMmAndUm_isTheSmallestNiceMmValue', () => {
+    // mm keeps every field of view where 1 mm still fits in 65% of the tile;
+    // just below that the um ladder takes over at its top (500 um), so the
+    // handover does not jump to a tiny bar.
+    const mm = measure(0, false, 1, {
+      extentsMax: vec3.fromValues(1.6, 1.6, 1.6), // maxMM = 1.04
+    })
+    expect(mm.label).toBe('1 mm')
+    const um = measure(0, false, 1, {
+      extentsMax: vec3.fromValues(1.5, 1.5, 1.5), // maxMM = 0.975
+    })
+    expect(um.label).toBe('500 um')
   })
 
   test('barLengthMatchesItsLabelInEveryOrientation', () => {

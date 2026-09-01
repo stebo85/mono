@@ -176,16 +176,21 @@ const ZOOM_2D_SNAP = 0.1
  * back to 0.5, and every zoom below that is fixed in BOTH directions -- 0.2
  * moves to neither 0.18 nor 0.22. So the wheel could never take the view below
  * half size and could never leave a smaller zoom set from code, even though the
- * range says 0.1. When the snap lands back on the zoom we started from, step one
- * whole snap increment instead; the multiplicative feel is untouched everywhere
- * the proportional step is already larger than that.
+ * range says 0.1. When the snap does not move the zoom by at least half a step,
+ * take one whole snap increment instead; the multiplicative feel is untouched
+ * everywhere the proportional step is already larger than that.
+ *
+ * The stall test uses a tolerance, not `===`: the caller keeps the zoom in a
+ * `vec4` and 0.4 comes back as 0.40000000596, which `===` reads as "moved".
  */
 export function stepZoom2D(zoom: number, direction: number): number {
   if (!Number.isFinite(zoom) || zoom <= 0) return ZOOM_2D_MIN
   const dir = Math.sign(direction)
   if (dir === 0) return zoom
   let next = Math.round(zoom * (1 + 0.1 * dir) * 10) / 10
-  if (next === zoom) next = Math.round((zoom + ZOOM_2D_SNAP * dir) * 10) / 10
+  if (Math.abs(next - zoom) < ZOOM_2D_SNAP / 2) {
+    next = Math.round((zoom + ZOOM_2D_SNAP * dir) * 10) / 10
+  }
   return Math.max(ZOOM_2D_MIN, Math.min(ZOOM_2D_MAX, next))
 }
 

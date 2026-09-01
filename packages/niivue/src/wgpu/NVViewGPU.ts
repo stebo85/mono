@@ -923,40 +923,11 @@ export default class NVView {
       screenSlices = this.screenSlices
       graphWidth = baseGraphWidth
     } else {
-      // No spatial view (a signal-only scene, OR the user chose
-      // SLICE_TYPE.NONE): skip all spatial tiles so no slices, crosshairs, or
-      // orientation labels render; the signal graph fills the instance area on
-      // its own. Otherwise lay out the slices and let the graph reclaim any
-      // horizontal slack.
-      const spatialHidden = md.isSpatialViewHidden()
-      const fit = spatialHidden
-        ? {
-            screenSlices: [] as NVSliceLayout.SliceTile[],
-            graphWidth: baseGraphWidth,
-          }
-        : NVSliceLayout.fitSlicesAndGraph(
-            {
-              canvasWH: [
-                canvasWidth - legendWidth - baseGraphWidth,
-                canvasHeight - cbHeight,
-              ],
-              sliceType: md.layout.sliceType,
-              tileMargin: md.layout.margin,
-              extentsMin: md.extentsMin,
-              extentsMax: md.extentsMax,
-              isRadiologicalConvention: md.layout.isRadiological,
-              multiplanarLayout: md.layout.multiplanarType,
-              multiplanarShowRender: md.layout.showRender,
-              sliceMosaicString: md.layout.mosaicString,
-              heroImageFraction: md.layout.heroFraction,
-              heroSliceType: md.layout.heroSliceType,
-              isMultiplanarEqualSize: md.layout.isEqualSize,
-              isCrossLines: md.ui.isCrossLinesVisible,
-              isCenterMosaic: md.layout.isMosaicCentered,
-              customLayout: md.layout.customLayout,
-            },
-            baseGraphWidth,
-          )
+      const fit = NVSliceLayout.fitSlicesFromModel(
+        md,
+        [canvasWidth - legendWidth - baseGraphWidth, canvasHeight - cbHeight],
+        baseGraphWidth,
+      )
       graphWidth = fit.graphWidth
       screenSlices = fit.screenSlices
       this.screenSlices = screenSlices
@@ -1784,7 +1755,7 @@ export default class NVView {
             this.fontRenderer.buildText(s, x, y, sc, c, ax, ay, bc),
           buildLine,
           md.ui.fontColor,
-          md.scene.backgroundColor,
+          md.scene.pan2Dxyzmm,
         )
         if (rulerResult) {
           labels.push(...rulerResult.labels)

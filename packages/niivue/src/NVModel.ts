@@ -181,6 +181,9 @@ export default class NVModel {
       ...(options.isRadiological !== undefined && {
         isRadiological: options.isRadiological,
       }),
+      ...(options.isSingleViewFillCanvas !== undefined && {
+        isSingleViewFillCanvas: options.isSingleViewFillCanvas,
+      }),
       ...(options.customLayout !== undefined && {
         customLayout: options.customLayout ?? null,
       }),

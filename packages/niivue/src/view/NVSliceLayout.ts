@@ -62,6 +62,7 @@ export type SliceLayoutConfig = {
   isMultiplanarEqualSize?: boolean
   isCrossLines?: boolean
   isCenterMosaic?: boolean
+  isSingleViewFillCanvas?: boolean
   customLayout?: CustomLayoutTile[] | null
 }
 
@@ -200,6 +201,24 @@ const cloneScreen = (s: ScreenInfo): ScreenInfo => ({
   mxMM: vec3.clone(s.mxMM),
   fovMM: vec3.clone(s.fovMM),
 })
+
+/**
+ * Widen the in-plane mm window about its own centre: scale and centre hold.
+ *
+ * `fovMM` deliberately keeps the DATA's span while `mnMM`/`mxMM` become the
+ * wider ortho window -- the two are equal for every other tile. Chrome that
+ * should size against the image rather than the empty margin (the scale ruler)
+ * reads `fovMM`; anything projecting the window reads `mnMM`/`mxMM`.
+ */
+const fillScreen = (s: ScreenInfo, spans: [number, number]): ScreenInfo => {
+  const out = cloneScreen(s)
+  spans.forEach((span, i) => {
+    const centre = (s.mnMM[i] + s.mxMM[i]) / 2
+    out.mnMM[i] = centre - span / 2
+    out.mxMM[i] = centre + span / 2
+  })
+  return out
+}
 
 // Tile mm dimensions (in-plane width x height) for an orientation
 const tileDimsMM = (
@@ -823,6 +842,7 @@ export function fitSlicesAndGraph(
 ): { screenSlices: SliceTile[]; graphWidth: number } {
   const screenSlices = screenSlicesLayout(config)
   if (baseGraphWidth <= 0) return { screenSlices, graphWidth: 0 }
+  // A filled single slice uses the slack itself, so the graph keeps base width.
   const single =
     (config.sliceType === NVConstants.SLICE_TYPE.AXIAL ||
       config.sliceType === NVConstants.SLICE_TYPE.CORONAL ||
@@ -843,6 +863,45 @@ export function fitSlicesAndGraph(
     }),
     graphWidth: baseGraphWidth + (baseW - usedW),
   }
+}
+
+/**
+ * Both renderers' slice-layout step. Emits no tiles when the spatial view is
+ * hidden (signal-only scene, or `SLICE_TYPE.NONE`), so nothing spatial renders
+ * and the graph has the area to itself. The model-to-config mapping lives here
+ * and nowhere else: a flag threaded into one backend's copy is a parity break.
+ *
+ * @param paneWH - the slice area: canvas minus the legend, graph and colorbar
+ */
+export function fitSlicesFromModel(
+  model: NVModel,
+  paneWH: [number, number],
+  baseGraphWidth: number,
+): { screenSlices: SliceTile[]; graphWidth: number } {
+  if (model.isSpatialViewHidden()) {
+    return { screenSlices: [], graphWidth: baseGraphWidth }
+  }
+  return fitSlicesAndGraph(
+    {
+      canvasWH: paneWH,
+      sliceType: model.layout.sliceType,
+      tileMargin: model.layout.margin,
+      extentsMin: model.extentsMin,
+      extentsMax: model.extentsMax,
+      isRadiologicalConvention: model.layout.isRadiological,
+      multiplanarLayout: model.layout.multiplanarType,
+      multiplanarShowRender: model.layout.showRender,
+      sliceMosaicString: model.layout.mosaicString,
+      heroImageFraction: model.layout.heroFraction,
+      heroSliceType: model.layout.heroSliceType,
+      isMultiplanarEqualSize: model.layout.isEqualSize,
+      isCrossLines: model.ui.isCrossLinesVisible,
+      isCenterMosaic: model.layout.isMosaicCentered,
+      isSingleViewFillCanvas: model.layout.isSingleViewFillCanvas,
+      customLayout: model.layout.customLayout,
+    },
+    baseGraphWidth,
+  )
 }
 
 export function screenSlicesLayout(config: SliceLayoutConfig): SliceTile[] {
@@ -889,11 +948,23 @@ export function screenSlicesLayout(config: SliceLayoutConfig): SliceTile[] {
       throw new Error('Missing fovMM for slice')
     }
     const zoom = Math.min(canvasWH[0] / fov[0], canvasWH[1] / fov[1])
-    const w = fov[0] * zoom
-    const h = fov[1] * zoom
+    // Fill needs a usable fit scale: zero or infinite gives NaN mm bounds.
+    const fill =
+      (config.isSingleViewFillCanvas ?? true) &&
+      Number.isFinite(zoom) &&
+      zoom > 0
+    const w = fill ? canvasWH[0] : fov[0] * zoom
+    const h = fill ? canvasWH[1] : fov[1] * zoom
     return [
       {
         ...screens[idx],
+        // Spans are stored PRE-zoom: calculateMvpMatrix2D divides by it (#68).
+        ...(fill && {
+          screen: fillScreen(screens[idx].screen as ScreenInfo, [
+            w / zoom,
+            h / zoom,
+          ]),
+        }),
         leftTopWidthHeight: [
           (canvasWH[0] - w) / 2,
           (canvasWH[1] - h) / 2,

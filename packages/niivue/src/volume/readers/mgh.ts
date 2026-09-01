@@ -174,8 +174,11 @@ export async function read(
   const nBytesPerVoxel = hdr.numBitsPerVoxel / 8
   const nVoxels = width * height * depth * hdr.dims[4]
   const expectedBytes = nVoxels * nBytesPerVoxel
-  // Return only the raw image data buffer
-  const imgRaw = raw.slice(hdr.vox_offset, hdr.vox_offset + expectedBytes)
+  // Copy: a Node Buffer's slice() is subarray(), so imgRaw.buffer would be the
+  // whole underlying allocation, not the image.
+  const imgRaw = new Uint8Array(
+    raw.subarray(hdr.vox_offset, hdr.vox_offset + expectedBytes),
+  )
   // MGH/MGZ image data is big-endian. Downstream typed-array views read in
   // platform-native byte order, so on little-endian hosts swap multi-byte
   // samples (INT16/INT32/FLOAT32) to native order; single-byte UCHAR needs none.

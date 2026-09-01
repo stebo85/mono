@@ -115,11 +115,18 @@ export function buildDragReleaseInfo(ctrl: NiiVue): DragReleaseInfo | null {
   const vol = ctrl.model.getVolumes()[0]
   let voxStart: [number, number, number] = [0, 0, 0]
   let voxEnd: [number, number, number] = [0, 0, 0]
-  if (vol) {
-    const sv = NVTransforms.mm2vox(vol, startMM)
-    const ev = NVTransforms.mm2vox(vol, endMM)
-    voxStart = [Math.round(sv[0]), Math.round(sv[1]), Math.round(sv[2])]
-    voxEnd = [Math.round(ev[0]), Math.round(ev[1]), Math.round(ev[2])]
+  const dims = vol?.dimsRAS
+  if (vol && dims) {
+    // Voxel indices, and the tile can now extend past the volume, so a drag
+    // released in the margin would report an out-of-range index. The mm fields
+    // stay unclamped -- they describe the real gesture.
+    const clamp = (v: vec3): [number, number, number] => [
+      Math.max(0, Math.min(dims[1] - 1, Math.round(v[0]))),
+      Math.max(0, Math.min(dims[2] - 1, Math.round(v[1]))),
+      Math.max(0, Math.min(dims[3] - 1, Math.round(v[2]))),
+    ]
+    voxStart = clamp(NVTransforms.mm2vox(vol, startMM))
+    voxEnd = clamp(NVTransforms.mm2vox(vol, endMM))
   }
 
   const mmLength = vec3.distance(

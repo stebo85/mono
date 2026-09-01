@@ -41,8 +41,8 @@ in production is one well-predicted branch per call site. See
 
 ### Development Workflows
 
-- **`bun run dev`** — Runs the `demos/` pages with hot reloading. A Vite plugin intercepts `import '../dist/niivue.js'` and redirects it to source, so demo scripts stay identical to the deployed versions but get full HMR. Asset directories in `demos/` are symlinked to `public/` on first run.
-- **`bun run demo`** — Builds the library to `demos/dist/`, copies assets, and serves with `http-server`. Use this to test the actual built output or before deploying to GitHub Pages.
+- **`bun run dev`** — Serves the `examples/` pages from source with hot reloading at `localhost:5273`. The pages `import '../src/index.ts'` directly, so dev and the deployed build run the same files. On-demand sample data (OME-Zarr, DICOM-WSI) is downloaded into `public/` if missing.
+- **`bun run demo`** — Builds the examples site to `dist/` and serves it with `http-server`. Use this to test the actual built output or before deploying to GitHub Pages.
 
 ## Usage
 
@@ -201,7 +201,7 @@ bunx nx test niivue
 
 ### Architecture
 
-The codebase is written in **TypeScript** and follows an MVC pattern with dual rendering backends (WebGPU and WebGL2). See [CLAUDE.md](CLAUDE.md) for detailed architecture documentation, directory structure, code style, and module naming conventions.
+The codebase is written in **TypeScript** and follows an MVC pattern with dual rendering backends (WebGPU and WebGL2). See [AGENTS.md](AGENTS.md) for detailed architecture documentation, directory structure, code style, and module naming conventions.
 
 ### Dependencies
 

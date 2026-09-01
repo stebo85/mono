@@ -1,14 +1,16 @@
+import { mmPerPixel2D } from '@/math/NVTransforms'
 import { SLICE_TYPE } from '@/NVConstants'
 import type { BuildTextFn, GlyphBatch } from './NVFont'
 import type { BuildLineFn, LineData } from './NVLine'
-import type { SliceTile } from './NVSliceLayout'
+import { type SliceTile, slicePanUV } from './NVSliceLayout'
 
-// In-plane axis indices per orientation: [u, v] (depth axis excluded)
-const IN_PLANE: Record<number, [number, number]> = {
-  [SLICE_TYPE.AXIAL]: [0, 1],
-  [SLICE_TYPE.CORONAL]: [0, 2],
-  [SLICE_TYPE.SAGITTAL]: [1, 2],
-}
+// slicePanUV indexes by orientation, so anything else (RENDER, or a tile from
+// an externally assigned screenSlices) would throw rather than draw no ruler.
+const IS_2D: number[] = [
+  SLICE_TYPE.AXIAL,
+  SLICE_TYPE.CORONAL,
+  SLICE_TYPE.SAGITTAL,
+]
 
 // Nice ruler lengths to try, in descending order (in current unit)
 const NICE_VALUES = [10, 5, 2, 1]
@@ -21,15 +23,12 @@ function selectRulerTile(tiles: SliceTile[]): SliceTile | null {
   let best: SliceTile | null = null
   let bestSpan = 0
   for (const tile of tiles) {
-    if (tile.axCorSag === SLICE_TYPE.RENDER) continue
+    if (!IS_2D.includes(tile.axCorSag)) continue
     if (!tile.screen || !tile.leftTopWidthHeight) continue
-    const axes = IN_PLANE[tile.axCorSag]
-    if (!axes) continue
+    // fovMM is tile-local [u, v, depth], never world XYZ: buildScreens already
+    // remapped it, and world axes read sagittal's vertical span as horizontal.
     const fov = tile.screen.fovMM
-    const span = Math.max(
-      Math.abs(fov[axes[0]] as number),
-      Math.abs(fov[axes[1]] as number),
-    )
+    const span = Math.max(Math.abs(fov[0]), Math.abs(fov[1]))
     if (span > bestSpan) {
       bestSpan = span
       best = tile
@@ -78,25 +77,31 @@ export function buildRuler(
   buildText: BuildTextFn,
   buildLine: BuildLineFn,
   fontColor: number[],
-  _backColor: number[],
+  pan2Dxyzmm: ArrayLike<number>,
 ): RulerResult | null {
   const tile = selectRulerTile(tiles)
   if (!tile?.screen || !tile.leftTopWidthHeight) return null
 
-  const axes = IN_PLANE[tile.axCorSag]
-  if (!axes) return null
-
-  const fov = tile.screen.fovMM
-  // Use the horizontal (u-axis) FOV for ruler sizing since we draw horizontally
-  const hFovMM = Math.abs(fov[axes[0]] as number)
   const [tileLeft, tileTop, tileWidth, tileHeight] = tile.leftTopWidthHeight
 
-  const ruler = chooseRulerSize(hFovMM)
+  // Size against what is on screen: the 2D zoom narrows the ortho window, so
+  // tileWidth / fovMM would mislabel the bar by the zoom factor.
+  const mmPerPx = mmPerPixel2D(
+    tile.screen.mnMM,
+    tile.screen.mxMM,
+    tile.leftTopWidthHeight,
+    slicePanUV(pan2Dxyzmm, tile.axCorSag),
+  )
+  if (!(mmPerPx > 0)) return null
+
+  // Cap by the DATA span too: a filled tile is the whole canvas, so sizing on
+  // it alone grows the bar past the image whenever the volume is small.
+  const ruler = chooseRulerSize(
+    Math.min(tileWidth * mmPerPx, Math.abs(tile.screen.fovMM[0])),
+  )
   if (!ruler) return null
 
-  // Convert mm to pixels
-  const pxPerMM = tileWidth / hFovMM
-  const rulerPx = ruler.lengthMM * pxPerMM
+  const rulerPx = ruler.lengthMM / mmPerPx
 
   const segments = 5
   const segPx = rulerPx / segments

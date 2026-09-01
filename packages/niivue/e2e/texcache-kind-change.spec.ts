@@ -74,7 +74,15 @@ for (const backend of ['webgl2', 'webgpu'] as const) {
     const result = await page.evaluate(`(async () => {
       if ('${backend}' === 'webgpu') {
         if (!navigator.gpu) return { skip: 'no navigator.gpu' }
-        const adapter = await navigator.gpu.requestAdapter()
+        let adapter = null
+        try {
+          adapter = await navigator.gpu.requestAdapter()
+        } catch (e) {
+          // Dawn on a headless runner throws "A valid external Instance
+          // reference no longer exists" rather than resolving null. That is a
+          // missing adapter, not a failed assertion.
+          return { skip: 'requestAdapter threw: ' + e }
+        }
         if (!adapter) return { skip: 'no WebGPU adapter' }
       }
       const { default: NiiVue, SLICE_TYPE, chunkVolumeGrid } =
@@ -92,6 +100,12 @@ for (const backend of ['webgl2', 'webgpu'] as const) {
         sliceType: SLICE_TYPE.RENDER,
       })
       await nv.attachToCanvas(canvas)
+      // The both-backends build silently falls back to WebGL2 when WebGPU init
+      // throws, which would run this case twice on the same backend and report
+      // it as WebGPU coverage. Skip instead of passing on a lie.
+      if ('${backend}' === 'webgpu' && nv.backend !== 'webgpu') {
+        return { skip: 'WebGPU init fell back to ' + nv.backend }
+      }
       await nv.loadVolumes([{ url: file, name: 'texcache.nii' }])
       await nextFrame()
 

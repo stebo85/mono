@@ -18,7 +18,12 @@ name: niivue browser contracts
 # runners do not have, so running it here would be flaky noise rather than
 # signal. These three are deterministic without one: the first two never touch
 # the GPU, and texcache-kind-change forces `--use-angle=swiftshader` for its
-# WebGL2 case and skips its WebGPU case when `requestAdapter()` yields nothing.
+# WebGL2 case, which is the case that was proven to fail on main. Its WebGPU
+# case skips here. `requestAdapter()` does succeed on the runner, but the GPU
+# instance dies partway through, so the spec skips on GPU-loss errors only; a
+# validation error from a destroyed texture, the failure it exists to catch,
+# still fails. `--workers=1` because two Chromium instances sharing one
+# software GPU were what killed the instance.
 
 on:
   push:

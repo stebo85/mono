@@ -33,11 +33,37 @@ test.beforeEach(async ({ page }) => {
   await page.goto('/examples/index.html', { waitUntil: 'load' })
 })
 
-// A 2x2x2 forced plan: mni152 fits in one texture, so the tiling is forced
+// A 2x2x2 forced plan: the volume fits in one texture, so the tiling is forced
 // rather than required. Eight bricks is enough to tell "chunked" from "not"
 // without paying for 27 uploads under SwiftShader.
 const GRID = 2
 const EXPECTED_CHUNKS = GRID * GRID * GRID
+
+// A synthesized NIfTI-1, not a file from packages/dev-images: those are Git LFS
+// pointers on a CI checkout, and a pointer parses as "not NIFTI". Every spec on
+// this workflow's allowlist builds its own bytes for that reason. 48^3 uint16 is
+// small enough to upload quickly under SwiftShader and still divides into a
+// 2x2x2 grid with the renderer's 3-voxel gradient halo.
+const fixture = `
+  const N = 48
+  const VOX_OFFSET = 352
+  const raw = new Uint8Array(VOX_OFFSET + N * N * N * 2)
+  const dv = new DataView(raw.buffer)
+  dv.setInt32(0, 348, true)
+  ;[3, N, N, N, 1, 1, 1, 1].forEach((d, i) => dv.setInt16(40 + i * 2, d, true))
+  dv.setInt16(70, 512, true)   // DT_UINT16
+  dv.setInt16(72, 16, true)    // bitpix
+  ;[1, 2, 2, 2, 1, 1, 1, 1].forEach((p, i) => dv.setFloat32(76 + i * 4, p, true))
+  dv.setFloat32(108, VOX_OFFSET, true)
+  dv.setFloat32(112, 1, true)  // scl_slope
+  raw.set(new TextEncoder().encode('n+1\\0'), 344)
+  // A gradient rather than a constant, so an upload that silently drops a brick
+  // would be visible to a follow-up assertion if one is ever added here.
+  for (let i = 0; i < N * N * N; i++) {
+    dv.setUint16(VOX_OFFSET + i * 2, i % 4096, true)
+  }
+  const file = new File([raw], 'texcache.nii')
+`
 
 for (const backend of ['webgl2', 'webgpu'] as const) {
   test(`a volume that stops being chunked drops its bricks (${backend})`, async ({
@@ -55,6 +81,7 @@ for (const backend of ['webgl2', 'webgpu'] as const) {
         await import('/src/index.ts')
       const nextFrame = () => new Promise((r) =>
         requestAnimationFrame(() => requestAnimationFrame(r)))
+      ${fixture}
 
       const canvas = document.createElement('canvas')
       canvas.width = 256
@@ -65,7 +92,7 @@ for (const backend of ['webgl2', 'webgpu'] as const) {
         sliceType: SLICE_TYPE.RENDER,
       })
       await nv.attachToCanvas(canvas)
-      await nv.loadVolumes([{ url: '/volumes/mni152.nii.gz' }])
+      await nv.loadVolumes([{ url: file, name: 'texcache.nii' }])
       await nextFrame()
 
       const vol = nv.volumes[0]
@@ -82,8 +109,8 @@ for (const backend of ['webgl2', 'webgpu'] as const) {
       await nextFrame()
       const chunked = nv.chunkStreamStats()
 
-      // Back to one texture under the SAME cache key (vol.url), which is the
-      // kind change that used to strand the chunked entry.
+      // Back to one texture under the SAME cache key, which is the kind change
+      // that used to strand the chunked entry.
       vol.chunkPlan = undefined
       await nv.updateGLVolume()
       await nextFrame()

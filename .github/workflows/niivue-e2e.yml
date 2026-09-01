@@ -54,4 +54,5 @@ jobs:
             e2e/partial-decode-4d.spec.ts \
             e2e/reader-name-override.spec.ts \
             e2e/texcache-kind-change.spec.ts \
+            --workers=1 \
             --reporter=line

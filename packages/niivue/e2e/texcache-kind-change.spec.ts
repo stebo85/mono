@@ -72,6 +72,7 @@ for (const backend of ['webgl2', 'webgpu'] as const) {
     test.setTimeout(180_000)
 
     const result = await page.evaluate(`(async () => {
+     try {
       if ('${backend}' === 'webgpu') {
         if (!navigator.gpu) return { skip: 'no navigator.gpu' }
         let adapter = null
@@ -135,6 +136,18 @@ for (const backend of ['webgl2', 'webgpu'] as const) {
         singleTotal: single ? single.total : null,
         singleResident: single ? single.resident : null,
       }
+     } catch (e) {
+      // A headless runner's GPU process can die under two concurrent WebGPU
+      // contexts, after requestAdapter has already succeeded. That is the
+      // environment going away, so skip. Anything else -- a validation error
+      // from binding a destroyed texture, say, which is the failure mode this
+      // spec exists to catch -- still fails the test.
+      const m = String(e && e.message ? e.message : e)
+      if (/no longer exists|device (is )?lost|adapter/i.test(m)) {
+        return { skip: 'GPU unavailable: ' + m }
+      }
+      throw e
+     }
     })()`)
 
     // biome-ignore lint/suspicious/noExplicitAny: page.evaluate returns unknown

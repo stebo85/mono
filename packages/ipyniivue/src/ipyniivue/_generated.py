@@ -197,6 +197,7 @@ first such interaction warns). Turn one off before turning the other on.
     thumbnail_url = traitlets.Unicode(None, allow_none=True).tag(sync=True)
     tile_margin = traitlets.Float(None, allow_none=True).tag(sync=True)
     volume_alpha_shader = traitlets.Float(None, allow_none=True).tag(sync=True)
+    volume_gradient_opacity = traitlets.Float(None, allow_none=True).tag(sync=True)
     volume_illumination = traitlets.Float(None, allow_none=True).tag(sync=True)
     volume_is_alpha_clip_dark = traitlets.Bool(None, allow_none=True).tag(sync=True)
     volume_is_background_masking = traitlets.Bool(None, allow_none=True).tag(sync=True)
@@ -204,6 +205,7 @@ first such interaction warns). Turn one off before turning the other on.
     volume_is_cubic_interpolation = traitlets.Bool(None, allow_none=True).tag(sync=True)
     volume_is_nearest_interpolation = traitlets.Bool(None, allow_none=True).tag(sync=True)
     volume_is_v1_slice_shader = traitlets.Bool(None, allow_none=True).tag(sync=True)
+    volume_layer_gradient_mode = traitlets.Float(None, allow_none=True).tag(sync=True)
     volume_lod_brightness_compensation = traitlets.Float(None, allow_none=True).tag(sync=True)
     volume_lod_opacity_compensation = traitlets.Float(None, allow_none=True).tag(sync=True)
     volume_matcap = traitlets.Unicode(None, allow_none=True).tag(sync=True)
@@ -211,6 +213,7 @@ first such interaction warns). Turn one off before turning the other on.
     volume_paqd_uniforms = traitlets.List(trait=traitlets.Float(None, allow_none=True), default_value=None, minlen=4, maxlen=4, allow_none=True).tag(sync=True)
     volume_render_mode = traitlets.Float(None, allow_none=True).tag(sync=True)
     volume_sample_rate = traitlets.Float(None, allow_none=True).tag(sync=True)
+    volume_silhouette = traitlets.Float(None, allow_none=True).tag(sync=True)
     volume_transmittance_cutoff = traitlets.Float(None, allow_none=True).tag(sync=True)
 
     # Read-only properties (synced from JS to Python)

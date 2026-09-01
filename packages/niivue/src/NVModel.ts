@@ -324,6 +324,9 @@ export default class NVModel {
       ...(options.volumeRenderMode !== undefined && {
         renderMode: options.volumeRenderMode,
       }),
+      ...(options.volumeLayerGradientMode !== undefined && {
+        layerGradientMode: options.volumeLayerGradientMode,
+      }),
       ...(options.volumeSampleRate !== undefined && {
         sampleRate: options.volumeSampleRate,
       }),
@@ -335,6 +338,12 @@ export default class NVModel {
       }),
       ...(options.volumeLodOpacityCompensation !== undefined && {
         lodOpacityCompensation: options.volumeLodOpacityCompensation,
+      }),
+      ...(options.volumeGradientOpacity !== undefined && {
+        gradientOpacity: options.volumeGradientOpacity,
+      }),
+      ...(options.volumeSilhouette !== undefined && {
+        silhouette: options.volumeSilhouette,
       }),
     }
     // Mesh — flat options mapped to mesh group

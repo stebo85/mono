@@ -3,7 +3,7 @@
 // For each chunk in a ChunkPlan, extracts the chunk's source voxel range
 // from the CPU image buffer, uploads it as a per-chunk source 3D texture,
 // runs the orient compute pass with identity matrix (output dims == source
-// dims), then runs the gradient (sobel + blur) compute pass on the per-chunk
+// dims), then runs the gradient compute pass on the per-chunk
 // RGBA output. Returns one {volumeTexture, volumeGradientTexture} per chunk.
 //
 // Scope:

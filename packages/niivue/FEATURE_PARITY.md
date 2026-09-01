@@ -169,7 +169,9 @@ Tracking which features from the old `niivue` package exist in the new rewrite.
 |---------|--------|-------|
 | Azimuth/elevation | ✅ | Properties |
 | Volume illumination | ✅ | `volumeIllumination`; matcap shading is applied to the background, overlay, and drawing passes |
-| Gradient opacity | ❌ | No `setGradientOpacity` method |
+| Gradient opacity | ✅ | `volumeGradientOpacity` (both backends). Modulates the background pass alpha by the precomputed gradient magnitude, `a *= magnitude ^ (amount * 8)`, so homogeneous interior fades and edges survive. The old package indexes a 192-entry LUT of exactly that power function; this evaluates it analytically, so there is no buffer to upload and 0 is a no-op by construction. Demo: `examples/vox.gradopacity.html` |
+| Silhouette enhancement | ✅ | `volumeSilhouette` (both backends). The Fresnel companion to gradient opacity: `a *= (1 - abs(dot(normal, rayDir))) ^ amount`, plus a hard cull where `abs(dot) > 1 - amount`, fading material whose normal faces the camera and leaving the rim. Old-package equivalent is the second argument of `setGradientOpacity` |
+| Layer gradient estimator | ✅ | `volumeLayerGradientMode` (both backends). Selects the in-shader normal estimator for the overlay/drawing passes, which carry no precomputed gradient texture: central difference (legacy), Gaussian blob, or the old package's 8-corner Sobel. No old-package equivalent — it only had the central difference. Demo: `examples/vox.blobgrad.html` |
 | Custom gradient texture | ❌ | No `setCustomGradientTexture` / `getGradientTextureData` |
 | MatCap texture | ✅ | `loadMatcap()` / `volumeMatcap` |
 | Maximum-intensity projection | ✅ | `volumeRenderMode = VOLUME_RENDER_MODE.MAXIMUM` (both backends). Not the old `setAdditiveBlend` API — the ray-march combines samples with a component-wise max instead of OVER, and it applies to every volume pass (base, overlay, PAQD, drawing) |

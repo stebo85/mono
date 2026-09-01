@@ -713,6 +713,14 @@ export type VolumeRenderConfig = {
   /** How the 3D ray-march combines samples. VOLUME_RENDER_MODE.COMPOSITE | MAXIMUM */
   renderMode: number
   /**
+   * Which stencil estimates the in-shader LAYER gradient in the overlay and
+   * drawing ray-march passes. LAYER_GRADIENT_MODE.CENTRAL (default) | BLOB |
+   * SOBEL8. Does NOT affect the background volume, whose gradient is
+   * precomputed into a texture. See LAYER_GRADIENT_MODE for the accuracy
+   * measurements and when each is worth choosing.
+   */
+  layerGradientMode: number
+  /**
    * Samples per voxel along the ray in the 3D render. Oversampling converges the
    * ray integral at a proportional fragment cost. Clamped to [1, 4]. NOTE: this
    * does NOT remove concentric banding on smooth structures -- measured ring
@@ -790,6 +798,39 @@ export type VolumeRenderConfig = {
    * a 2D slice tile shows one sample with no accumulation.
    */
   lodOpacityCompensation: number
+  /**
+   * Gradient-magnitude opacity modulation for the BACKGROUND volume's 3D
+   * ray-march. 0 (the default) is a no-op; raising it toward 1 progressively
+   * suppresses homogeneous interior while leaving edges intact, because each
+   * sample's alpha is scaled by `magnitude ^ (gradientOpacity * 8)` and the
+   * gradient magnitude is near 0 wherever the data is flat.
+   *
+   * The exponent form is the analytic version of the old NiiVue's 192-entry
+   * `gradientOpacity` LUT, which sampled exactly this function; there is no
+   * table to upload and `0` yields 1.0 for every magnitude by construction.
+   *
+   * The magnitude comes from the precomputed gradient texture's alpha channel,
+   * so this applies to the background volume only -- the overlay and drawing
+   * passes estimate their gradient in-shader (see `layerGradientMode`) and are
+   * unaffected. 2D slice tiles show one sample with no accumulation and are
+   * unaffected too.
+   */
+  gradientOpacity: number
+  /**
+   * Silhouette (Fresnel rim) enhancement for the BACKGROUND volume's 3D
+   * ray-march. 0 (the default) is a no-op; clamped to [0, 1].
+   *
+   * A sample's alpha is scaled by `(1 - |dot(normal, rayDir)|) ^ silhouette`,
+   * which fades material whose surface faces the camera and keeps material seen
+   * edge-on, so a surface reads as an outline rather than a solid. Samples more
+   * aligned with the view than `1 - silhouette` are culled outright, which is
+   * what opens the interior up at higher settings.
+   *
+   * Independent of `gradientOpacity`: either can be used alone, and both use
+   * the same precomputed background gradient (so, like it, this needs a
+   * background volume and does nothing to overlays or 2D slices).
+   */
+  silhouette: number
 }
 
 /**
@@ -1134,6 +1175,8 @@ export type NiiVueOptions = {
   volumeTransmittanceCutoff?: number
   /** VOLUME_RENDER_MODE.COMPOSITE (default) | MAXIMUM */
   volumeRenderMode?: number
+  /** Layer-gradient stencil for the overlay/drawing passes. LAYER_GRADIENT_MODE.CENTRAL (default) | BLOB | SOBEL8. See VolumeRenderConfig.layerGradientMode. */
+  volumeLayerGradientMode?: number
   /** Samples per voxel along the ray in the 3D render, [1, 4]. See VolumeRenderConfig.sampleRate. */
   volumeSampleRate?: number
   /** Tricubic B-spline reconstruction in the 3D ray-march. See VolumeRenderConfig.isCubicInterpolation. */
@@ -1142,6 +1185,10 @@ export type NiiVueOptions = {
   volumeLodBrightnessCompensation?: number
   /** Per-level opacity compensation for coarse multi-LOD bricks in the 3D ray-march, [0, 1]; 0 disables (default). See VolumeRenderConfig.lodOpacityCompensation. */
   volumeLodOpacityCompensation?: number
+  /** Gradient-magnitude opacity modulation for the background 3D ray-march, [0, 1]; 0 disables (default). See VolumeRenderConfig.gradientOpacity. */
+  volumeGradientOpacity?: number
+  /** Silhouette (Fresnel rim) enhancement for the background 3D ray-march, [0, 1]; 0 disables (default). See VolumeRenderConfig.silhouette. */
+  volumeSilhouette?: number
 
   // Mesh (prefixed)
   meshXRay?: number

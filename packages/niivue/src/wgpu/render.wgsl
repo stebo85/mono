@@ -5,12 +5,26 @@
 // before this, so the ceiling costs nothing at the common rates.
 const MAX_FINE_STEPS: i32 = 8192;
 
-// In-shader layer-gradient tuning constants, used by the overlay and drawing
-// passes (neither has a precomputed gradient texture the way the background
-// does). Shader authoring choices, not runtime uniforms. Offset widens vs
-// sharpens the gradient stencil; non-integer exploits the linear sampler for
-// Gaussian-like free smoothing. Epsilon below which gradient normalization is
-// unreliable.
+// In-shader layer-gradient constants, used by the overlay and drawing passes
+// (neither has a precomputed gradient texture the way the background does).
+//
+// Three estimators, selected at runtime by params.layerGradMode, which the
+// controller drives through volumeLayerGradientMode / LAYER_GRADIENT_MODE:
+//   0 CENTRAL  the legacy 6-tap central difference at a hand-tuned offset
+//   1 BLOB     the Gaussian-blob derivative (see layerGradBlob)
+//   2 SOBEL8   the 8-corner Sobel the old niivue precomputes with
+//
+// The rest are shader authoring choices rather than runtime knobs. SIGMA is the
+// width, in voxels, of the Gaussian blob the layer is reconstructed with; it is
+// the only knob for mode 1, since both tap radii and their weights derive from
+// it. DIAGONALS adds the four body-diagonal directions to the three axes (mode
+// 1 only). OFFSET is used by mode 0 only. EPSILON is the magnitude below which
+// gradient normalization is unreliable.
+const LAYER_GRAD_CENTRAL: i32 = 0;
+const LAYER_GRAD_BLOB: i32 = 1;
+const LAYER_GRAD_SOBEL8: i32 = 2;
+const LAYER_GRAD_SIGMA: f32 = 1.0;
+const LAYER_GRAD_DIAGONALS: bool = true;
 const LAYER_GRAD_OFFSET: f32 = 1.5;
 const LAYER_GRAD_EPSILON: f32 = 1e-6;
 
@@ -23,29 +37,168 @@ fn layerScalar(c: vec4f) -> f32 {
     return dot(c, vec4f(0.299, 0.587, 0.114, 2.0));
 }
 
-// Matcap shade factor from a 6-tap central-difference gradient of `tex` at `p`.
-// The taps always go through the LINEAR sampler (even when the layer itself is
-// ray-marched with nearest), so each is a trilinear blend of 8 texels — a
-// Gaussian-like smoothing for free that hides ray-march step discretization.
-// Sign: value(+X) - value(-X) matches the volume gradient's inward-pointing
-// convention. Returns vec3f(1.0) (no shading) when the gradient is degenerate.
-fn layerShade(tex: texture_3d<f32>, p: vec3f, amount: f32) -> vec3f {
-    // dv is a LAYER_GRAD_OFFSET-voxel offset in full-volume [0,1] units;
-    // chunkTexCoord then maps it into the per-chunk texture, so the stencil
-    // width stays correct for a chunked layer.
+// Central difference of `tex` along one antipodal pair. `off` is a half-offset
+// in full-volume [0,1] units; chunkTexCoord maps it into the per-chunk texture
+// so the stencil width stays correct for a chunked layer. Sign convention is
+// value(+dir) - value(-dir), matching the precomputed volume gradient's
+// inward-pointing normals.
+fn layerPairDiff(tex: texture_3d<f32>, p: vec3f, off: vec3f) -> f32 {
+    let a = layerScalar(textureSampleLevel(tex, tex_sampler, chunkTexCoord(p + off), 0.0));
+    let b = layerScalar(textureSampleLevel(tex, tex_sampler, chunkTexCoord(p - off), 0.0));
+    return a - b;
+}
+
+// Radial envelope of a Gaussian's derivative. For g(r) = exp(-r^2 / (2 s^2)),
+// grad g = -(r / s^2) g(r), so the magnitude goes as r * g(r). The 1 / s^2 is
+// a common factor over every direction and the result is normalized, so it is
+// dropped. Peaks at r == s, which is where the diagonal shell samples.
+fn blobWeight(r: f32, s: f32) -> f32 {
+    return r * exp(-(r * r) / (2.0 * s * s));
+}
+
+// Legacy estimator: a 6-tap central difference at a hand-tuned 1.5-voxel
+// offset -- three axes, no diagonals. The default, and what NiiVue has always
+// drawn.
+fn layerGradCentral(tex: texture_3d<f32>, p: vec3f) -> vec3f {
     let dv = LAYER_GRAD_OFFSET / params.volumeTexDimsFull.xyz;
-    let vXp = layerScalar(textureSampleLevel(tex, tex_sampler, chunkTexCoord(p + vec3f(dv.x, 0.0, 0.0)), 0.0));
-    let vXm = layerScalar(textureSampleLevel(tex, tex_sampler, chunkTexCoord(p - vec3f(dv.x, 0.0, 0.0)), 0.0));
-    let vYp = layerScalar(textureSampleLevel(tex, tex_sampler, chunkTexCoord(p + vec3f(0.0, dv.y, 0.0)), 0.0));
-    let vYm = layerScalar(textureSampleLevel(tex, tex_sampler, chunkTexCoord(p - vec3f(0.0, dv.y, 0.0)), 0.0));
-    let vZp = layerScalar(textureSampleLevel(tex, tex_sampler, chunkTexCoord(p + vec3f(0.0, 0.0, dv.z)), 0.0));
-    let vZm = layerScalar(textureSampleLevel(tex, tex_sampler, chunkTexCoord(p - vec3f(0.0, 0.0, dv.z)), 0.0));
-    let grad = vec3f(vXp - vXm, vYp - vYm, vZp - vZm);
+    return vec3f(
+        layerPairDiff(tex, p, vec3f(dv.x, 0.0, 0.0)),
+        layerPairDiff(tex, p, vec3f(0.0, dv.y, 0.0)),
+        layerPairDiff(tex, p, vec3f(0.0, 0.0, dv.z))
+    );
+}
+
+// Gaussian-blob gradient.
+//
+// Treat the layer as a sum of radially symmetric Gaussian basis functions
+// rather than a lattice of point samples. That reconstruction differentiates
+// analytically — d(f * g) = f * dg — so the gradient of the smoothed field
+// is a radially weighted sum of directional central differences, with no
+// finite-difference stencil left to hand-tune. Every tap radius and weight
+// falls out of LAYER_GRAD_SIGMA.
+//
+// Directions come in antipodal pairs, so each costs 2 fetches and contributes
+// dir * (f(p + r*dir) - f(p - r*dir)). Two shells:
+//
+//   axes (6 fetches). The 1D DoG correlation weight is w(t) = t * g(t), so the
+//   taps at t = 1 and t = 2 voxels both carry positive weight. Same-sign
+//   neighbouring taps fold into a SINGLE linear fetch: sampling at
+//   (1*w1 + 2*w2) / (w1 + w2) with weight (w1 + w2) reproduces both, because
+//   the sampler lerps linearly between those two texels. So a 2-tap-per-side
+//   DoG costs exactly what the 1-tap central difference did. Worth noting the
+//   fold radius at s = 1 is 1.31, which is what the legacy 1.5 was reaching
+//   for by hand.
+//
+//   body diagonals (8 fetches, LAYER_GRAD_DIAGONALS). One tap per side at
+//   r = s, the peak of r * g(r). These carry no folding trick: an off-axis
+//   trilinear fetch is not a 1D lerp, so the two-into-one identity does not
+//   hold. They are what buys isotropy, and they are the whole of the win: on an
+//   analytic sphere the axis shell alone only takes the mean angular error from
+//   0.80 to 0.62 degrees, while adding the diagonals takes it to 0.20.
+//
+//   Where that error lives is worth stating precisely, because it is easy to
+//   guess wrong. It is NOT largest along the diagonals. Every estimator here is
+//   EXACT on the axes, the face diagonals, and the body diagonals alike — those
+//   are symmetry directions of both the stencil and the sphere, so the tap
+//   errors cancel. The error appears in the generic directions BETWEEN them,
+//   and that is what the extra shell suppresses (1.53 to 0.49 degrees on one
+//   such direction). So the artifact to look for is not facets pointing down
+//   the diagonals but a smooth angular ripple with zeros at the symmetry axes.
+//
+// Both shells are individually isotropic in their second moment (3 axes give
+// I, 4 body diagonals give (4/3)I), so they combine without a correction
+// matrix. Each shell is divided by its own radius to put the two finite
+// differences on a common scale before they are summed.
+//
+// The taps always go through the LINEAR sampler, even when the layer itself is
+// ray-marched with nearest, so each is a trilinear blend of 8 texels. Note
+// that p is an arbitrary ray position rather than a texel center, so the fold
+// is an approximation there rather than an identity; the extra smoothing that
+// costs is the same smoothing the legacy path already relied on.
+fn layerGradBlob(tex: texture_3d<f32>, p: vec3f) -> vec3f {
+    let s = LAYER_GRAD_SIGMA;
+    // One voxel in full-volume [0,1] units. Componentwise, so a voxel-space
+    // direction stays that direction after the anisotropic texture scaling.
+    let vox = 1.0 / params.volumeTexDimsFull.xyz;
+
+    let w1 = blobWeight(1.0, s);
+    let w2 = blobWeight(2.0, s);
+    let rAx = (w1 + 2.0 * w2) / (w1 + w2);
+    let kAx = (w1 + w2) / rAx;
+    let ax = rAx * vox;
+    var grad = kAx * vec3f(
+        layerPairDiff(tex, p, vec3f(ax.x, 0.0, 0.0)),
+        layerPairDiff(tex, p, vec3f(0.0, ax.y, 0.0)),
+        layerPairDiff(tex, p, vec3f(0.0, 0.0, ax.z))
+    );
+
+    if (LAYER_GRAD_DIAGONALS) {
+        let rDg = s;
+        let kDg = blobWeight(rDg, s) / rDg;
+        let u = 1.0 / sqrt(3.0);
+        let d0 = vec3f(u, u, u);
+        let d1 = vec3f(u, u, -u);
+        let d2 = vec3f(u, -u, u);
+        let d3 = vec3f(u, -u, -u);
+        let dg = rDg * vox;
+        grad += kDg * (
+            d0 * layerPairDiff(tex, p, d0 * dg)
+            + d1 * layerPairDiff(tex, p, d1 * dg)
+            + d2 * layerPairDiff(tex, p, d2 * dg)
+            + d3 * layerPairDiff(tex, p, d3 * dg));
+    }
+    return grad;
+}
+
+// The old niivue's estimator: an 8-corner Sobel, i.e. the four body-diagonal
+// antipodal pairs at (+-1,+-1,+-1) voxels and no axis taps at all. It is the
+// exact mirror of the legacy central difference, which uses the three axes and
+// no diagonals -- and it is the better half of that trade (0.68 vs 0.80 degrees
+// mean angular error on an analytic sphere). The blob estimator uses both
+// shells, which is where its 0.20 comes from.
+//
+// One caveat when comparing against upstream. There this stencil does NOT run
+// on the raw layer: it runs as a precompute over a 27-tap prepass, and that
+// prepass is a BLUR despite its name (its -d and +d terms carry the same sign;
+// summing the three directional blurs it writes gives a hollow kernel with
+// centre 0, faces 2, edges 4, corners 3). So the old pipeline is already a
+// derivative of a smoothed field -- the same idea layerGradBlob derives
+// analytically, done as two texture passes instead. That prepass is worth
+// 0.68 -> 0.55 degrees, which this in-shader version does not have (216 taps
+// per shaded sample is not a thing to do in a ray-march). Mode SOBEL8 is
+// therefore slightly harsh on the old method, by a quarter of the gap it
+// still loses by.
+fn layerGradSobel8(tex: texture_3d<f32>, p: vec3f) -> vec3f {
+    let vox = 1.0 / params.volumeTexDimsFull.xyz;
+    let d0 = vec3f(1.0, 1.0, 1.0);
+    let d1 = vec3f(1.0, 1.0, -1.0);
+    let d2 = vec3f(1.0, -1.0, 1.0);
+    let d3 = vec3f(1.0, -1.0, -1.0);
+    return d0 * layerPairDiff(tex, p, d0 * vox)
+        + d1 * layerPairDiff(tex, p, d1 * vox)
+        + d2 * layerPairDiff(tex, p, d2 * vox)
+        + d3 * layerPairDiff(tex, p, d3 * vox);
+}
+
+fn layerGrad(tex: texture_3d<f32>, p: vec3f, mode: i32) -> vec3f {
+    if (mode == LAYER_GRAD_SOBEL8) { return layerGradSobel8(tex, p); }
+    if (mode == LAYER_GRAD_BLOB) { return layerGradBlob(tex, p); }
+    return layerGradCentral(tex, p);
+}
+
+// Matcap shade factor from the layer's own gradient at `p`. Returns
+// vec3f(1.0) (no shading) when the gradient is degenerate.
+fn layerShade(tex: texture_3d<f32>, p: vec3f, amount: f32) -> vec3f {
+    let grad = layerGrad(tex, p, i32(params.layerGradMode));
     if (length(grad) <= LAYER_GRAD_EPSILON) { return vec3f(1.0); }
     let localNormal = normalize(grad);
     let norm3 = mat3x3f(params.normMtx[0].xyz, params.normMtx[1].xyz, params.normMtx[2].xyz);
     let n = norm3 * localNormal;
-    let uv = n.xy * 0.5 + 0.5;
+    // Flip y for the lookup. A matcap PNG is a lit sphere whose light sits near
+    // the TOP of the image, and v=0 is the image's top row (neither backend
+    // flips on upload), so v must count DOWN from the eye-space +y a normal
+    // pointing up produces. Without this the volume is lit from below.
+    let uv = vec2f(n.x, -n.y) * 0.5 + 0.5;
     let mc_rgb = textureSampleLevel(matcap, tex_sampler, uv, 0.0).rgb * (1.0 + (amount / 3.0));
     return mix(vec3f(1.0), mc_rgb, amount);
 }
@@ -465,6 +618,14 @@ fn fragment_main(in: VertexOutput) -> FragmentOutput {
 			// steps of material -- the bright and dark seams along level boundaries.
 			var bLo = select(max(snappedBg - 0.5 * stepSize, 0.0), 0.0, snappedBg <= stepSize);
 			let norm3 = mat3x3f(params.normMtx[0].xyz, params.normMtx[1].xyz, params.normMtx[2].xyz);
+			// Three features read the precomputed gradient texture, and NONE of
+			// them is on by default. Hoisted out of the loop because all three
+			// terms are uniform over the draw (localGradientAmount is settled by
+			// the fast pass above), so the branch is fully coherent -- every
+			// fragment takes the same side. Skipping the fetch + normalize +
+			// matcap tap when they are all off measures ~20% of the render.
+			// Mirrored in gl/renderShader.ts.
+			let needsGradient = (localGradientAmount > 0.0) || (params.gradientOpacity > 0.0) || (params.silhouettePower > 0.0);
 			for (var fi: i32 = 0; fi < MAX_FINE_STEPS; fi++) {
 				if (bLo >= len) { break; }
 				// Clipped to len, so the final sample covers the trailing sliver
@@ -492,19 +653,55 @@ fn fragment_main(in: VertexOutput) -> FragmentOutput {
 						bgHasHit = true;
 						firstHit = samplePos;
 					}
-					let gradRaw = textureSampleLevel(volumeGradient, tex_sampler, volCoord, 0.0).rgb;
-					let localNormal = normalize(gradRaw * 2.0 - 1.0);
-					let n = norm3 * localNormal;
-					let uv = n.xy * 0.5 + 0.5;
-					let lightingAmount = localGradientAmount;
-					let mc_rgb = textureSampleLevel(matcap, tex_sampler, uv, 0.0).rgb * (1.0 + (lightingAmount / 3.0));
-					let blendedRGB = mix(vec3f(1.0), mc_rgb, lightingAmount);
-					let finalRGB = blendedRGB * applyGamma(colorSample.rgb, params.invGamma);
+					// Identity defaults, so the branch below is the only thing that
+					// has to know about the gradient: a magnitude of 1 is a no-op in
+					// the gradient-opacity pow(), and localNormal is read only under
+					// silhouettePower > 0, which implies needsGradient.
+					var gradMagnitude = 1.0;
+					var localNormal = vec3f(0.0);
+					var finalRGB = applyGamma(colorSample.rgb, params.invGamma);
+					if (needsGradient) {
+						let gradSample = textureSampleLevel(volumeGradient, tex_sampler, volCoord, 0.0);
+						gradMagnitude = gradSample.a;
+						// Guarded normalize: the precompute writes 0.5 (a zero vector
+						// once decoded) wherever the data is flat, and normalize(0) is
+						// NaN -- which would poison the matcap lookup and, below, the
+						// silhouette dot. The guarded form leaves both defined.
+						let gradVec = gradSample.rgb * 2.0 - 1.0;
+						localNormal = gradVec / max(length(gradVec), 1e-6);
+						let lightingAmount = localGradientAmount;
+						if (lightingAmount > 0.0) {
+							let n = norm3 * localNormal;
+							// See layerShade() for why y is flipped: the matcap's light is
+							// at the top of the PNG and v=0 is the top row, so v counts
+							// down from +y.
+							let uv = vec2f(n.x, -n.y) * 0.5 + 0.5;
+							let mc_rgb = textureSampleLevel(matcap, tex_sampler, uv, 0.0).rgb * (1.0 + (lightingAmount / 3.0));
+							finalRGB *= mix(vec3f(1.0), mc_rgb, lightingAmount);
+						}
+					}
 					// Step-size correction compensates a coarse brick's sparser
 					// sampling in an OVER accumulation. A max projection reads
 					// each sample independently, so correcting it would brighten
 					// coarse bricks instead of matching them.
-					let correctedA = select(1.0 - pow(1.0 - colorSample.a, max(slab * refPerLen * params.lodOpacityScale, 1e-3)), colorSample.a, mip);
+					var correctedA = select(1.0 - pow(1.0 - colorSample.a, max(slab * refPerLen * params.lodOpacityScale, 1e-3)), colorSample.a, mip);
+					// Gradient opacity: scale alpha by the gradient magnitude raised to
+					// gradientOpacity*8. This is the analytic form of the old NiiVue's
+					// 192-entry LUT, which held exactly pow(i/191, opacity*8) -- so
+					// there is no table to upload and 0 is a no-op by construction
+					// (pow(m, 0) == 1) rather than by a special case. Homogeneous
+					// interior has magnitude ~0 and fades out; edges keep their alpha.
+					if (params.gradientOpacity > 0.0) {
+						correctedA *= pow(gradMagnitude, params.gradientOpacity * 8.0);
+					}
+					// Silhouette: fade material whose surface faces the camera and keep
+					// material seen edge-on, so a surface reads as a rim. The hard cull
+					// above 1-silhouette is what opens the interior at higher settings.
+					if (params.silhouettePower > 0.0) {
+						let viewAlign = abs(dot(localNormal, dir));
+						correctedA *= pow(1.0 - viewAlign, params.silhouettePower);
+						if (viewAlign > 1.0 - params.silhouettePower) { correctedA = 0.0; }
+					}
 					let premultiplied = vec4f(finalRGB * correctedA, correctedA);
 					if (mip) {
 						colAcc = max(colAcc, premultiplied);

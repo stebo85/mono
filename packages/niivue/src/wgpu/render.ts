@@ -190,7 +190,12 @@ interface ChunkUniforms {
 interface SingleTexEntry {
   kind: 'single'
   volumeTexture: GPUTexture
-  volumeGradientTexture: GPUTexture
+  /**
+   * Null when the volume was uploaded with no gradient consumer switched on --
+   * the gradient pass is skipped entirely in that case. `_ensureSingleGradients`
+   * fills it in on the first frame after one turns on.
+   */
+  volumeGradientTexture: GPUTexture | null
   /** Categorical volume: never smooth its baked label colors (see _cubicVolumeSafe). */
   isLabel: boolean
 }
@@ -248,7 +253,7 @@ function setChunkBudget(entry: ChunkedTexEntry, bytes: number): void {
 
 type TexCacheEntry = SingleTexEntry | ChunkedTexEntry
 
-// 496 bytes = 124 floats:
+// 500 bytes of data = 125 floats:
 //   16 mvp + 16 norm + 16 matRAS + 4 volScale + 4 rayDir + 4 (gradient/numVol/cutaway/pad)
 //   + 4 clipPlaneColor + 24 clipPlanes + 4 paqd + 8 scalars (earlyTermination,
 //     clipPlaneOverlay, fadeAlpha, renderMode, cubicFilter, invGamma,
@@ -257,9 +262,14 @@ type TexCacheEntry = SingleTexEntry | ChunkedTexEntry
 //     volumeTexDimsFull, so the group is 8 lanes before and after.
 //   + 4 volumeTexDimsFull + 4 chunkSubOrigin + 4 chunkSubSize
 //   + 4 dataOriginTexFrac + 4 dataSizeTexFrac + 4 rayStepTexVox
-// Still rounds up to the same 512-byte alignedRenderSize (UNIFORM_ALIGNMENT 256),
-// so every *_PARAMS_BASE offset below is unchanged by the added vec4.
-const renderParamsSize = 496
+//   + 3 trailing f32 (layerGradMode, gradientOpacity, silhouettePower)
+// The constant below is the size the BIND GROUP declares, which must be the
+// size WGSL gives the struct, not the byte count we write into it: a trailing
+// f32 leaves the struct 16-byte-aligned at 512, and declaring 508 makes every
+// render pipeline fail validation -- silently, as a blank canvas on every
+// example. 512 is exactly the old alignedRenderSize, so the params buffer does
+// not grow and every *_PARAMS_BASE offset below is unchanged.
+const renderParamsSize = 512
 export const alignedRenderSize =
   Math.ceil(renderParamsSize / UNIFORM_ALIGNMENT) * UNIFORM_ALIGNMENT
 // Byte offset of the base chunk-params region (after the per-tile non-chunked
@@ -408,6 +418,16 @@ export class VolumeRenderer extends NVRenderer {
   // Volume flag (set per-frame from md.volume.renderMode): 0 = composite (OVER),
   // 1 = maximum-intensity projection. See VOLUME_RENDER_MODE.
   renderMode = 0
+  // Which stencil the overlay/drawing passes estimate their own gradient with
+  // (from md.volume.layerGradientMode). The background volume reads a
+  // precomputed gradient texture and is unaffected. See LAYER_GRADIENT_MODE.
+  layerGradientMode = VOLUME_DEFAULTS.layerGradientMode
+  // Background-volume gradient opacity and silhouette (Fresnel rim), set by the
+  // view each frame from md.volume. Both read the precomputed gradient
+  // texture's magnitude/direction, so a non-zero value also means the gradient
+  // pass must run even when the volume is unlit (see _needsGradient).
+  gradientOpacity = VOLUME_DEFAULTS.gradientOpacity
+  silhouette = VOLUME_DEFAULTS.silhouette
   // Scene display gamma (set per-frame from md.scene.gamma). Applied to the
   // classified RGB of every volume sample, never to alpha, so brightening does
   // not change how much a ray occludes. 1.0 is a strict no-op.
@@ -855,10 +875,12 @@ export class VolumeRenderer extends NVRenderer {
           undefined,
           modParams,
         )
-        const volumeGradientTexture = await wgpu.volume2TextureGradientRGBA(
-          device,
-          volumeTexture,
-        )
+        // Skipped outright when nothing reads it. The pass is a full-volume
+        // compute dispatch and the texture it produces is the size of the
+        // volume, so an unlit scene pays neither.
+        const volumeGradientTexture = this._needsGradient()
+          ? await wgpu.volume2TextureGradientRGBA(device, volumeTexture)
+          : null
         entry = {
           kind: 'single',
           volumeTexture,
@@ -901,10 +923,11 @@ export class VolumeRenderer extends NVRenderer {
         orient.dispatchOrient(device, this.volumeOrientCache)
         this.volumeTexture = this.volumeOrientCache.outputTexture
       }
-      this.volumeGradientTexture = await wgpu.volume2TextureGradientRGBA(
-        device,
-        this.volumeTexture,
-      )
+      // See the cached branch: skipped when nothing reads it, and filled in
+      // later by _ensureSingleGradients without a reupload.
+      this.volumeGradientTexture = this._needsGradient()
+        ? await wgpu.volume2TextureGradientRGBA(device, this.volumeTexture)
+        : null
       this._activeVolKey = null
     }
 
@@ -923,10 +946,10 @@ export class VolumeRenderer extends NVRenderer {
    * overlay — each gets its own cache entry + residency manager, keyed by its
    * own url/name, and the per-frame pump (pumpChunkUploads) drives them all.
    *
-   * Halo is 3 (not the [1,1,1] default): the per-chunk gradient runs a sobel
-   * (radius 1) + blur (radius 1) stencil, and trilinear sampling at the data
-   * edge reaches one voxel further, so the gradient is only seam-free between
-   * chunks with a 3-voxel halo.
+   * Halo is 3 (not the [1,1,1] default): the per-chunk gradient taps at +-0.7
+   * voxel through a LINEAR sampler, so it reads one voxel past the chunk, and
+   * trilinear sampling at the data edge reaches one further -- a 3-voxel halo
+   * keeps the gradient seam-free between chunks with a margin.
    */
   private async _ensureChunkedVolumeEntry(
     device: GPUDevice,
@@ -979,7 +1002,7 @@ export class VolumeRenderer extends NVRenderer {
           device,
           vol,
           existing.plan,
-          () => this.gradientAmount > 0,
+          () => this._needsGradient(),
           existing.decoded,
         )
         existing.uploader.dispose()
@@ -1001,7 +1024,7 @@ export class VolumeRenderer extends NVRenderer {
       device,
       vol,
       plan,
-      () => this.gradientAmount > 0,
+      () => this._needsGradient(),
       decoded,
     )
     // The entry holds the live uploader + per-chunk bind groups so an in-place
@@ -1075,7 +1098,7 @@ export class VolumeRenderer extends NVRenderer {
       device,
       vol,
       newPlan,
-      () => this.gradientAmount > 0,
+      () => this._needsGradient(),
       entry.decoded,
     )
     entry.uploader.dispose()
@@ -1158,7 +1181,9 @@ export class VolumeRenderer extends NVRenderer {
     if (cached) {
       this.bindGroup = cached
       this._bindTexVol = entry.volumeTexture
-      this._bindTexGrad = entry.volumeGradientTexture
+      // Mirrors what updateBindGroup bound: the placeholder while the entry is
+      // unlit, so the cache-hit test there stays honest.
+      this._bindTexGrad = entry.volumeGradientTexture || this.placeholderOverlay
     }
     return true
   }
@@ -1468,6 +1493,7 @@ export class VolumeRenderer extends NVRenderer {
     this._frameNow = performance.now()
     this._fadeActive = false
     this._refreshUnlitChunksForLighting()
+    this._ensureSingleGradients()
     for (const entry of this._texCache.values()) {
       if (entry.kind !== 'chunked') continue
       // Predict from the frame that just ended, before its record is cleared.
@@ -1530,8 +1556,61 @@ export class VolumeRenderer extends NVRenderer {
     }
   }
 
+  /**
+   * Whether the per-chunk gradient pass must run. Lighting is not the only
+   * consumer: gradient opacity and silhouette read the same texture's magnitude
+   * and direction, so an unlit volume with either turned up still needs it.
+   */
+  private _needsGradient(): boolean {
+    return (
+      this.gradientAmount > 0 || this.gradientOpacity > 0 || this.silhouette > 0
+    )
+  }
+
+  /**
+   * Build any non-chunked gradient texture that the upload path deferred.
+   *
+   * The single-texture analogue of `_refreshUnlitChunksForLighting`: an unlit
+   * volume skips the gradient pass at upload, so switching illumination,
+   * gradient opacity or silhouette on has to fill it in. Called once per frame
+   * before the tile loop; a no-op pointer test once the texture exists, and
+   * the texture outlives the toggle so flipping the feature off and on again
+   * does not rebuild it.
+   *
+   * Uses the await-free build: `beginChunkFrame` is synchronous, and the queue
+   * already orders the compute write before this frame's sampling read.
+   */
+  private _ensureSingleGradients(): void {
+    const device = this._device
+    if (!device || !this._needsGradient()) return
+    for (const [key, entry] of this._texCache) {
+      if (entry.kind !== 'single' || entry.volumeGradientTexture) continue
+      entry.volumeGradientTexture = wgpu.volume2TextureGradientRGBASync(
+        device,
+        entry.volumeTexture,
+      )
+      // The cached bind group for this key holds the placeholder at binding 4.
+      this._bindGroupCache.delete(key)
+      // updateVolume / bindCachedVolume copied the then-null pointer into the
+      // live slot, so re-point it at the texture just built.
+      if (entry.volumeTexture === this.volumeTexture) {
+        this.volumeGradientTexture = entry.volumeGradientTexture
+      }
+    }
+    if (
+      !this._activeChunked &&
+      this.volumeTexture &&
+      !this.volumeGradientTexture
+    ) {
+      this.volumeGradientTexture = wgpu.volume2TextureGradientRGBASync(
+        device,
+        this.volumeTexture,
+      )
+    }
+  }
+
   private _refreshUnlitChunksForLighting(): void {
-    if (this.gradientAmount <= 0 || !this._uploadedUnlit) return
+    if (!this._needsGradient() || !this._uploadedUnlit) return
     this._uploadedUnlit = false
     for (const entry of this._texCache.values()) {
       if (entry.kind !== 'chunked') continue
@@ -1648,7 +1727,8 @@ export class VolumeRenderer extends NVRenderer {
       if (ci >= 0) this._combinedOverlayEntries.splice(ci, 1)
     } else {
       entry.volumeTexture.destroy()
-      entry.volumeGradientTexture.destroy()
+      // Null when the volume was uploaded with no gradient consumer on.
+      entry.volumeGradientTexture?.destroy()
     }
   }
 
@@ -2318,12 +2398,17 @@ export class VolumeRenderer extends NVRenderer {
     // no single volume bind group to maintain here.
     if (this._activeChunked) return
 
-    if (!this.volumeTexture || !this.volumeGradientTexture) return
+    // Only the volume texture is required. volumeGradientTexture is legitimately
+    // null on an unlit volume (the gradient pass is skipped at upload), and the
+    // shader's needsGradient branch is false in exactly that case, so the
+    // placeholder bound at binding 4 is never sampled.
+    if (!this.volumeTexture) return
+    const gradTex = this.volumeGradientTexture || this.placeholderOverlay
 
     if (
       this.bindGroup &&
       this._bindTexVol === this.volumeTexture &&
-      this._bindTexGrad === this.volumeGradientTexture &&
+      this._bindTexGrad === gradTex &&
       this._bindTexMatcap === this.matcapTexture &&
       this._bindTexOverlay === overlayTex &&
       this._bindTexPaqd === paqdTex &&
@@ -2343,7 +2428,7 @@ export class VolumeRenderer extends NVRenderer {
         { binding: 1, resource: this.volumeTexture.createView() },
         { binding: 2, resource: this.matcapTexture.createView() },
         { binding: 3, resource: this.sampler },
-        { binding: 4, resource: this.volumeGradientTexture.createView() },
+        { binding: 4, resource: gradTex.createView() },
         { binding: 5, resource: overlayTex.createView() },
         { binding: 6, resource: paqdTex.createView() },
         { binding: 7, resource: drawTex.createView() },
@@ -2352,7 +2437,7 @@ export class VolumeRenderer extends NVRenderer {
       ],
     })
     this._bindTexVol = this.volumeTexture
-    this._bindTexGrad = this.volumeGradientTexture
+    this._bindTexGrad = gradTex
     this._bindTexMatcap = this.matcapTexture
     this._bindTexOverlay = overlayTex
     this._bindTexPaqd = paqdTex
@@ -3109,6 +3194,15 @@ export class VolumeRenderer extends NVRenderer {
         ...chunkUniforms.rayStepTexVox,
         // .w lane: ray samples per voxel in the fine march (was pad).
         this.sampleRate,
+        // layerGradientMode (offset 496): the stencil the overlay and drawing
+        // passes use for their own gradient. Trailing f32s -- the struct's
+        // 16-byte alignment rounds the size back up to the 512 it already
+        // occupied, so no offset above moves and the buffer does not grow.
+        this.layerGradientMode,
+        // gradientOpacity (500) and silhouettePower (504): background-only
+        // alpha modulation from the precomputed gradient. 0 is a no-op for both.
+        this.gradientOpacity,
+        this.silhouette,
       ]),
     )
   }

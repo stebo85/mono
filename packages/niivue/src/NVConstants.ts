@@ -47,6 +47,33 @@ export enum VOLUME_RENDER_MODE {
   MAXIMUM = 1,
 }
 
+/**
+ * Which stencil estimates the in-shader LAYER gradient, used by the overlay and
+ * drawing ray-march passes to light a layer from its own normals. This is NOT
+ * the background volume's gradient: that one is precomputed into a texture, so
+ * it is unaffected by this setting.
+ *
+ * Mean angular error against an analytic sphere (4000 near-uniform directions):
+ * CENTRAL 0.80 deg, SOBEL8 0.68, BLOB 0.20. All three are exact on the axes,
+ * face diagonals, and body diagonals alike -- those are symmetry directions of
+ * both the stencils and the sphere -- so the error lives in the generic
+ * directions between them and shows as a smooth angular ripple, not as facets.
+ *
+ * CENTRAL is the default because it is what NiiVue has always drawn. The
+ * accuracy difference is real but sub-degree, which does not survive a matcap
+ * lookup on smooth overlays; reach for BLOB on thin or high-curvature
+ * structure, where a half-degree of normal error lands a specular highlight
+ * next to a feature instead of on it.
+ */
+export enum LAYER_GRADIENT_MODE {
+  /** Legacy 6-tap central difference at a hand-tuned 1.5-voxel offset: 3 axes, no diagonals. */
+  CENTRAL = 0,
+  /** Derivative of a Gaussian blob reconstruction: folded axis taps plus a body-diagonal shell. */
+  BLOB = 1,
+  /** The 8-corner Sobel the old niivue (niivue/niivue) precomputes with: 4 body diagonals, no axes. */
+  SOBEL8 = 2,
+}
+
 export enum SHOW_RENDER {
   NEVER = 0,
   ALWAYS = 1,
@@ -345,10 +372,13 @@ export const VOLUME_DEFAULTS: VolumeRenderConfig = {
   paqdUniforms: [0.01, 0.5, 0.25, 0.4] as [number, number, number, number],
   transmittanceCutoff: 0.95,
   renderMode: VOLUME_RENDER_MODE.COMPOSITE,
+  layerGradientMode: LAYER_GRADIENT_MODE.CENTRAL,
   sampleRate: 2,
   isCubicInterpolation: false,
   lodBrightnessCompensation: 0.08,
   lodOpacityCompensation: 0,
+  gradientOpacity: 0,
+  silhouette: 0,
 }
 
 export const MESH_DEFAULTS: MeshRenderConfig = {

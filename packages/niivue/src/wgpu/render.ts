@@ -1747,7 +1747,7 @@ export class VolumeRenderer extends NVRenderer {
     this._destroyTexEntry(entry)
     if (!key) return
     this._texCache.delete(key)
-    // The cached bind group holds this entry's textures at bindings 3 and 4.
+    // The cached bind group holds this entry's textures at bindings 1 and 4.
     this._bindGroupCache.delete(key)
   }
 

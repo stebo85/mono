@@ -855,16 +855,29 @@ export class VolumeRenderer extends NVRenderer {
     this._activeChunked = null
     this._cubicVolumeSafe = !vol.colormapLabel
 
+    // This volume is not chunked any more: its plan was cleared, or the same
+    // url was reloaded as a plain volume. Drop the chunked entry now, because
+    // nothing downstream will. It would otherwise sit in `_texCache` for the
+    // life of the renderer holding every brick texture, still driven by
+    // `beginChunkFrame`, and still counted by `chunkStreamStats` -- which then
+    // reports a brick stream for a single-texture volume. The `perVolumeCache`
+    // branch below cleared it, but only multi-instance callers take that
+    // branch, so the ordinary path leaked.
+    const priorEntry = cacheKey ? this._texCache.get(cacheKey) : undefined
+    if (priorEntry?.kind === 'chunked') {
+      this._evictTexEntry(cacheKey, priorEntry)
+    }
+
     if (perVolumeCache) {
       // Multi-instance / global3d: cache each volume's texture by key so the
       // render loop can switch the active texture per tile via
       // bindCachedVolume. (volumeOrientCache is a single slot and cannot serve
       // per-tile volume switching.)
-      let entry = cacheKey ? this._texCache.get(cacheKey) : undefined
-      if (entry && entry.kind !== 'single') {
-        this._evictTexEntry(cacheKey, entry)
-        entry = undefined
-      }
+      // The chunked case was evicted above, so anything still here is single.
+      // Narrowing on `kind` rather than asserting keeps that an invariant the
+      // compiler checks.
+      const prior = cacheKey ? this._texCache.get(cacheKey) : undefined
+      let entry = prior?.kind === 'single' ? prior : undefined
       if (!entry) {
         const volumeTexture = await orient.volume2Texture(
           device,
